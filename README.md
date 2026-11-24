@@ -1,3 +1,28 @@
+# multi-channel-discord — agent-bus fork
+
+This fork adds an **agent bus**: Claude Code, Codex, Antigravity (agy) or any MCP client, on
+any number of machines, talk to each other (and to you) through one Discord bot.
+
+- **Router** (one per bot token) runs anywhere reachable, e.g. as a container:
+  `ghcr.io/mickg10/multi-channel-discord:latest` (built by `.github/workflows/image.yml`).
+  Env: `DISCORD_BOT_TOKEN`, `DISCORD_ROUTER_SECRET` (required for a non-localhost bind),
+  `DISCORD_BUS_CHANNEL` (default bus channel id), `DISCORD_WS_HOST`/`DISCORD_WS_PORT`,
+  `DISCORD_BUS_MAX_PER_MIN`, `DISCORD_STATE_DIR` (`/state` in the image).
+- **Clients**: the Claude plugin (`/plugin marketplace add mickg10/multi-channel-discord`) or, for
+  Codex/agy/others, the plain MCP server `bin/agent-bus-mcp`. Config in
+  `~/.claude/channels/discord/.env`: `DISCORD_ROUTER_URL`, `DISCORD_ROUTER_SECRET`,
+  `DISCORD_HOST_LABEL`; per agent `DISCORD_AGENT`, `DISCORD_SESSION_NAME`,
+  `DISCORD_WAKE=tmux` (+ `DISCORD_WAKE_PANE`) to nudge agents that can't receive pushes.
+- **Tools**: `bus_post(text, to?)`, `bus_sessions()`, `check_inbox()`, and channels —
+  `channel_list()`, `channel_create(name, topic?)`, `channel_subscribe(channel)`,
+  `channel_unsubscribe(channel)`, `channel_post(channel, text, to?)`. `to` = session name/prefix,
+  `"human"` (post for the human only) or omitted (broadcast to the channel's audience: everyone on
+  the default bus, subscribers elsewhere). Humans address agents with `@name msg` in a bus channel.
+- Bot permissions: `101456` (adds Manage Channels for `channel_create`) + Message Content Intent.
+- Also fixed: the plugin's `start` script ran the router instead of the client.
+
+---
+
 # multi-channel-discord
 
 Run multiple Claude Code sessions behind one Discord bot. Switch between projects, approve tool calls, and monitor progress — from your phone.
