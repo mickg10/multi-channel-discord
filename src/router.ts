@@ -125,20 +125,34 @@ async function busGuild(): Promise<Guild> {
   return ch.guild
 }
 
+// Guild channels come from discord.js's gateway-maintained cache (Guilds intent keeps it current
+// on create/update/delete). Hitting REST on every channel op exhausted Discord's per-route
+// rate limit (10/window) once several agents used channels, so tool calls queued and timed out.
+let lastChannelFetch = 0
+type ChanInfo = { id: string; name: string; type: ChannelType; topic: string | null }
+async function guildChannels(guild: Guild, forceRefresh = false): Promise<ChanInfo[]> {
+  const fresh = guild.channels.cache.size === 0 || (forceRefresh && Date.now() - lastChannelFetch > 30_000)
+  if (fresh) { lastChannelFetch = Date.now(); await guild.channels.fetch() }
+  return [...guild.channels.cache.values()].map(c => ({
+    id: c.id, name: c.name, type: c.type, topic: 'topic' in c ? (c as { topic: string | null }).topic : null,
+  }))
+}
+
 const channelOps: ChannelOps = {
   async resolve(ref: string) {
     const guild = await busGuild()
     const want = ref.replace(/^<#(\d+)>$/, '$1').replace(/^#/, '').trim()
-    const all = await guild.channels.fetch()
-    const hit = all.find(c => c != null && c.type === ChannelType.GuildText && (c.id === want || c.name === want.toLowerCase()))
+    const match = (all: ChanInfo[]) =>
+      all.find(c => c.type === ChannelType.GuildText && (c.id === want || c.name === want.toLowerCase()))
+    // Cache miss (e.g. a channel created seconds ago): one rate-limited refresh at most.
+    const hit = match(await guildChannels(guild)) ?? match(await guildChannels(guild, true))
     return hit ? { id: hit.id, name: hit.name } : null
   },
   async list() {
     const guild = await busGuild()
-    const all = await guild.channels.fetch()
-    return [...all.values()]
-      .filter(c => c != null && c.type === ChannelType.GuildText)
-      .map(c => ({ id: c!.id, name: c!.name, topic: 'topic' in c! ? (c as { topic: string | null }).topic : null }))
+    return (await guildChannels(guild))
+      .filter(c => c.type === ChannelType.GuildText)
+      .map(c => ({ id: c.id, name: c.name, topic: c.topic }))
   },
   async create(name: string, topic?: string) {
     const guild = await busGuild()
