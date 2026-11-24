@@ -52,7 +52,7 @@ export interface NodeConfig {
   agents: AgentConfig[]
   maxTurnsPerHour?: number
   turnTimeoutSec?: number
-  /** MCP servers this node is willing to host: name → {command, args?, env?, methods?}.
+  /** MCP servers this node is willing to host: name → {command, args?, env?, methods?, initTimeoutMs?}.
    *  The router never sends commands — it only names a server; the local allowlist decides
    *  what may actually be spawned here. env values may be "file:/path" (resolved at spawn). */
   mcpServers?: LocalMcpConfig
@@ -87,7 +87,6 @@ function loadConfig(): NodeConfig {
   for (const a of c.agents) {
     if (!a.name || !['claude', 'codex', 'agy', 'opencode'].includes(a.kind)) throw new Error(`bad agent entry: ${JSON.stringify(a)}`)
   }
-  validateLocalMcp(c.mcpServers)
   return c
 }
 
@@ -219,7 +218,7 @@ async function main(): Promise<void> {
   let attempt = 0
   let reqId = 0
   const pending = new Map<string, (data: string) => void>()
-  // stdio MCP servers this node hosts for the bus (registry declaration arrives per call).
+  // stdio MCP servers this node hosts for the bus; what may run comes from localMcp only.
   const mcpChild = new McpChild(undefined, log)
   process.on('exit', () => mcpChild.close())
 
@@ -310,16 +309,16 @@ async function main(): Promise<void> {
         if (a) void runTurn(a)
       } else if (m.type === 'mcpExec' && typeof m.callId === 'string') {
         // The router names a server; only the local allowlist decides what may be spawned.
-        // call() never rejects, but guard anyway: an unhandled rejection would exit the daemon.
+        const reply = (success: boolean, data: string) => {
+          try { ws!.send(JSON.stringify({ type: 'mcpResult', callId: m.callId, success, data })) } catch {}
+        }
         const r = resolveLocalMcp(localMcp, m as McpExecRequest)
-        void (r.ok ? mcpChild.call(r.spec) : Promise.resolve({ ok: false, data: r.reason }))
-          .then(out => {
-            try { ws!.send(JSON.stringify({ type: 'mcpResult', callId: m.callId, success: out.ok, data: out.data })) } catch {}
-          })
-          .catch(err => {
-            log(`mcpExec ${m.server} failed: ${err instanceof Error ? err.message : String(err)}`)
-            try { ws!.send(JSON.stringify({ type: 'mcpResult', callId: m.callId, success: false, data: `${m.server}: internal error` })) } catch {}
-          })
+        if (!r.ok) reply(false, r.reason)
+        // call() never rejects; the catch is a backstop, since an unhandled rejection would exit the daemon.
+        else void mcpChild.call(r.spec).then(out => reply(out.ok, out.data)).catch(err => {
+          log(`mcpExec ${m.server} failed: ${err instanceof Error ? err.message : String(err)}`)
+          reply(false, `${m.server}: internal error`)
+        })
       } else if (m.type === 'toolResult') { pending.get(m.requestId)?.(m.data); pending.delete(m.requestId) }
       else if (m.type === 'error') log(`router error: ${m.message}`)
     }

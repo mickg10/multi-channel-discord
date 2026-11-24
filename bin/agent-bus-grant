@@ -4,7 +4,7 @@
  * Run on the router host (or wherever the state dir is mounted). Round one issues none;
  * this CLI exists for round two, when a side-effecting server is declared and Mick approves.
  *
- *   bun bin/agent-bus-grant <stateDir> issue <server> [--session <name>] [--ttl-hours N] [--note "..."]
+ *   bun bin/agent-bus-grant <stateDir> issue <server> [--session <name>] [--instance <id>] [--ttl-hours N] [--note "..."]
  *   bun bin/agent-bus-grant <stateDir> list
  *   bun bin/agent-bus-grant <stateDir> revoke <grantId>
  */
@@ -13,7 +13,7 @@ import { Grants } from '../src/mcp.js'
 
 const [stateDir, cmd, ...rest] = process.argv.slice(2)
 if (!stateDir || !cmd || !['issue', 'list', 'revoke'].includes(cmd)) {
-  process.stderr.write('usage: bun bin/agent-bus-grant <stateDir> issue|list|revoke ...\n')
+  process.stderr.write('usage: bun bin/agent-bus-grant <stateDir> issue <server> [--session <name>] [--instance <id>] [--ttl-hours N] [--note "..."] | list | revoke <grantId>\n')
   process.exit(2)
 }
 
@@ -22,7 +22,7 @@ const grants = Grants.inStateDir(stateDir)
 if (cmd === 'list') {
   const all = grants.list()
   if (!all.length) console.log('no grants')
-  for (const g of all) console.log(`${g.id}  server=${g.server}${g.session ? `  session=${g.session}` : ''}  expires=${g.expires}${g.note ? `  (${g.note})` : ''}`)
+  for (const g of all) console.log(`${g.id}  server=${g.server}${g.session ? `  session=${g.session}` : ''}${g.instance ? `  instance=${g.instance}` : ''}  expires=${g.expires}${g.note ? `  (${g.note})` : ''}`)
   process.exit(0)
 }
 
@@ -36,17 +36,12 @@ if (cmd === 'revoke') {
 // issue
 const server = rest[0]
 if (!server) { process.stderr.write('issue needs a server name\n'); process.exit(2) }
-const opt: Record<string, string | number | undefined> = {}
+const opts: { session?: string; instance?: string; ttlHours?: number; note?: string } = {}
 for (let i = 1; i < rest.length; i++) {
-  if (rest[i] === '--session') opt.session = rest[++i]
-  else if (rest[i] === '--instance') opt.instance = rest[++i]
-  else if (rest[i] === '--ttl-hours') opt.ttlHours = Number(rest[++i])
-  else if (rest[i] === '--note') opt.note = rest[++i]
+  const flag = rest[i], value = rest[++i]
+  if (flag === '--session') opts.session = value
+  else if (flag === '--instance') opts.instance = value
+  else if (flag === '--ttl-hours') opts.ttlHours = Number(value)
+  else if (flag === '--note') opts.note = value
 }
-const g = grants.issue(server, {
-  ...(opt.session !== undefined && { session: String(opt.session) }),
-  ...(opt.instance !== undefined && { instance: String(opt.instance) }),
-  ...(opt.ttlHours !== undefined && { ttlHours: Number(opt.ttlHours) }),
-  ...(opt.note !== undefined && { note: String(opt.note) }),
-})
-console.log(JSON.stringify(g, null, 2))
+console.log(JSON.stringify(grants.issue(server, opts), null, 2))

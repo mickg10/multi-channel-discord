@@ -144,6 +144,23 @@ describe('Grants persistence + live reload', () => {
     expect(running.check(g.id, 'unifi', { session: 'a@b' })).toBe(false)
   })
 
+  test('grants fail CLOSED (no throw, no partial map) on valid JSON with a bad shape', async () => {
+    const file = join(dir, 'g.json')
+    const g = new Grants(file).issue('unifi', { session: 'a@b', ttlHours: 1 })
+    const running = new Grants(file)
+    const ok = () => running.check(g.id, 'unifi', { session: 'a@b' })
+    expect(ok()).toBe(true)
+    // Each write differs in size so the mtime:size stamp always changes.
+    for (const bad of ['{}', '[null]', JSON.stringify([g, { note: 'no id' }]), JSON.stringify([g, 42, 'padding-padding'])]) {
+      await writeFile(file, bad)
+      expect(ok).not.toThrow()
+      expect(ok()).toBe(false) // the valid entry alongside a bad one is dropped too
+      expect(running.list()).toEqual([])
+    }
+    await writeFile(file, JSON.stringify([g]))
+    expect(ok()).toBe(true) // recovers once the file is valid again
+  })
+
   test('grants can bind to a client instance id', () => {
     const grants = new Grants()
     const g = grants.issue('unifi', { session: 'a@b', instance: 'inst-1' })
@@ -222,12 +239,12 @@ describe('node-local allowlist', () => {
   })
 
   test('local method allowlist is enforced; happy path carries env to the spec', () => {
-    const local = validateLocalMcp({ web: { command: 'bunx', args: ['-y', 'srv'], env: { K: 'file:/x' }, methods: ['search'] } })
+    const local = validateLocalMcp({ web: { command: 'bunx', args: ['-y', 'srv'], env: { K: 'file:/x' }, methods: ['search'], initTimeoutMs: 60_000 } })
     const denied = resolveLocalMcp(local, { callId: 'c', server: 'web', method: 'fetch' })
     expect(denied.ok).toBe(false)
     const ok = resolveLocalMcp(local, { callId: 'c', server: 'web', method: 'search', params: { q: 'x' } })
     expect(ok.ok).toBe(true)
-    if (ok.ok) expect(ok.spec).toMatchObject({ command: 'bunx', env: { K: 'file:/x' }, method: 'search' })
+    if (ok.ok) expect(ok.spec).toMatchObject({ command: 'bunx', env: { K: 'file:/x' }, method: 'search', initTimeoutMs: 60_000 })
   })
 
   test('resolveEnv maps file: refs to file contents', async () => {
@@ -252,6 +269,10 @@ describe('ws handlers: mcp ops', () => {
     }
   }
 
+  function routerMcp(servers: unknown[], timeoutMs: number) {
+    return { registry: McpRegistry.fromFile(registryFile(servers)), grants: new Grants(), audit: McpAudit.inStateDir(dir), pending: new PendingMcpCalls(timeoutMs) }
+  }
+
   test('mcp ops without registry configured report disabled', () => {
     const h = createWsHandlers(makeDeps())
     const ws = mockWs()
@@ -263,8 +284,7 @@ describe('ws handlers: mcp ops', () => {
 
   test('mcpList returns the declaration summary', () => {
     const deps = makeDeps({
-      mcp: McpRegistry.fromFile(registryFile([READ_ONLY])),
-      mcpGrants: new Grants(), mcpAudit: McpAudit.inStateDir(dir), mcpPending: new PendingMcpCalls(100),
+      mcp: routerMcp([READ_ONLY], 100),
     })
     const ws = mockWs()
     ws.data.sessionName = 'a@b'
@@ -281,8 +301,7 @@ describe('ws handlers: mcp ops', () => {
     nodes.register('mac', () => {}, [{ name: 'headless@mac', kind: 'opencode' }])
     const deps = makeDeps({
       nodes,
-      mcp: McpRegistry.fromFile(registryFile([READ_ONLY])),
-      mcpGrants: new Grants(), mcpAudit: McpAudit.inStateDir(dir), mcpPending: new PendingMcpCalls(500),
+      mcp: routerMcp([READ_ONLY], 500),
     })
     const caller = mockWs()
     caller.data.sessionName = 'a@mac'
@@ -309,8 +328,7 @@ describe('ws handlers: mcp ops', () => {
 
   test('mcpCall on a side-effecting server is rejected at the router and audited', () => {
     const deps = makeDeps({
-      mcp: McpRegistry.fromFile(registryFile([WRITER])),
-      mcpGrants: new Grants(), mcpAudit: McpAudit.inStateDir(dir), mcpPending: new PendingMcpCalls(100),
+      mcp: routerMcp([WRITER], 100),
     })
     const ws = mockWs()
     ws.data.sessionName = 'a@mac'
@@ -325,8 +343,7 @@ describe('ws handlers: mcp ops', () => {
 
   test('mcpDescribe on a disconnected node fails with the declaration as context', () => {
     const deps = makeDeps({
-      mcp: McpRegistry.fromFile(registryFile([READ_ONLY])),
-      mcpGrants: new Grants(), mcpAudit: McpAudit.inStateDir(dir), mcpPending: new PendingMcpCalls(100),
+      mcp: routerMcp([READ_ONLY], 100),
     })
     const ws = mockWs()
     ws.data.sessionName = 'a@b'
@@ -438,6 +455,41 @@ process.stdin.on('data', d => {
     const r2 = await child.call({ server: 'flaky', command: process.execPath, args: ['-e', FAKE_SERVER], env: {}, method: 'tools/list' })
     expect(r2.ok).toBe(true)
     expect(JSON.parse(r2.data).tools[0]).toMatchObject({ name: 'lookup' })
+    child.close()
+  })
+
+  test('a per-server initTimeoutMs overrides the default (slow starters can come up)', async () => {
+    const child = new McpChild(undefined, () => {}, 50) // default would time out the 120 ms init
+    const r = await child.call({ server: 'slowok', command: process.execPath, args: ['-e', DELAYED_SERVER], method: 'tools/list', initTimeoutMs: 2000 })
+    expect(r.ok).toBe(true)
+    child.close()
+  })
+
+  test('multi-byte UTF-8 split across stdout chunks is decoded intact', async () => {
+    // Writes one reply in two raw byte chunks, splitting the 3-byte "€" between them.
+    const SPLIT_SERVER = `
+let buf = ''
+process.stdin.on('data', d => {
+  buf += d
+  let i
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1)
+    if (!line.trim()) continue
+    const m = JSON.parse(line)
+    if (m.method === 'initialize') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} }) + '\\n')
+    else if (m.method === 'tools/list') {
+      const bytes = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { text: 'price: €5' } }) + '\\n')
+      const cut = bytes.indexOf(0xe2) + 1
+      process.stdout.write(bytes.subarray(0, cut))
+      setTimeout(() => process.stdout.write(bytes.subarray(cut)), 30)
+    }
+  }
+})
+`
+    const child = new McpChild()
+    const r = await child.call({ server: 'utf8', command: process.execPath, args: ['-e', SPLIT_SERVER], method: 'tools/list' })
+    expect(r.ok).toBe(true)
+    expect(JSON.parse(r.data).text).toBe('price: €5')
     child.close()
   })
 })

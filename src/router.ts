@@ -141,10 +141,13 @@ const claims = Claims.inStateDir(STATE_DIR)
 // A missing registry file = feature present but empty (mcp_list returns []); a malformed file
 // fails startup closed — a broken declaration must not silently widen admission.
 const MCP_REGISTRY_FILE = process.env.MCP_REGISTRY ?? pjoin(STATE_DIR, 'mcp-registry.json')
-const mcp = McpRegistry.fromFileOrNull(MCP_REGISTRY_FILE)
-const mcpGrants = Grants.inStateDir(STATE_DIR)
-const mcpAudit = McpAudit.inStateDir(STATE_DIR)
-const mcpPending = new PendingMcpCalls(Number(process.env.MCP_CALL_TIMEOUT_MS ?? 30_000))
+const mcpRegistry = McpRegistry.fromFileOrNull(MCP_REGISTRY_FILE)
+const mcp = mcpRegistry && {
+  registry: mcpRegistry,
+  grants: Grants.inStateDir(STATE_DIR),
+  audit: McpAudit.inStateDir(STATE_DIR),
+  pending: new PendingMcpCalls(Number(process.env.MCP_CALL_TIMEOUT_MS ?? 30_000)),
+}
 
 // Rules of comms: ${STATE_DIR}/rules.md, delivered once per session name per rules version.
 const RULES_FILE = pjoin(STATE_DIR, 'rules.md')
@@ -245,9 +248,6 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   nodes,
   claims,
   mcp: mcp ?? undefined,
-  mcpGrants,
-  mcpAudit,
-  mcpPending,
   admins: ADMINS,
   nodeSecrets: nodeSecretsProvider,
   humanChannelId: HUMAN_CHANNEL,

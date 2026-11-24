@@ -695,7 +695,7 @@ export async function startPlugin(): Promise<void> {
         }
         case 'mcp_list': {
           const r = await sendToolRequest({ type: 'mcpList' })
-          const list = JSON.parse(r) as Array<{ name: string; description: string; node: string; class: string; methods: string | number }>
+          const list = JSON.parse(r) as Array<{ name: string; description: string; node: string; class: string; methods: number }>
           const lines = list.map(s => `- ${s.name} [${s.class}, node ${s.node}, methods: ${s.methods}]${s.description ? ` — ${s.description}` : ''}`)
           return { content: [{ type: 'text', text: lines.join('\n') || 'No shared MCP servers declared.' }] }
         }
