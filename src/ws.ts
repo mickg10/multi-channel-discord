@@ -53,6 +53,8 @@ export interface WsData {
   authed?: boolean
   /** Set when this connection is a node daemon. */
   nodeName?: string
+  /** Register-time instance id of the client connection (grant binding). */
+  instanceId?: string
 }
 
 export interface WsDeps {
@@ -174,7 +176,7 @@ function handleMcpOp(ws: WsLike, parsed: import('./types.js').WsMcpOp, deps: Rea
     return
   }
   if (!parsed.method) { sendToolResult(ws, parsed.requestId, false, 'method required'); return }
-  const decision = deps.mcp.checkCall(parsed.server, parsed.method, deps.mcpGrants, me, parsed.grant)
+  const decision = deps.mcp.checkCall(parsed.server, parsed.method, deps.mcpGrants, { session: me, instance: ws.data.instanceId }, parsed.grant)
   if (!decision.ok) {
     deps.mcpAudit.record(me, parsed.server, parsed.method, parsed.params, `reject:${decision.reason}`)
     sendToolResult(ws, parsed.requestId, false, decision.reason)
@@ -509,6 +511,7 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
 
 function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>): void {
   const sendCb = (msg: string) => ws.send(msg)
+  ws.data.instanceId = instanceId
   const actualName = deps.sessions.registerSession(
     sendCb,
     name,

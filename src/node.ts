@@ -309,10 +309,16 @@ async function main(): Promise<void> {
         if (a) void runTurn(a)
       } else if (m.type === 'mcpExec' && typeof m.callId === 'string') {
         // The router names a server; only the local allowlist decides what may be spawned.
+        // call() never rejects, but guard anyway: an unhandled rejection would exit the daemon.
         const r = resolveLocalMcp(localMcp, m as McpExecRequest)
-        void (r.ok ? mcpChild.call(r.spec) : Promise.resolve({ ok: false, data: r.reason })).then(out => {
-          try { ws!.send(JSON.stringify({ type: 'mcpResult', callId: m.callId, success: out.ok, data: out.data })) } catch {}
-        })
+        void (r.ok ? mcpChild.call(r.spec) : Promise.resolve({ ok: false, data: r.reason }))
+          .then(out => {
+            try { ws!.send(JSON.stringify({ type: 'mcpResult', callId: m.callId, success: out.ok, data: out.data })) } catch {}
+          })
+          .catch(err => {
+            log(`mcpExec ${m.server} failed: ${err instanceof Error ? err.message : String(err)}`)
+            try { ws!.send(JSON.stringify({ type: 'mcpResult', callId: m.callId, success: false, data: `${m.server}: internal error` })) } catch {}
+          })
       } else if (m.type === 'toolResult') { pending.get(m.requestId)?.(m.data); pending.delete(m.requestId) }
       else if (m.type === 'error') log(`router error: ${m.message}`)
     }

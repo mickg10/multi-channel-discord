@@ -15,7 +15,8 @@
       "description": "z.ai web search + reader for clients without built-in search (key stays on the hosting node)",
       "node": "vps2",
       "owner": "claude_setup",
-      "class": "read-only"
+      "class": "read-only",
+      "methods": ["web_search", "read_url"]
     }
   ]
 }

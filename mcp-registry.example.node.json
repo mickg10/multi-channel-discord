@@ -6,7 +6,7 @@
     "inventory": {
       "command": "bun",
       "args": ["/srv/agent-bus/mcp/inventory/server.ts"],
-      "env": { "INVENTORY_EXPORT": "file:/srv/agent-bus/mcp/inventory/export.json" }
+      "env": { "INVENTORY_EXPORT_FILE": "/srv/agent-bus/mcp/inventory/export.json" }
     },
     "web-tools": {
       "command": "bunx",

@@ -39,11 +39,13 @@ if (!server) { process.stderr.write('issue needs a server name\n'); process.exit
 const opt: Record<string, string | number | undefined> = {}
 for (let i = 1; i < rest.length; i++) {
   if (rest[i] === '--session') opt.session = rest[++i]
+  else if (rest[i] === '--instance') opt.instance = rest[++i]
   else if (rest[i] === '--ttl-hours') opt.ttlHours = Number(rest[++i])
   else if (rest[i] === '--note') opt.note = rest[++i]
 }
 const g = grants.issue(server, {
   ...(opt.session !== undefined && { session: String(opt.session) }),
+  ...(opt.instance !== undefined && { instance: String(opt.instance) }),
   ...(opt.ttlHours !== undefined && { ttlHours: Number(opt.ttlHours) }),
   ...(opt.note !== undefined && { note: String(opt.note) }),
 })

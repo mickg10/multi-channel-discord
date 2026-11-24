@@ -34,8 +34,9 @@ export interface McpServerDecl {
   readonly node: string
   readonly owner?: string
   readonly class: McpClass
-  /** Allowlisted tool names. Omit to allow every tool the server lists (class still gates). */
-  readonly methods?: readonly string[]
+  /** Allowlisted tool names — REQUIRED. Omitted methods would mean allow-all, which
+   *  draft v2 item 5 forbids: undeclared methods must be hard-rejected. */
+  readonly methods: readonly string[]
   readonly timeoutMs?: number
 }
 
@@ -68,6 +69,9 @@ export class McpRegistry {
       if (s.class !== 'read-only' && s.class !== 'side-effecting') {
         throw new Error(`${file}: server "${s.name}": class must be "read-only" or "side-effecting"`)
       }
+      if (!Array.isArray(s.methods) || s.methods.length === 0 || !s.methods.every(m => typeof m === 'string')) {
+        throw new Error(`${file}: server "${s.name}": "methods" is required (a non-empty allowlist; allow-all is forbidden)`)
+      }
       if (s.command !== undefined || s.env !== undefined || s.args !== undefined) {
         throw new Error(`${file}: server "${s.name}": command/args/env must live in the node's own config, not the registry (review blocker 1)`)
       }
@@ -83,29 +87,29 @@ export class McpRegistry {
 
   get source(): string | undefined { return this.loadedFrom }
 
-  list(): Array<{ name: string; description: string; node: string; class: McpClass; methods: string | number }> {
+  list(): Array<{ name: string; description: string; node: string; class: McpClass; methods: number }> {
     return [...this.servers.values()].map(s => ({
       name: s.name,
       description: s.description ?? '',
       node: s.node,
       class: s.class,
-      methods: s.methods ? s.methods.length : 'all',
+      methods: s.methods.length,
     }))
   }
 
   get(name: string): McpServerDecl | undefined { return this.servers.get(name) }
 
   /** Admission check for one call. Side-effecting servers need a valid grant. */
-  checkCall(name: string, method: string, grants: Grants, session: string, grantId?: string): McpDecision {
+  checkCall(name: string, method: string, grants: Grants, caller: McpCaller, grantId?: string): McpDecision {
     const decl = this.servers.get(name)
     if (!decl) return { ok: false, reason: `server "${name}" is not declared in the registry` }
-    if (decl.methods && !decl.methods.includes(method)) {
+    if (!decl.methods.includes(method)) {
       return { ok: false, reason: `method "${method}" is not allowlisted for server "${name}"` }
     }
     if (decl.class === 'side-effecting') {
       if (!grantId) return { ok: false, reason: `server "${name}" is side-effecting: a Mick-issued grant ID is required (none are issued in round one)` }
-      if (!grants.check(grantId, name, session)) {
-        return { ok: false, reason: `grant rejected for server "${name}" (unknown, expired, session-mismatched or revoked)` }
+      if (!grants.check(grantId, name, caller)) {
+        return { ok: false, reason: `grant rejected for server "${name}" (unknown, expired, session/instance-mismatched or revoked)` }
       }
     }
     return { ok: true, decl }
@@ -122,8 +126,16 @@ export interface McpGrant {
   readonly server: string
   /** Restrict to one session name; omit = any session may present it. */
   readonly session?: string
+  /** Restrict to one client instance id (the register-time instanceId); omit = any instance. */
+  readonly instance?: string
   readonly expires: string
   readonly note?: string
+}
+
+/** Who is calling: display name plus the register-time instance id of the connection. */
+export interface McpCaller {
+  readonly session: string
+  readonly instance?: string
 }
 
 export class Grants {
@@ -131,7 +143,7 @@ export class Grants {
   private fileStamp = ''
   constructor(private readonly file?: string) {
     if (!file) return
-    this.reload()
+    this.reload(true)
     this.fileStamp = this.stamp()
   }
   static inStateDir(dir: string): Grants { return new Grants(join(dir, 'mcp-grants.json')) }
@@ -141,7 +153,9 @@ export class Grants {
     try { const s = statSync(this.file); return `${s.mtimeMs}:${s.size}` } catch { return '' }
   }
 
-  /** Reload the persisted grants if the file changed since the last load (live revocation). */
+  /** Reload the persisted grants if the file changed since the last load (live revocation).
+   *  Fails CLOSED: if the file is missing or unparseable, the in-memory grants are dropped —
+   *  a corrupted state must not keep authorizing side-effecting calls. */
   reload(force = false): void {
     if (!this.file) return
     const now = this.stamp()
@@ -152,15 +166,19 @@ export class Grants {
       for (const g of JSON.parse(readFileSync(this.file, 'utf8')) as McpGrant[]) next.set(g.id, g)
       this.map.clear()
       for (const [k, v] of next) this.map.set(k, v)
-    } catch {}
+    } catch (err: unknown) {
+      process.stderr.write(`discord channel: mcp grants file unreadable (${err instanceof Error ? err.message : String(err)}); failing closed\n`)
+      this.map.clear()
+    }
   }
 
-  issue(server: string, opts: { session?: string; ttlHours?: number; note?: string } = {}): McpGrant {
+  issue(server: string, opts: { session?: string; instance?: string; ttlHours?: number; note?: string } = {}): McpGrant {
     const id = `mcpgr_${randomBytes(16).toString('hex').slice(0, 24)}`
     const g: McpGrant = {
       id,
       server,
       ...(opts.session && { session: opts.session }),
+      ...(opts.instance && { instance: opts.instance }),
       expires: new Date(Date.now() + (opts.ttlHours ?? 24) * 3600_000).toISOString(),
       ...(opts.note && { note: opts.note }),
     }
@@ -170,11 +188,12 @@ export class Grants {
     return g
   }
 
-  check(id: string, server: string, session: string): boolean {
+  check(id: string, server: string, caller: McpCaller): boolean {
     this.reload()
     const g = this.map.get(id)
     if (!g || g.server !== server) return false
-    if (g.session && g.session !== session) return false
+    if (g.session && g.session !== caller.session) return false
+    if (g.instance && g.instance !== caller.instance) return false
     return Date.parse(g.expires) > Date.now()
   }
 
@@ -182,7 +201,7 @@ export class Grants {
   list(): McpGrant[] { this.reload(); return [...this.map.values()] }
   private save(): void {
     if (!this.file) return
-    try { mkdirSync(dirname(this.file), { recursive: true }); writeFileSync(this.file, JSON.stringify([...this.map.values()], null, 2)) } catch {}
+    try { writeJsonAtomic(this.file, [...this.map.values()]) } catch {}
   }
 }
 
@@ -359,13 +378,25 @@ export function resolveEnv(env: Readonly<Record<string, string>> | undefined): R
 export class McpChild {
   private readonly children = new Map<string, ChildState>()
 
-  constructor(private readonly spawnFn: SpawnFn = defaultSpawn, private readonly log: (m: string) => void = () => {}) {}
+  constructor(private readonly spawnFn: SpawnFn = defaultSpawn, private readonly log: (m: string) => void = () => {}, private readonly initTimeoutMs = 10_000) {}
 
-  /** Run one method ('tools/list' or a tool name via 'tools/call') on a (re)spawned child. */
+  /** Run one method ('tools/list' or a tool name via 'tools/call') on a (re)spawned child.
+   *  NEVER rejects: every failure path resolves {ok:false} (a rejecting call would crash
+   *  node daemons whose handlers cannot catch mid-promise throws). */
   async call(spec: McpExecSpec): Promise<{ ok: boolean; data: string }> {
-    const child = this.ensureChild(spec)
+    let child: ChildState
+    try {
+      child = this.ensureChild(spec)
+    } catch (err: unknown) {
+      // e.g. an unreadable "file:" env ref — configuration problem on this node.
+      return { ok: false, data: `${spec.server}: cannot start: ${err instanceof Error ? err.message : String(err)}` }
+    }
     const ready = await child.ready
-    if (!ready.ok) return ready
+    if (!ready.ok) {
+      // A failed/slow initialize must not brick the server for later calls: evict and kill.
+      this.dropChild(spec.server, child)
+      return ready
+    }
     return this.request(child, spec, spec.timeoutMs ?? 20_000)
   }
 
@@ -375,6 +406,13 @@ export class McpChild {
     this.children.clear()
   }
 
+  /** Kill and forget a cached child, but only if it is still the cached one. */
+  private dropChild(server: string, child: ChildState): void {
+    if (this.children.get(server) !== child) return
+    this.children.delete(server)
+    try { child.proc.kill('SIGTERM') } catch {}
+  }
+
   /** Get or spawn the child for a server; every concurrent caller shares one readiness promise. */
   private ensureChild(spec: McpExecSpec): ChildState {
     const existing = this.children.get(spec.server)
@@ -382,12 +420,13 @@ export class McpChild {
     const proc = this.spawnFn(spec.command, spec.args ?? [], { ...(process.env as Record<string, string>), ...resolveEnv(spec.env) })
     const child: ChildState = { proc, nextId: 1, pending: new Map(), buffer: '', ready: Promise.resolve({ ok: false, data: 'unreachable' }) }
     this.children.set(spec.server, child)
-    proc.stdout.on('data', (d: Buffer) => this.onStdout(spec.server, d.toString()))
+    // Ownership guard: once this child is replaced, its events must not touch the successor.
+    const isCurrent = () => this.children.get(spec.server) === child
+    proc.stdout.on('data', (d: Buffer) => { if (isCurrent()) this.onStdout(spec.server, d.toString()) })
     proc.stderr.on('data', (d: Buffer) => this.log(`${spec.server} stderr: ${String(d).trim().slice(0, 200)}`))
     const failAll = (msg: string) => {
-      const c = this.children.get(spec.server)
-      if (c === child) this.children.delete(spec.server)
-      for (const [, p] of c?.pending ?? []) { clearTimeout(p.timer); p.resolve({ ok: false, data: `${spec.server}: ${msg}` }) }
+      if (isCurrent()) this.children.delete(spec.server)
+      for (const [id, p] of child.pending) { child.pending.delete(id); clearTimeout(p.timer); p.resolve({ ok: false, data: `${spec.server}: ${msg}` }) }
     }
     // Spawn errors (ENOENT etc.) arrive asynchronously as 'error', not from spawn() itself.
     proc.on('error', (err: Error) => failAll(`spawn failed: ${err.message}`))
@@ -402,8 +441,8 @@ export class McpChild {
       const id = child.nextId++
       const timer = setTimeout(() => {
         child.pending.delete(id)
-        resolve({ ok: false, data: `${spec.server}: initialize handshake timed out` })
-      }, 10_000)
+        resolve({ ok: false, data: `${spec.server}: initialize handshake timed out after ${this.initTimeoutMs} ms` })
+      }, this.initTimeoutMs)
       child.pending.set(id, {
         resolve: v => {
           clearTimeout(timer)

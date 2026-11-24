@@ -28,7 +28,7 @@ function registryFile(servers: unknown): string {
 }
 
 const READ_ONLY = { name: 'inventory', node: 'nas642', class: 'read-only', methods: ['lookup', 'list'], description: 'infra inventory' }
-const WRITER = { name: 'unifi', node: 'nas642', class: 'side-effecting' }
+const WRITER = { name: 'unifi', node: 'nas642', class: 'side-effecting', methods: ['setFirewall'] }
 
 describe('McpRegistry', () => {
   test('loads and lists servers (admission facts only)', () => {
@@ -45,10 +45,17 @@ describe('McpRegistry', () => {
   })
 
   test('rejects command/args/env in the registry (spawn specs are node-local)', () => {
-    const f = registryFile([{ name: 'x', node: 'n', class: 'read-only', command: 'bun' }])
+    const f = registryFile([{ name: 'x', node: 'n', class: 'read-only', methods: ['a'], command: 'bun' }])
     expect(() => McpRegistry.fromFile(f)).toThrow(/node's own config/)
-    const f2 = registryFile([{ name: 'x', node: 'n', class: 'read-only', env: { A: 'b' } }])
+    const f2 = registryFile([{ name: 'x', node: 'n', class: 'read-only', methods: ['a'], env: { A: 'b' } }])
     expect(() => McpRegistry.fromFile(f2)).toThrow(/node's own config/)
+  })
+
+  test('registry without a methods allowlist is rejected (allow-all is forbidden)', () => {
+    const f = registryFile([{ name: 'x', node: 'n', class: 'read-only' }])
+    expect(() => McpRegistry.fromFile(f)).toThrow(/methods.*required/)
+    const f2 = registryFile([{ name: 'x', node: 'n', class: 'read-only', methods: [] }])
+    expect(() => McpRegistry.fromFile(f2)).toThrow(/methods.*required/)
   })
 
   test('fromFileOrNull returns null for a missing file', () => {
@@ -59,27 +66,27 @@ describe('McpRegistry', () => {
 describe('admission (checkCall)', () => {
   test('read-only allowlisted method is allowed', () => {
     const reg = McpRegistry.fromFile(registryFile([READ_ONLY]))
-    const d = reg.checkCall('inventory', 'lookup', new Grants(), 'agent@x')
+    const d = reg.checkCall('inventory', 'lookup', new Grants(), { session: 'agent@x' })
     expect(d.ok).toBe(true)
   })
 
   test('undeclared server rejected', () => {
     const reg = McpRegistry.fromFile(registryFile([READ_ONLY]))
-    const d = reg.checkCall('ghost', 'lookup', new Grants(), 'agent@x')
+    const d = reg.checkCall('ghost', 'lookup', new Grants(), { session: 'agent@x' })
     if (d.ok) throw new Error('expected rejection')
     expect(d.reason).toContain('not declared')
   })
 
   test('method outside allowlist rejected', () => {
     const reg = McpRegistry.fromFile(registryFile([READ_ONLY]))
-    const d = reg.checkCall('inventory', 'reboot', new Grants(), 'agent@x')
+    const d = reg.checkCall('inventory', 'reboot', new Grants(), { session: 'agent@x' })
     if (d.ok) throw new Error('expected rejection')
     expect(d.reason).toContain('not allowlisted')
   })
 
   test('side-effecting without grant rejected (round-one default-deny)', () => {
     const reg = McpRegistry.fromFile(registryFile([WRITER]))
-    const d = reg.checkCall('unifi', 'setFirewall', new Grants(), 'agent@x')
+    const d = reg.checkCall('unifi', 'setFirewall', new Grants(), { session: 'agent@x' })
     if (d.ok) throw new Error('expected rejection')
     expect(d.reason).toContain('grant')
   })
@@ -88,19 +95,19 @@ describe('admission (checkCall)', () => {
     const reg = McpRegistry.fromFile(registryFile([WRITER]))
     const grants = new Grants()
     const g = grants.issue('unifi', { session: 'agent@x', ttlHours: 1 })
-    expect(reg.checkCall('unifi', 'setFirewall', grants, 'agent@x', g.id).ok).toBe(true)
-    expect(reg.checkCall('unifi', 'setFirewall', grants, 'other@y', g.id).ok).toBe(false)
+    expect(reg.checkCall('unifi', 'setFirewall', grants, { session: 'agent@x' }, g.id).ok).toBe(true)
+    expect(reg.checkCall('unifi', 'setFirewall', grants, { session: 'other@y' }, g.id).ok).toBe(false)
     const exp = grants.issue('unifi', { ttlHours: -1 })
-    expect(reg.checkCall('unifi', 'setFirewall', grants, 'agent@x', exp.id).ok).toBe(false)
+    expect(reg.checkCall('unifi', 'setFirewall', grants, { session: 'agent@x' }, exp.id).ok).toBe(false)
     grants.revoke(g.id)
-    expect(reg.checkCall('unifi', 'setFirewall', grants, 'agent@x', g.id).ok).toBe(false)
+    expect(reg.checkCall('unifi', 'setFirewall', grants, { session: 'agent@x' }, g.id).ok).toBe(false)
   })
 
   test('grant for another server does not apply', () => {
     const reg = McpRegistry.fromFile(registryFile([WRITER]))
     const grants = new Grants()
     const g = grants.issue('inventory', {})
-    expect(reg.checkCall('unifi', 'setFirewall', grants, 'agent@x', g.id).ok).toBe(false)
+    expect(reg.checkCall('unifi', 'setFirewall', grants, { session: 'agent@x' }, g.id).ok).toBe(false)
   })
 })
 
@@ -109,7 +116,7 @@ describe('Grants persistence + live reload', () => {
     const file = join(dir, 'g.json')
     const g = new Grants(file).issue('unifi', { session: 'a@b' })
     const again = new Grants(file)
-    expect(again.check(g.id, 'unifi', 'a@b')).toBe(true)
+    expect(again.check(g.id, 'unifi', { session: 'a@b' })).toBe(true)
   })
 
   test('CLI-issued grants apply to a running instance; CLI revocation applies live', async () => {
@@ -119,10 +126,30 @@ describe('Grants persistence + live reload', () => {
     // A separate instance (bin/agent-bus-grant) issues:
     const cli = new Grants(file)
     const g = cli.issue('unifi', { session: 'a@b', ttlHours: 1 })
-    expect(running.check(g.id, 'unifi', 'a@b')).toBe(true)
+    expect(running.check(g.id, 'unifi', { session: 'a@b' })).toBe(true)
     // And revokes:
     cli.revoke(g.id)
-    expect(running.check(g.id, 'unifi', 'a@b')).toBe(false)
+    expect(running.check(g.id, 'unifi', { session: 'a@b' })).toBe(false)
+  })
+
+  test('grants fail CLOSED when the file becomes unreadable or corrupt', async () => {
+    const file = join(dir, 'g.json')
+    const a = new Grants(file)
+    const g = a.issue('unifi', { session: 'a@b', ttlHours: 1 })
+    const running = new Grants(file)
+    expect(running.check(g.id, 'unifi', { session: 'a@b' })).toBe(true)
+    await writeFile(file, '{corrupt json') // stamp changes, parse fails
+    expect(running.check(g.id, 'unifi', { session: 'a@b' })).toBe(false)
+    await writeFile(file, JSON.stringify([])) // deleted-from-file = gone
+    expect(running.check(g.id, 'unifi', { session: 'a@b' })).toBe(false)
+  })
+
+  test('grants can bind to a client instance id', () => {
+    const grants = new Grants()
+    const g = grants.issue('unifi', { session: 'a@b', instance: 'inst-1' })
+    expect(grants.check(g.id, 'unifi', { session: 'a@b', instance: 'inst-1' })).toBe(true)
+    expect(grants.check(g.id, 'unifi', { session: 'a@b', instance: 'inst-2' })).toBe(false)
+    expect(grants.check(g.id, 'unifi', { session: 'a@b' })).toBe(false) // unknown instance cannot present it
   })
 })
 
@@ -391,6 +418,27 @@ process.stdin.on('data', d => {
     const r = await child.call({ server: 'nope', command: '/nonexistent/binary', method: 'tools/list' })
     expect(r.ok).toBe(false)
     expect(r.data).toContain('spawn failed')
+  })
+
+  test('an unreadable file: env ref resolves {ok:false} instead of rejecting (node daemon must not crash)', async () => {
+    const child = new McpChild()
+    const r = await child.call({ server: 'badenv', command: process.execPath, args: ['-e', ''], env: { K: 'file:/nonexistent/secret' }, method: 'tools/list' })
+    expect(r.ok).toBe(false)
+    expect(r.data).toContain('cannot start')
+  })
+
+  test('a failed/slow initialize evicts the child: a later call respawns instead of reusing the dead entry', async () => {
+    // Server whose initialize response takes 300 ms; init timeout 50 ms → first call fails fast.
+    const child = new McpChild(undefined, () => {}, 50)
+    const slow = { server: 'flaky', command: process.execPath, args: ['-e', DELAYED_SERVER], method: 'tools/list' }
+    const r1 = await child.call(slow)
+    expect(r1.ok).toBe(false)
+    expect(r1.data).toContain('initialize handshake timed out')
+    // Same server name, but an instantly-initializing server: must spawn fresh and succeed.
+    const r2 = await child.call({ server: 'flaky', command: process.execPath, args: ['-e', FAKE_SERVER], env: {}, method: 'tools/list' })
+    expect(r2.ok).toBe(true)
+    expect(JSON.parse(r2.data).tools[0]).toMatchObject({ name: 'lookup' })
+    child.close()
   })
 })
 
