@@ -3,7 +3,8 @@
  *
  * The agent (Claude Code, Codex, agy, ...) talks MCP over our stdin/stdout. We run the real
  * client (src/plugin.ts) as a child and relay newline-delimited JSON-RPC both ways. Every
- * DISCORD_UPDATE_INTERVAL seconds we fast-forward the client git checkout; when its HEAD
+ * DISCORD_UPDATE_INTERVAL seconds we fast-forward the client git checkout to origin/release
+ * (DISCORD_UPDATE_BRANCH; CI moves it only after tests pass); when its HEAD
  * changes (or the child dies) we restart the child *without* the agent noticing:
  * the cached `initialize` request + `initialized` notification are replayed to the new child,
  * the duplicate initialize response is swallowed, and `notifications/tools/list_changed` tells
@@ -123,9 +124,12 @@ for (const s of ['SIGTERM', 'SIGINT'] as const) process.on(s, () => { shuttingDo
 // Periodic self-update (git fast-forward only; never touches local changes).
 function checkUpdate(): void {
   if (!isGit || intervalSec <= 0) return
+  // Follow origin/release (moved by CI only after tests pass), not main: a bad push must not
+  // reach live agents. Fast-forward only, so a dev checkout that is ahead is left alone.
+  const branch = process.env.DISCORD_UPDATE_BRANCH ?? 'release'
   try {
-    git('fetch', '-q', 'origin')
-    git('merge', '--ff-only', '-q', '@{u}')
+    git('fetch', '-q', 'origin', branch)
+    git('merge', '--ff-only', '-q', `origin/${branch}`)
   } catch {}
   const now = head()
   if (now && now !== runningHead) {
