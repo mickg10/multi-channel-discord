@@ -222,12 +222,12 @@ describe('node-local allowlist', () => {
   })
 
   test('local method allowlist is enforced; happy path carries env to the spec', () => {
-    const local = validateLocalMcp({ web: { command: 'bunx', args: ['-y', 'srv'], env: { K: 'file:/x' }, methods: ['search'] } })
+    const local = validateLocalMcp({ web: { command: 'bunx', args: ['-y', 'srv'], env: { K: 'file:/x' }, methods: ['search'], initTimeoutMs: 60_000 } })
     const denied = resolveLocalMcp(local, { callId: 'c', server: 'web', method: 'fetch' })
     expect(denied.ok).toBe(false)
     const ok = resolveLocalMcp(local, { callId: 'c', server: 'web', method: 'search', params: { q: 'x' } })
     expect(ok.ok).toBe(true)
-    if (ok.ok) expect(ok.spec).toMatchObject({ command: 'bunx', env: { K: 'file:/x' }, method: 'search' })
+    if (ok.ok) expect(ok.spec).toMatchObject({ command: 'bunx', env: { K: 'file:/x' }, method: 'search', initTimeoutMs: 60_000 })
   })
 
   test('resolveEnv maps file: refs to file contents', async () => {
@@ -438,6 +438,41 @@ process.stdin.on('data', d => {
     const r2 = await child.call({ server: 'flaky', command: process.execPath, args: ['-e', FAKE_SERVER], env: {}, method: 'tools/list' })
     expect(r2.ok).toBe(true)
     expect(JSON.parse(r2.data).tools[0]).toMatchObject({ name: 'lookup' })
+    child.close()
+  })
+
+  test('a per-server initTimeoutMs overrides the default (slow starters can come up)', async () => {
+    const child = new McpChild(undefined, () => {}, 50) // default would time out the 120 ms init
+    const r = await child.call({ server: 'slowok', command: process.execPath, args: ['-e', DELAYED_SERVER], method: 'tools/list', initTimeoutMs: 2000 })
+    expect(r.ok).toBe(true)
+    child.close()
+  })
+
+  test('multi-byte UTF-8 split across stdout chunks is decoded intact', async () => {
+    // Writes one reply in two raw byte chunks, splitting the 3-byte "€" between them.
+    const SPLIT_SERVER = `
+let buf = ''
+process.stdin.on('data', d => {
+  buf += d
+  let i
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1)
+    if (!line.trim()) continue
+    const m = JSON.parse(line)
+    if (m.method === 'initialize') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} }) + '\\n')
+    else if (m.method === 'tools/list') {
+      const bytes = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { text: 'price: €5' } }) + '\\n')
+      const cut = bytes.indexOf(0xe2) + 1
+      process.stdout.write(bytes.subarray(0, cut))
+      setTimeout(() => process.stdout.write(bytes.subarray(cut)), 30)
+    }
+  }
+})
+`
+    const child = new McpChild()
+    const r = await child.call({ server: 'utf8', command: process.execPath, args: ['-e', SPLIT_SERVER], method: 'tools/list' })
+    expect(r.ok).toBe(true)
+    expect(JSON.parse(r.data).text).toBe('price: €5')
     child.close()
   })
 })

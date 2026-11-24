@@ -300,6 +300,8 @@ export interface LocalMcpEntry {
   readonly env?: Readonly<Record<string, string>>
   /** Optional local method allowlist (defense in depth on top of the router's). */
   readonly methods?: readonly string[]
+  /** Initialize-handshake timeout for slow-starting servers (default 10 s). */
+  readonly initTimeoutMs?: number
 }
 
 export type LocalMcpConfig = Record<string, LocalMcpEntry>
@@ -316,6 +318,7 @@ export function validateLocalMcp(cfg: unknown): LocalMcpConfig {
       ...(Array.isArray(v.args) && { args: v.args }),
       ...(v.env && typeof v.env === 'object' && { env: v.env as Record<string, string> }),
       ...(Array.isArray(v.methods) && { methods: v.methods }),
+      ...(typeof v.initTimeoutMs === 'number' && v.initTimeoutMs > 0 && { initTimeoutMs: v.initTimeoutMs }),
     }
   }
   return out
@@ -342,6 +345,7 @@ export function resolveLocalMcp(local: LocalMcpConfig, req: McpExecRequest): { o
     spec: {
       server: req.server, command: entry.command,
       ...(entry.args && { args: entry.args }), ...(entry.env && { env: entry.env }),
+      ...(entry.initTimeoutMs && { initTimeoutMs: entry.initTimeoutMs }),
       method: req.method, ...(req.params !== undefined && { params: req.params }),
       timeoutMs: req.timeoutMs,
     },
@@ -356,6 +360,8 @@ export interface McpExecSpec {
   readonly method: string
   readonly params?: unknown
   readonly timeoutMs?: number
+  /** Overrides the McpChild default initialize timeout for this server. */
+  readonly initTimeoutMs?: number
 }
 
 /** Outcome of one node-side MCP operation. Failures are values, never rejections. */
@@ -433,8 +439,11 @@ export class McpChild {
     this.children.set(server, child)
     // Ownership guard: once this child is replaced, its events must not touch the successor.
     const isCurrent = () => this.children.get(server) === child
-    proc.stdout.on('data', (d: Buffer) => { if (isCurrent()) this.onStdout(server, child, d.toString()) })
-    proc.stderr.on('data', (d: Buffer) => this.log(`${server} stderr: ${String(d).trim().slice(0, 200)}`))
+    // Decode as a stream: per-chunk toString() would split multi-byte UTF-8 characters into U+FFFD.
+    proc.stdout.setEncoding('utf8')
+    proc.stderr.setEncoding('utf8')
+    proc.stdout.on('data', (d: string) => { if (isCurrent()) this.onStdout(server, child, d) })
+    proc.stderr.on('data', (d: string) => this.log(`${server} stderr: ${d.trim().slice(0, 200)}`))
     const failAll = (msg: string) => {
       if (isCurrent()) this.children.delete(server)
       for (const [id, p] of child.pending) { child.pending.delete(id); clearTimeout(p.timer); p.resolve({ ok: false, data: `${server}: ${msg}` }) }
@@ -442,15 +451,15 @@ export class McpChild {
     // Spawn errors (ENOENT etc.) arrive asynchronously as 'error', not from spawn() itself.
     proc.on('error', (err: Error) => failAll(`spawn failed: ${err.message}`))
     proc.on('exit', () => failAll('server process exited'))
-    child.ready = this.initialize(server, child)
+    child.ready = this.initialize(server, child, spec.initTimeoutMs ?? this.initTimeoutMs)
     return child
   }
 
   /** initialize → wait for the response → send notifications/initialized (MCP lifecycle). */
-  private async initialize(server: string, child: ChildState): Promise<McpOutcome> {
+  private async initialize(server: string, child: ChildState, timeoutMs: number): Promise<McpOutcome> {
     const r = await this.rpc(server, child, 'initialize', {
       protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'agent-bus', version: '0.1' },
-    }, this.initTimeoutMs, 'initialize handshake')
+    }, timeoutMs, 'initialize handshake')
     if (!r.ok) return r
     try { write(child, { method: 'notifications/initialized' }) } catch { /* server already gone; the next write fails */ }
     return { ok: true, data: '' }

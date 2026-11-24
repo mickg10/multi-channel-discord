@@ -52,7 +52,7 @@ export interface NodeConfig {
   agents: AgentConfig[]
   maxTurnsPerHour?: number
   turnTimeoutSec?: number
-  /** MCP servers this node is willing to host: name → {command, args?, env?, methods?}.
+  /** MCP servers this node is willing to host: name → {command, args?, env?, methods?, initTimeoutMs?}.
    *  The router never sends commands — it only names a server; the local allowlist decides
    *  what may actually be spawned here. env values may be "file:/path" (resolved at spawn). */
   mcpServers?: LocalMcpConfig

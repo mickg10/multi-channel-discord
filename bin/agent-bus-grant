@@ -13,7 +13,7 @@ import { Grants } from '../src/mcp.js'
 
 const [stateDir, cmd, ...rest] = process.argv.slice(2)
 if (!stateDir || !cmd || !['issue', 'list', 'revoke'].includes(cmd)) {
-  process.stderr.write('usage: bun bin/agent-bus-grant <stateDir> issue|list|revoke ...\n')
+  process.stderr.write('usage: bun bin/agent-bus-grant <stateDir> issue <server> [--session <name>] [--instance <id>] [--ttl-hours N] [--note "..."] | list | revoke <grantId>\n')
   process.exit(2)
 }
 
@@ -22,7 +22,7 @@ const grants = Grants.inStateDir(stateDir)
 if (cmd === 'list') {
   const all = grants.list()
   if (!all.length) console.log('no grants')
-  for (const g of all) console.log(`${g.id}  server=${g.server}${g.session ? `  session=${g.session}` : ''}  expires=${g.expires}${g.note ? `  (${g.note})` : ''}`)
+  for (const g of all) console.log(`${g.id}  server=${g.server}${g.session ? `  session=${g.session}` : ''}${g.instance ? `  instance=${g.instance}` : ''}  expires=${g.expires}${g.note ? `  (${g.note})` : ''}`)
   process.exit(0)
 }
 
