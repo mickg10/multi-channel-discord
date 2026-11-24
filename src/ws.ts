@@ -18,6 +18,7 @@
 import type { PluginToRouterMessage, WsRegistered, WsRenamed, WsError, WsToolResult, WsPermissionVerdict, WsAskUser, WsRegisterSkills, ChannelMeta } from './types.js'
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
+import type { Inboxes, NodeRegistry } from './nodes.js'
 
 /** Guild channel operations the router provides (mockable in tests). */
 export interface ChannelOps {
@@ -25,6 +26,8 @@ export interface ChannelOps {
   resolve(ref: string): Promise<{ id: string; name: string } | null>
   list(): Promise<Array<{ id: string; name: string; topic?: string | null }>>
   create(name: string, topic?: string): Promise<{ id: string; name: string }>
+  /** Move to the "archive" category and set its topic (optional: not all routers support it). */
+  archive?(id: string, topic: string): Promise<void>
 }
 import { chunk, assertSendable } from './discord.js'
 import { noteSent, getStateDir } from './access.js'
@@ -46,6 +49,8 @@ export interface WsData {
   sendCallback: ((msg: string) => void) | null
   /** True once the plugin has registered with the correct shared secret. */
   authed?: boolean
+  /** Set when this connection is a node daemon. */
+  nodeName?: string
 }
 
 export interface WsDeps {
@@ -69,6 +74,45 @@ export interface WsDeps {
   /** Channel subscriptions (agent bus beyond the default channel). */
   readonly subs?: Subscriptions
   readonly channelOps?: ChannelOps
+  /** Durable per-agent inboxes and node-owned (headless) agents. */
+  readonly inboxes?: Inboxes
+  readonly nodes?: NodeRegistry
+  /** Channel where every to="human" post lands; everyone receives the human's posts there. */
+  readonly humanChannelId?: string
+  /** Bus rules sent once to every session on (first) register. */
+  readonly rules?: () => { text: string; seen(name: string): boolean; markSeen(name: string): void } | null
+}
+
+/** Sessions with mode 'pull' (no channel push): their traffic is queued, not pushed. */
+const pullSessions = new Set<string>()
+
+/** Every addressable agent name: live sessions plus node agents that are between turns. */
+function allNames(deps: Readonly<WsDeps>): string[] {
+  const out = new Set(deps.sessions.getSessions().map(s => s.name))
+  for (const a of deps.nodes?.list() ?? []) out.add(a.name)
+  return [...out]
+}
+
+/**
+ * Deliver one message to one agent: push to a live push-mode session; otherwise queue it in the
+ * durable inbox and, if a node owns the agent, ask the node to run a turn.
+ */
+export function deliver(deps: Readonly<WsDeps>, name: string, text: string, meta: ChannelMeta): boolean {
+  const live = deps.sessions.getSessions().some(s => s.name === name)
+  if (live && !pullSessions.has(name)) return deps.sessions.routeToSession(name, text, meta)
+  if (!deps.inboxes) return live ? deps.sessions.routeToSession(name, text, meta) : false
+  if (!live && !deps.nodes?.get(name)) return false
+  const n = deps.inboxes.push(name, text, meta)
+  // A live pull session is mid-turn and will check_inbox; the node re-checks after the turn.
+  if (!live) deps.nodes?.wake(name, n)
+  return true
+}
+
+function sendRulesOnce(deps: Readonly<WsDeps>, name: string): void {
+  const r = deps.rules?.()
+  if (!r || r.seen(name)) return
+  r.markSeen(name)
+  deliver(deps, name, r.text, { source: 'agent-bus', from: 'router', user: 'router', to: name, channel: 'rules', chat_id: deps.busChannelId })
 }
 
 export interface WsLike {
@@ -108,6 +152,12 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
     },
 
     close(ws: WsLike): void {
+      if (ws.data.nodeName && ws.data.sendCallback) {
+        deps.nodes?.unregister(ws.data.nodeName, ws.data.sendCallback)
+        deps.onSessionChange?.()
+        return
+      }
+      if (ws.data.sessionName) pullSessions.delete(ws.data.sessionName)
       // Clean up any pending permission requests associated with this WS
       for (const [reqId, reqWs] of permissionSessions) {
         if (reqWs === ws) {
@@ -147,6 +197,33 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
     return
   }
   switch (parsed.type) {
+    case 'registerNode': {
+      if (deps.secret && parsed.secret !== deps.secret) { sendError(ws, 'register rejected: bad or missing router secret'); return }
+      if (!deps.nodes || !hasString(parsed, 'node') || !Array.isArray(parsed.agents)) { sendError(ws, 'registerNode requires node and agents (and a router with nodes enabled)'); return }
+      ws.data.authed = true
+      ws.data.nodeName = parsed.node
+      const send = (m: string) => ws.send(m)
+      ws.data.sendCallback = send
+      deps.nodes.register(parsed.node, send, parsed.agents)
+      ws.send(JSON.stringify({ type: 'nodeRegistered', node: parsed.node, agents: parsed.agents.map(a => a.name) }))
+      for (const a of parsed.agents) {
+        sendRulesOnce(deps, a.name)
+        // Wake agents that have mail waiting from while the node was away.
+        const n = deps.inboxes?.count(a.name) ?? 0
+        if (n > 0 && !deps.sessions.getSessions().some(s => s.name === a.name)) deps.nodes.wake(a.name, n)
+      }
+      deps.onSessionChange?.()
+      break
+    }
+    case 'inboxPull':
+    case 'inboxCount': {
+      if (!hasString(parsed, 'requestId')) { sendError(ws, 'inbox op requires requestId'); return }
+      const who = parsed.type === 'inboxCount' ? parsed.agent : ws.data.sessionName
+      if (!who) { sendToolResult(ws, parsed.requestId, false, 'not registered'); return }
+      if (parsed.type === 'inboxCount') sendToolResult(ws, parsed.requestId, true, String(deps.inboxes?.count(who) ?? 0))
+      else sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.inboxes?.drain(who) ?? []))
+      break
+    }
     case 'busPost':
       if (!hasString(parsed, 'text')) {
         sendError(ws, 'busPost requires text')
@@ -165,6 +242,7 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
     case 'channelCreate':
     case 'channelSubscribe':
     case 'channelUnsubscribe':
+    case 'channelArchive':
       if (!hasString(parsed, 'requestId')) {
         sendError(ws, 'channel operation requires requestId')
         return
@@ -176,9 +254,19 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         sendError(ws, 'listSessions requires requestId')
         return
       }
-      sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.sessions.getSessions().map(s => ({
-        name: s.name, projectPath: s.projectPath, connectedAt: new Date(s.connectedAt).toISOString(),
-      }))))
+      {
+        const live = deps.sessions.getSessions().map(s => ({
+          name: s.name, projectPath: s.projectPath, connectedAt: new Date(s.connectedAt).toISOString(),
+          state: deps.nodes?.get(s.name) ? 'running' : 'live',
+          ...(deps.nodes?.get(s.name) && { node: deps.nodes.get(s.name)!.node }),
+        }))
+        const liveNames = new Set(live.map(s => s.name))
+        const asleep = (deps.nodes?.list() ?? []).filter(a => !liveNames.has(a.name)).map(a => ({
+          name: a.name, projectPath: a.cwd ?? '', connectedAt: '', state: 'idle', node: a.node,
+          pending: deps.inboxes?.count(a.name) ?? 0,
+        }))
+        sendToolResult(ws, parsed.requestId, true, JSON.stringify([...live, ...asleep]))
+      }
       break
     case 'register':
       if (!hasString(parsed, 'name') || !hasString(parsed, 'projectPath')) {
@@ -191,6 +279,15 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       }
       ws.data.authed = true
       handleRegister(ws, parsed.name, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
+      if (ws.data.sessionName) {
+        if ((parsed as { mode?: string }).mode === 'pull') pullSessions.add(ws.data.sessionName)
+        else {
+          pullSessions.delete(ws.data.sessionName)
+          // Messages queued while this agent was offline: push them now.
+          for (const q of deps.inboxes?.drain(ws.data.sessionName) ?? []) deps.sessions.routeToSession(ws.data.sessionName, q.content, { ...q.meta, queued_at: q.at })
+        }
+        sendRulesOnce(deps, ws.data.sessionName)
+      }
       break
     case 'deregister':
       handleDeregister(ws, deps)
@@ -733,8 +830,8 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
 
 /** Sessions that receive untargeted traffic in a channel: everyone for the default bus, else subscribers. */
 function audience(channelId: string, deps: Readonly<WsDeps>): string[] {
-  const live = deps.sessions.getSessions().map(s => s.name)
-  if (channelId === deps.busChannelId) return live
+  const live = allNames(deps)
+  if (channelId === deps.busChannelId || channelId === deps.humanChannelId) return live
   const subs = new Set(deps.subs?.subscribers(channelId) ?? [])
   return live.filter(n => subs.has(n))
 }
@@ -760,7 +857,7 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   times.push(now)
   busPostTimes.set(from, times)
 
-  const names = deps.sessions.getSessions().map(s => s.name).filter(n => n !== from)
+  const names = allNames(deps).filter(n => n !== from)
   let targets: string[] = audience(channelId, deps).filter(n => n !== from)
   let toLabel = channelId === deps.busChannelId ? 'all' : 'subscribers'
   if (to && HUMAN_TARGETS.has(to.toLowerCase())) {
@@ -779,8 +876,11 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     toLabel = pick.join(', ')
   }
 
-  for (const c of chunk(`**[${from} → ${toLabel}]** ${text}`, deps.chunkLimit, deps.chunkMode)) {
-    sendToDiscord(deps.client, channelId, c)
+  const toHuman = toLabel === 'human' && deps.humanChannelId && deps.humanChannelId !== channelId
+  const where = toHuman ? deps.humanChannelId! : channelId
+  const origin = toHuman ? ` (from ${channelName ? `#${channelName}` : channelId === deps.busChannelId ? '#general' : channelId})` : ''
+  for (const c of chunk(`**[${from} → ${toLabel}]**${origin} ${text}`, deps.chunkLimit, deps.chunkMode)) {
+    sendToDiscord(deps.client, where, c)
   }
 
   const meta: ChannelMeta = {
@@ -792,15 +892,16 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     to: toLabel,
     ts: new Date(now).toISOString(),
   }
-  for (const name of targets) deps.sessions.routeToSession(name, text, meta)
+  for (const name of targets) deliver(deps, name, text, meta)
 }
 
 /**
  * Deliver a human-authored message posted in the bus channel. A leading "@name"
  * (or "name:") targets one session; otherwise every session receives it.
  */
-export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager, audienceNames?: readonly string[]): string[] {
-  const names = sessions.getSessions().map(s => s.name)
+export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager, audienceNames?: readonly string[], deps?: Readonly<WsDeps>): string[] {
+  const names = deps ? allNames(deps) : sessions.getSessions().map(s => s.name)
+  const send = (n: string, t: string, m: ChannelMeta) => deps ? deliver(deps, n, t, m) : sessions.routeToSession(n, t, m)
   const everyone = audienceNames ? names.filter(n => audienceNames.includes(n)) : names
   const m = content.match(/^\s*@?([\w.@:/-]+?)[:,]?\s+([\s\S]*)$/)
   if (m) {
@@ -808,15 +909,15 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
     const exact = names.filter(n => n === want)
     const pick = exact.length === 1 ? exact : names.filter(n => n.startsWith(want))
     if (pick.length > 0) {
-      for (const n of pick) sessions.routeToSession(n, m[2], { ...meta, to: pick.join(', ') })
+      for (const n of pick) send(n, m[2], { ...meta, to: pick.join(', ') })
       return pick
     }
   }
-  for (const n of everyone) sessions.routeToSession(n, content, { ...meta, to: audienceNames ? 'subscribers' : 'all' })
+  for (const n of everyone) send(n, content, { ...meta, to: audienceNames ? 'subscribers' : 'all' })
   return everyone
 }
 
-async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string }, deps: Readonly<WsDeps>): Promise<void> {
+async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string }, deps: Readonly<WsDeps>): Promise<void> {
   const me = ws.data.sessionName
   const ops = deps.channelOps
   const subs = deps.subs
@@ -828,8 +929,9 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       const out = list.map(c => ({
         id: c.id, name: c.name, topic: c.topic ?? undefined,
         default: c.id === deps.busChannelId,
-        subscribed: c.id === deps.busChannelId || subs.has(me, c.id),
-        subscribers: c.id === deps.busChannelId ? ['(everyone)'] : subs.subscribers(c.id),
+        human: c.id === deps.humanChannelId,
+        subscribed: c.id === deps.busChannelId || c.id === deps.humanChannelId || subs.has(me, c.id),
+        subscribers: c.id === deps.busChannelId || c.id === deps.humanChannelId ? ['(everyone)'] : subs.subscribers(c.id),
       }))
       sendToolResult(ws, msg.requestId, true, JSON.stringify(out))
       return
@@ -846,6 +948,19 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
     if (!ch) { sendToolResult(ws, msg.requestId, false, `Unknown channel "${msg.channel ?? ''}" (use channel_list)`); return }
     if (ch.id === deps.busChannelId) {
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, note: 'default bus channel: every session always receives it' }))
+      return
+    }
+    if (msg.type === 'channelArchive') {
+      if (ch.id === deps.humanChannelId) { sendToolResult(ws, msg.requestId, false, 'cannot archive the human channel'); return }
+      const repl = msg.replacement ? await ops.resolve(msg.replacement) : null
+      if (msg.replacement && !repl) { sendToolResult(ws, msg.requestId, false, `Unknown replacement channel "${msg.replacement}"`); return }
+      if (repl?.id === ch.id) { sendToolResult(ws, msg.requestId, false, 'replacement is the same channel'); return }
+      const note = `ARCHIVED by ${me}${repl ? ` — continue in #${repl.name} (${repl.id})` : ''}`
+      if (ops.archive) await ops.archive(ch.id, note)
+      const moved = subs.subscribers(ch.id)
+      for (const n of moved) { subs.remove(n, ch.id); if (repl) subs.add(n, repl.id) }
+      sendToDiscord(deps.client, ch.id, `**${note}**`)
+      sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, archived: true, movedSubscribers: moved, ...(repl && { replacement: repl }) }))
       return
     }
     const changed = msg.type === 'channelSubscribe' ? subs.add(me, ch.id) : subs.remove(me, ch.id)

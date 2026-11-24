@@ -10,7 +10,7 @@
 import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './access.js'
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
-import { createWsHandlers, handlePermissionButton, routeHumanBusMessage } from './ws.js'
+import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, deliver as deliverFn } from './ws.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete, updateSkillCommands, isSkillCommand } from './slash-commands.js'
@@ -18,6 +18,10 @@ import type { SlashCommandDeps, SkillEntry } from './slash-commands.js'
 import type { ChannelMeta } from './types.js'
 import { ActivityType, ChannelType, type Message, type Guild } from 'discord.js'
 import { Subscriptions } from './subscriptions.js'
+import { Inboxes, NodeRegistry } from './nodes.js'
+import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { join as pjoin } from 'node:path'
 import type { ChannelOps } from './ws.js'
 
 // Load token from ~/.claude/channels/discord/.env
@@ -32,6 +36,8 @@ const ROUTER_SECRET = process.env.DISCORD_ROUTER_SECRET || undefined
 // Discord channel used as the agent bus (agent <-> agent messages). Unset = bus disabled.
 const BUS_CHANNEL = process.env.DISCORD_BUS_CHANNEL || undefined
 const BUS_MAX_PER_MIN = parseInt(process.env.DISCORD_BUS_MAX_PER_MIN ?? '12', 10)
+// Channel where agents' to="human" posts land (questions / approvals for the human).
+const HUMAN_CHANNEL = process.env.DISCORD_HUMAN_CHANNEL || undefined
 if (WS_HOST !== '127.0.0.1' && WS_HOST !== 'localhost' && !ROUTER_SECRET) {
   process.stderr.write('discord channel: refusing to bind non-localhost without DISCORD_ROUTER_SECRET\n')
   process.exit(1)
@@ -117,6 +123,26 @@ const access = loadAccess()
 // ============================================================
 
 const subs = Subscriptions.inStateDir(STATE_DIR)
+const inboxes = Inboxes.inStateDir(STATE_DIR)
+const nodes = new NodeRegistry()
+
+// Rules of comms: ${STATE_DIR}/rules.md, delivered once per session name per rules version.
+const RULES_FILE = pjoin(STATE_DIR, 'rules.md')
+const RULES_SEEN = pjoin(STATE_DIR, 'rules-seen.json')
+function rulesProvider() {
+  if (!existsSync(RULES_FILE)) return null
+  let text = ''
+  try { text = readFileSync(RULES_FILE, 'utf8').trim() } catch { return null }
+  if (!text) return null
+  const hash = createHash('sha256').update(text).digest('hex').slice(0, 12)
+  let seen: Record<string, string> = {}
+  try { seen = JSON.parse(readFileSync(RULES_SEEN, 'utf8')) } catch {}
+  return {
+    text: `${text}\n\n(rules v${hash} — sent once by the router; also in the #general topic)`,
+    seen: (name: string) => seen[name] === hash,
+    markSeen: (name: string) => { seen[name] = hash; try { writeFileSync(RULES_SEEN, JSON.stringify(seen, null, 2)) } catch {} },
+  }
+}
 
 async function busGuild(): Promise<Guild> {
   if (!BUS_CHANNEL) throw new Error('bus disabled')
@@ -167,9 +193,20 @@ const channelOps: ChannelOps = {
     })
     return { id: ch.id, name: ch.name }
   },
+  async archive(id: string, topic: string) {
+    const guild = await busGuild()
+    const catInfo = (await guildChannels(guild)).find(c => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === 'archive')
+    const cat = catInfo ?? await guild.channels.create({ name: 'archive', type: ChannelType.GuildCategory, reason: 'agent-bus channel_archive' })
+    const ch = guild.channels.cache.get(id) ?? await guild.channels.fetch(id)
+    if (ch && ch.type === ChannelType.GuildText) {
+      await ch.edit({ parent: cat!.id, topic: topic.slice(0, 1000), reason: 'agent-bus channel_archive' })
+    }
+  },
 }
 
-const wsHandlers = createWsHandlers({
+let wsDepsRef: Parameters<typeof createWsHandlers>[0]
+function deliverTo(name: string, text: string, meta: ChannelMeta): void { deliverFn(wsDepsRef, name, text, meta) }
+const wsHandlers = createWsHandlers(wsDepsRef = {
   sessions,
   history,
   client,
@@ -184,6 +221,10 @@ const wsHandlers = createWsHandlers({
   busMaxPerMinute: BUS_MAX_PER_MIN,
   subs: BUS_CHANNEL ? subs : undefined,
   channelOps: BUS_CHANNEL ? channelOps : undefined,
+  inboxes,
+  nodes,
+  humanChannelId: HUMAN_CHANNEL,
+  rules: rulesProvider,
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
     updateSkillCommands(client, skills).catch((err: unknown) => {
       process.stderr.write(`discord channel: skill command registration failed: ${err instanceof Error ? err.message : String(err)}\n`)
@@ -229,7 +270,7 @@ const wsServer = Bun.serve<WsData>({
   },
 })
 
-process.stderr.write(`discord channel: WS server listening on ${WS_HOST}:${WS_PORT} (auth=${ROUTER_SECRET ? 'secret' : 'none'}, bus=${BUS_CHANNEL ?? 'off'})\n`)
+process.stderr.write(`discord channel: WS server listening on ${WS_HOST}:${WS_PORT} (auth=${ROUTER_SECRET ? 'secret' : 'none'}, bus=${BUS_CHANNEL ?? 'off'}, human=${HUMAN_CHANNEL ?? 'off'})\n`)
 
 // ============================================================
 // PID management
@@ -273,8 +314,24 @@ async function handleBusInbound(msg: Message): Promise<void> {
   }
   let channelName: string | undefined
   try { channelName = 'name' in msg.channel ? (msg.channel as { name: string }).name : undefined } catch {}
-  const audienceNames = msg.channelId === BUS_CHANNEL ? undefined : subs.subscribers(msg.channelId)
-  const delivered = routeHumanBusMessage(content, { ...meta, ...(channelName && { channel: channelName }) }, sessions, audienceNames)
+  const fullMeta: ChannelMeta = { ...meta, ...(channelName && { channel: channelName }) }
+  // A Discord reply to an agent's post goes to that agent only ("**[name → ...]**" prefix).
+  let delivered: string[] = []
+  if (msg.reference?.messageId) {
+    try {
+      const ref = await msg.channel.messages.fetch(msg.reference.messageId)
+      const m = ref.author.id === client.user?.id ? ref.content.match(/^\*\*\[([^\]\s]+) →/) : null
+      if (m) {
+        const asker = m[1]
+        deliverTo(asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id })
+        delivered = [asker]
+      }
+    } catch {}
+  }
+  if (delivered.length === 0) {
+    const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
+    delivered = routeHumanBusMessage(content, fullMeta, sessions, everyone ? undefined : subs.subscribers(msg.channelId), wsDepsRef)
+  }
   process.stderr.write(`discord: bus message from ${msg.author.username} -> ${delivered.join(',') || '(no sessions)'}\n`)
   if (delivered.length === 0) {
     await msg.reply('No agent sessions are connected.').catch(() => {})
@@ -284,7 +341,7 @@ async function handleBusInbound(msg: Message): Promise<void> {
 }
 
 async function handleInbound(msg: Message): Promise<void> {
-  if (BUS_CHANNEL && (msg.channelId === BUS_CHANNEL || subs.channels().has(msg.channelId))) return handleBusInbound(msg)
+  if (BUS_CHANNEL && (msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL || subs.channels().has(msg.channelId))) return handleBusInbound(msg)
   process.stderr.write(`discord: inbound from ${msg.author.username}: "${msg.content.slice(0, 50)}" action=`)
   const result = await gate(msg)
   process.stderr.write(`${result.action}\n`)

@@ -24,6 +24,8 @@ export interface WsRegister {
   readonly instanceId?: string
   /** Shared secret; required when the router sets DISCORD_ROUTER_SECRET. */
   readonly secret?: string
+  /** 'pull' = cannot receive pushes; messages are queued for check_inbox. Default 'push'. */
+  readonly mode?: 'push' | 'pull'
 }
 
 /** Plugin → Router: rename this session */
@@ -129,14 +131,33 @@ export interface WsChannelPost {
 
 /** Channel management, answered with a toolResult. */
 export interface WsChannelOp {
-  readonly type: 'channelList' | 'channelCreate' | 'channelSubscribe' | 'channelUnsubscribe'
+  readonly type: 'channelList' | 'channelCreate' | 'channelSubscribe' | 'channelUnsubscribe' | 'channelArchive'
   readonly requestId: string
   readonly channel?: string
   readonly name?: string
   readonly topic?: string
+  /** channelArchive: where the conversation continues. */
+  readonly replacement?: string
+}
+
+/** A per-machine node daemon announcing the headless agents it runs. */
+export interface WsRegisterNode {
+  readonly type: 'registerNode'
+  readonly node: string
+  readonly secret?: string
+  readonly agents: ReadonlyArray<{ readonly name: string; readonly kind: string; readonly cwd?: string }>
+}
+
+/** Pull (and clear) this session's durable inbox, or (node) count another agent's. */
+export interface WsInboxOp {
+  readonly type: 'inboxPull' | 'inboxCount'
+  readonly requestId: string
+  readonly agent?: string
 }
 
 export type PluginToRouterMessage =
+  | WsRegisterNode
+  | WsInboxOp
   | WsChannelPost
   | WsChannelOp
   | WsBusPost

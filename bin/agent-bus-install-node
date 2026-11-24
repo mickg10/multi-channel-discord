@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Install / update an agent-bus node on this machine (Linux systemd or macOS launchd).
+#
+#   agent-bus-install-node --router ws://HOST:8789 --secret-file FILE [--node NAME] [--user USER]
+#
+#   --router       router URL (stored in ~/.claude/channels/discord/.env)
+#   --secret-file  file containing the router shared secret (never pass it on the command line)
+#   --node         node name (default: short hostname)
+#   --user         (Linux, when run as root) the account the agents run as; installs a system unit
+#
+# Idempotent. Re-running updates the clone, PATH and the service. It never overwrites an existing
+# ~/.config/agent-bus/node.json (agents list) — edit that file, the node picks it up on restart
+# (`systemctl restart agent-bus-node` / `launchctl kickstart -k gui/$UID/net.agent-bus.node`).
+set -euo pipefail
+
+ROUTER="" SECRET_FILE="" NODE="" RUN_AS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --router) ROUTER="$2"; shift 2 ;;
+    --secret-file) SECRET_FILE="$2"; shift 2 ;;
+    --node) NODE="$2"; shift 2 ;;
+    --user) RUN_AS="$2"; shift 2 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "unknown arg $1" >&2; exit 1 ;;
+  esac
+done
+
+OS="$(uname -s)"
+if [ "$OS" = Linux ] && [ "$(id -u)" = 0 ] && [ -n "$RUN_AS" ]; then
+  # Re-run the per-user part as the agent account, then install a system unit.
+  SELF="$(readlink -f "$0")"
+  args=(); [ -n "$ROUTER" ] && args+=(--router "$ROUTER"); [ -n "$NODE" ] && args+=(--node "$NODE")
+  if [ -n "$SECRET_FILE" ]; then tmp=$(mktemp); cp "$SECRET_FILE" "$tmp"; chown "$RUN_AS" "$tmp"; args+=(--secret-file "$tmp"); fi
+  su - "$RUN_AS" -c "AGENT_BUS_NO_SERVICE=1 bash '$SELF' ${args[*]@Q}"
+  [ -n "${tmp:-}" ] && rm -f "$tmp"
+  H=$(getent passwd "$RUN_AS" | cut -d: -f6)
+  UPATH=$(su - "$RUN_AS" -c 'cat ~/.config/agent-bus/path')
+  cat > /etc/systemd/system/agent-bus-node.service <<EOF
+[Unit]
+Description=agent-bus node (headless Claude/Codex/agy agents for the Discord agent bus)
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+User=$RUN_AS
+WorkingDirectory=$H
+Environment=HOME=$H
+Environment=PATH=$UPATH
+ExecStart=$H/.bun/bin/bun $H/src/multi-channel-discord/src/node.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable agent-bus-node >/dev/null
+  systemctl restart agent-bus-node
+  sleep 3; systemctl --no-pager -l status agent-bus-node | sed -n 1,12p
+  exit 0
+fi
+
+# ---- per-user part ----
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash >/dev/null
+DIR="$HOME/src/multi-channel-discord"
+if [ -d "$DIR/.git" ]; then
+  git -C "$DIR" fetch -q origin release && git -C "$DIR" merge -q --ff-only origin/release || true
+else
+  mkdir -p "$HOME/src" && git clone -q -b release https://github.com/mickg10/multi-channel-discord.git "$DIR"
+fi
+(cd "$DIR" && bun install --no-summary >/dev/null)
+
+ENVD="$HOME/.claude/channels/discord"; mkdir -p "$ENVD"; chmod 700 "$ENVD"; touch "$ENVD/.env"; chmod 600 "$ENVD/.env"
+setkv() { grep -v "^$1=" "$ENVD/.env" > "$ENVD/.env.tmp" || true; echo "$1=$2" >> "$ENVD/.env.tmp"; mv "$ENVD/.env.tmp" "$ENVD/.env"; chmod 600 "$ENVD/.env"; }
+[ -n "$ROUTER" ] && setkv DISCORD_ROUTER_URL "$ROUTER"
+[ -n "$SECRET_FILE" ] && setkv DISCORD_ROUTER_SECRET "$(tr -d '\n' < "$SECRET_FILE")"
+[ -n "$NODE" ] && setkv DISCORD_HOST_LABEL "$NODE"
+grep -q '^DISCORD_ROUTER_URL=' "$ENVD/.env" || echo "WARNING: no router URL in $ENVD/.env (use --router)" >&2
+
+CFGD="$HOME/.config/agent-bus"; mkdir -p "$CFGD"
+NODE_NAME="${NODE:-$(hostname -s | tr '[:upper:]' '[:lower:]')}"
+if [ ! -f "$CFGD/node.json" ]; then
+  cat > "$CFGD/node.json" <<EOF
+{
+  "node": "$NODE_NAME",
+  "maxTurnsPerHour": 20,
+  "turnTimeoutSec": 1800,
+  "agents": []
+}
+EOF
+  echo "created $CFGD/node.json — add agents (see README: kind claude|codex|agy, name, cwd, env, args)"
+fi
+
+# PATH for the service: wherever the agent CLIs live right now.
+P="$HOME/.bun/bin:$HOME/.local/bin"
+for c in claude codex agy node git; do d=$(dirname "$(command -v $c 2>/dev/null || echo /nonexistent/x)"); [ -d "$d" ] && P="$P:$d"; done
+P="$P:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+echo "$P" > "$CFGD/path"
+
+[ "${AGENT_BUS_NO_SERVICE:-}" = 1 ] && exit 0
+
+if [ "$OS" = Darwin ]; then
+  PL="$HOME/Library/LaunchAgents/net.agent-bus.node.plist"
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  cat > "$PL" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>net.agent-bus.node</string>
+  <key>ProgramArguments</key><array><string>$HOME/.bun/bin/bun</string><string>$DIR/src/node.ts</string></array>
+  <key>WorkingDirectory</key><string>$HOME</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$P</string><key>HOME</key><string>$HOME</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/agent-bus-node.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/agent-bus-node.log</string>
+</dict></plist>
+EOF
+  launchctl bootout "gui/$(id -u)/net.agent-bus.node" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PL"
+  sleep 3; tail -3 "$HOME/Library/Logs/agent-bus-node.log" 2>/dev/null || true
+  echo "installed launchd agent net.agent-bus.node (log: ~/Library/Logs/agent-bus-node.log)"
+else
+  UD="$HOME/.config/systemd/user"; mkdir -p "$UD"
+  cat > "$UD/agent-bus-node.service" <<EOF
+[Unit]
+Description=agent-bus node
+
+[Service]
+Environment=PATH=$P
+ExecStart=$HOME/.bun/bin/bun $DIR/src/node.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload && systemctl --user enable --now agent-bus-node
+  echo "installed systemd --user unit agent-bus-node. For it to run without a login: sudo loginctl enable-linger $USER"
+fi
