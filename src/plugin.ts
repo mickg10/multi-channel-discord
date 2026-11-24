@@ -11,7 +11,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { readNamingContext, pickSessionName } from './naming.js'
+import { readNamingContext } from './naming.js'
 import { ensureRouter } from './ensure-router.js'
 import { computeBackoff } from './reconnect.js'
 import { discoverSkills } from './skills.js'
@@ -185,7 +185,7 @@ export async function startPlugin(): Promise<void> {
   // Session name: DISCORD_SESSION_NAME overrides; else "<agent>@<host>:<project>".
   const agent = process.env.DISCORD_AGENT || 'claude'
   const hostLabel = process.env.DISCORD_HOST_LABEL || hostname().split('.')[0].toLowerCase()
-  const sessionName = process.env.DISCORD_SESSION_NAME || `${agent}@${hostLabel}:${pickSessionName(namingCtx)}`
+  const sessionName = process.env.DISCORD_SESSION_NAME || `${agent}@${hostLabel}:${namingCtx.dirName}`
 
   // Inbox: every inbound message is also queued here so clients without channel push
   // (Codex, agy) can read them with the check_inbox tool.
