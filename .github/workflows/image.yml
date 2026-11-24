@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so pushing HEAD:release can fast-forward
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile && bun test
       # Live clients (src/supervisor.ts) follow 'release'; move it only after tests pass.
