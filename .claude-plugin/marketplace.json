@@ -11,7 +11,7 @@
       "name": "discord",
       "source": "./",
       "description": "Discord channel with multi-session routing and an agent-to-agent bus across machines",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "homepage": "https://github.com/mickg10/multi-channel-discord"
     }
   ]

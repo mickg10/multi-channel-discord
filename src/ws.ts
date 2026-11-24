@@ -18,7 +18,7 @@
 import type { PluginToRouterMessage, WsRegistered, WsRenamed, WsError, WsToolResult, WsPermissionVerdict, WsAskUser, WsRegisterSkills, ChannelMeta } from './types.js'
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
-import type { Inboxes, NodeRegistry } from './nodes.js'
+import type { Inboxes, NodeRegistry, Claims } from './nodes.js'
 
 /** Guild channel operations the router provides (mockable in tests). */
 export interface ChannelOps {
@@ -77,6 +77,7 @@ export interface WsDeps {
   /** Durable per-agent inboxes and node-owned (headless) agents. */
   readonly inboxes?: Inboxes
   readonly nodes?: NodeRegistry
+  readonly claims?: Claims
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
   readonly humanChannelId?: string
   /** Bus rules sent once to every session on (first) register. */
@@ -215,6 +216,29 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       deps.onSessionChange?.()
       break
     }
+    case 'claim':
+    case 'releaseClaim':
+    case 'listClaims': {
+      if (!hasString(parsed, 'requestId')) { sendError(ws, 'claim op requires requestId'); return }
+      const me = ws.data.sessionName
+      if (!me || !deps.claims) { sendToolResult(ws, parsed.requestId, false, me ? 'claims disabled' : 'not registered'); return }
+      if (parsed.type === 'listClaims') { sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.claims.list())); return }
+      if (!parsed.task) { sendToolResult(ws, parsed.requestId, false, 'task required'); return }
+      const r = parsed.type === 'claim' ? deps.claims.claim(parsed.task, me, parsed.note) : deps.claims.release(parsed.task, me, parsed.to)
+      sendToolResult(ws, parsed.requestId, true, JSON.stringify(r))
+      break
+    }
+    case 'agentStatus': {
+      // For nodes: is an interactive (push) session holding this name? Then the node must not run
+      // a headless turn on the same conversation; any queued mail is handed to the live session.
+      const p = parsed as { requestId?: string; agent?: string }
+      if (!p.requestId || !p.agent) { sendError(ws, 'agentStatus requires requestId and agent'); return }
+      const live = deps.sessions.getSessions().some(s => s.name === p.agent)
+      const push = live && !pullSessions.has(p.agent)
+      if (push) for (const q of deps.inboxes?.drain(p.agent) ?? []) deps.sessions.routeToSession(p.agent, q.content, { ...q.meta, queued_at: q.at })
+      sendToolResult(ws, p.requestId, true, JSON.stringify({ live, mode: live ? (push ? 'push' : 'pull') : null, pending: deps.inboxes?.count(p.agent) ?? 0 }))
+      break
+    }
     case 'inboxPull':
     case 'inboxCount': {
       if (!hasString(parsed, 'requestId')) { sendError(ws, 'inbox op requires requestId'); return }
@@ -278,6 +302,15 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         return
       }
       ws.data.authed = true
+      {
+        // Headless turns (pull mode) re-register the same name each turn; replace the stale
+        // slot instead of creating "name-2" that nobody reads.
+        const p = parsed as { mode?: string; takeover?: boolean; instanceId?: string }
+        const stale = deps.sessions.getSessions().find(s => s.name === parsed.name)
+        if (stale && (p.takeover || p.mode === 'pull')) {
+          try { deps.sessions.deregisterSession(parsed.name) } catch {}
+        }
+      }
       handleRegister(ws, parsed.name, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
       if (ws.data.sessionName) {
         if ((parsed as { mode?: string }).mode === 'pull') pullSessions.add(ws.data.sessionName)

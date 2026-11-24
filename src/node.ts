@@ -32,7 +32,7 @@ const HOME = homedir()
 const expand = (p: string) => p.replace(/^~(?=$|\/)/, HOME)
 const log = (m: string) => process.stderr.write(`${new Date().toISOString()} agent-bus node: ${m}\n`)
 
-export type Kind = 'claude' | 'codex' | 'agy'
+export type Kind = 'claude' | 'codex' | 'agy' | 'opencode'
 export interface AgentConfig {
   name: string
   kind: Kind
@@ -56,9 +56,11 @@ const MCP_LAUNCHER = join(CODE_DIR, 'bin', 'agent-bus-mcp')
 const CONFIG_FILE = expand(process.env.AGENT_BUS_NODE_CONFIG ?? '~/.config/agent-bus/node.json')
 const STATE_FILE = join(dirname(CONFIG_FILE), 'node-state.json')
 const ENV_FILE = expand(process.env.DISCORD_STATE_DIR ? `${process.env.DISCORD_STATE_DIR}/.env` : '~/.claude/channels/discord/.env')
+/** Sentinel session: continue the most recent conversation in the agent's cwd (adopt an existing one). */
+export const LAST = 'last'
 const DISCORD_TOOLS = ['bus_post', 'bus_sessions', 'check_inbox', 'reply', 'react', 'edit_message', 'fetch_messages',
   'download_attachment', 'ask_user', 'channel_post', 'channel_list', 'channel_create', 'channel_subscribe',
-  'channel_unsubscribe', 'channel_archive']
+  'channel_unsubscribe', 'channel_archive', 'claim', 'release_claim', 'list_claims']
 
 function readEnvFile(): Record<string, string> {
   const out: Record<string, string> = {}
@@ -75,7 +77,7 @@ function loadConfig(): NodeConfig {
   const c = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) as NodeConfig
   if (!Array.isArray(c.agents)) throw new Error(`${CONFIG_FILE}: "agents" must be an array`)
   for (const a of c.agents) {
-    if (!a.name || !['claude', 'codex', 'agy'].includes(a.kind)) throw new Error(`bad agent entry: ${JSON.stringify(a)}`)
+    if (!a.name || !['claude', 'codex', 'agy', 'opencode'].includes(a.kind)) throw new Error(`bad agent entry: ${JSON.stringify(a)}`)
   }
   return c
 }
@@ -121,12 +123,12 @@ function claudeHasPlugin(): boolean {
   } catch { return false }
 }
 
-export function buildCommand(a: AgentConfig, session: string | undefined, prompt: string, opts: { claudePlugin: boolean }): { cmd: string; args: string[] } {
+export function buildCommand(a: AgentConfig, session: string | undefined, prompt: string, opts: { claudePlugin: boolean }): { cmd: string; args: string[]; env?: Record<string, string> } {
   const extra = a.args ?? []
   const mcpEnv: Record<string, string> = { DISCORD_SESSION_NAME: a.name, DISCORD_AGENT: a.kind, DISCORD_MODE: 'pull', DISCORD_WAKE: '' }
   switch (a.kind) {
     case 'claude': {
-      const args = ['-p', prompt, '--output-format', 'json', ...(session ? ['--resume', session] : [])]
+      const args = ['-p', prompt, '--output-format', 'json', ...(session === LAST ? ['--continue'] : session ? ['--resume', session] : [])]
       if (!opts.claudePlugin) {
         args.push('--mcp-config', JSON.stringify({ mcpServers: { discord: { command: MCP_LAUNCHER, env: mcpEnv } } }))
       }
@@ -140,15 +142,34 @@ export function buildCommand(a: AgentConfig, session: string | undefined, prompt
       for (const [k, v] of Object.entries(mcpEnv)) set(`mcp_servers.discord.env.${k}`, v)
       for (const t of DISCORD_TOOLS) set(`mcp_servers.discord.tools.${t}.approval_mode`, 'approve')
       // `codex exec [opts] resume <id> <prompt>` | `codex exec [opts] <prompt>`
-      return { cmd: 'codex', args: ['exec', '--json', '--skip-git-repo-check', ...c, ...extra, ...(session ? ['resume', session] : []), prompt] }
+      return { cmd: 'codex', args: ['exec', '--json', '--skip-git-repo-check', ...c, ...extra, ...(session === LAST ? ['resume', '--last'] : session ? ['resume', session] : []), prompt] }
     }
     case 'agy':
-      return { cmd: 'agy', args: ['-p', prompt, '--output-format', 'json', ...(session ? ['--conversation', session] : []), ...extra] }
+      return { cmd: 'agy', args: ['-p', prompt, '--output-format', 'json', ...(session === LAST ? ['--continue'] : session ? ['--conversation', session] : []), ...extra] }
+    case 'opencode':
+      // OPENCODE_CONFIG_CONTENT is merged over the user's config: adds/overrides the discord MCP.
+      return {
+        cmd: 'opencode',
+        args: ['run', '--format', 'json', ...(session === LAST ? ['--continue'] : session ? ['--session', session] : []), ...extra, prompt],
+        env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({ mcp: { discord: { type: 'local', command: [MCP_LAUNCHER], environment: mcpEnv, enabled: true } } }) },
+      }
   }
 }
 
 /** Pull the session/thread/conversation id and a short result out of a turn's stdout. */
 export function parseTurnOutput(kind: Kind, out: string): { session?: string; summary?: string; error?: string } {
+  if (kind === 'opencode') {
+    let session: string | undefined, summary: string | undefined, error: string | undefined
+    for (const line of out.split('\n')) {
+      try {
+        const e = JSON.parse(line)
+        session ??= e.sessionID
+        if (e.type === 'text' && e.part?.text) summary = e.part.text
+        if (e.type === 'error') error = JSON.stringify(e).slice(0, 300)
+      } catch {}
+    }
+    return { session, summary, error }
+  }
   if (kind === 'codex') {
     let session: string | undefined, summary: string | undefined, error: string | undefined
     for (const line of out.split('\n')) {
@@ -190,7 +211,7 @@ async function main(): Promise<void> {
   const pending = new Map<string, (data: string) => void>()
 
   for (const a of cfg.agents) {
-    if (a.resume && !state[a.name]?.session) state[a.name] = { ...state[a.name], session: a.resume }
+    if (a.resume && a.resume !== 'last' && !state[a.name]?.session) state[a.name] = { ...state[a.name], session: a.resume }
   }
   saveState(state)
 
@@ -214,16 +235,27 @@ async function main(): Promise<void> {
 
   async function runTurn(a: AgentConfig): Promise<void> {
     if (running.has(a.name)) { again.add(a.name); return }
+    // Never run headless on a conversation an interactive session (tmux etc.) holds right now.
+    // Wait out short reconnect gaps (router restarts) before deciding.
+    running.add(a.name)
+    await new Promise(r => setTimeout(r, Number(process.env.AGENT_BUS_WAKE_DELAY_MS ?? 8000)))
+    running.delete(a.name)
+    try {
+      const st = JSON.parse(await request('agentStatus', { agent: a.name })) as { live: boolean; mode: string | null }
+      if (st.live && st.mode === 'push') { log(`${a.name}: interactive session is live; mail handed to it, no headless turn`); return }
+    } catch {}
     if (!budgetOk(a)) { log(`${a.name}: turn budget exhausted, messages stay queued`); return }
     running.add(a.name)
     turnTimes.get(a.name)!.push(Date.now())
     const st = state[a.name] ?? {}
+    const session = st.session ?? (a.resume === LAST ? LAST : undefined)
+    // An adopted conversation already has context; still tell it how headless turns work.
     const prompt = st.session ? WAKE_PROMPT : `${bootstrapPrompt(a, node)}\n\n${WAKE_PROMPT}`
-    const { cmd, args } = buildCommand(a, st.session, prompt, { claudePlugin })
-    const env = { ...process.env, ...Object.fromEntries(Object.entries(a.env ?? {}).map(([k, v]) => [k, expand(v)])),
+    const { cmd, args, env: cmdEnv } = buildCommand(a, session, prompt, { claudePlugin })
+    const env = { ...process.env, ...cmdEnv, ...Object.fromEntries(Object.entries(a.env ?? {}).map(([k, v]) => [k, expand(v)])),
       DISCORD_SESSION_NAME: a.name, DISCORD_AGENT: a.kind, DISCORD_MODE: 'pull', DISCORD_WAKE: '' }
     const cwd = expand(a.cwd ?? '~')
-    log(`${a.name}: turn start (${st.session ? `resume ${st.session.slice(0, 8)}` : 'new session'}) in ${cwd}`)
+    log(`${a.name}: turn start (${st.session ? `resume ${st.session.slice(0, 8)}` : session === LAST ? 'adopt last conversation' : 'new session'}) in ${cwd}`)
     const t0 = Date.now()
     const out = await new Promise<string>(res => {
       let buf = ''

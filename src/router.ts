@@ -18,7 +18,7 @@ import type { SlashCommandDeps, SkillEntry } from './slash-commands.js'
 import type { ChannelMeta } from './types.js'
 import { ActivityType, ChannelType, type Message, type Guild } from 'discord.js'
 import { Subscriptions } from './subscriptions.js'
-import { Inboxes, NodeRegistry } from './nodes.js'
+import { Inboxes, NodeRegistry, Claims } from './nodes.js'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join as pjoin } from 'node:path'
@@ -125,6 +125,7 @@ const access = loadAccess()
 const subs = Subscriptions.inStateDir(STATE_DIR)
 const inboxes = Inboxes.inStateDir(STATE_DIR)
 const nodes = new NodeRegistry()
+const claims = Claims.inStateDir(STATE_DIR)
 
 // Rules of comms: ${STATE_DIR}/rules.md, delivered once per session name per rules version.
 const RULES_FILE = pjoin(STATE_DIR, 'rules.md')
@@ -223,6 +224,7 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   channelOps: BUS_CHANNEL ? channelOps : undefined,
   inboxes,
   nodes,
+  claims,
   humanChannelId: HUMAN_CHANNEL,
   rules: rulesProvider,
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {

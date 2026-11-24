@@ -26,6 +26,8 @@ export interface WsRegister {
   readonly secret?: string
   /** 'pull' = cannot receive pushes; messages are queued for check_inbox. Default 'push'. */
   readonly mode?: 'push' | 'pull'
+  /** Replace an existing session with this name instead of getting a "-2" suffix. */
+  readonly takeover?: boolean
 }
 
 /** Plugin → Router: rename this session */
@@ -150,12 +152,22 @@ export interface WsRegisterNode {
 
 /** Pull (and clear) this session's durable inbox, or (node) count another agent's. */
 export interface WsInboxOp {
-  readonly type: 'inboxPull' | 'inboxCount'
+  readonly type: 'inboxPull' | 'inboxCount' | 'agentStatus'
   readonly requestId: string
   readonly agent?: string
 }
 
+/** Atomic task claims. */
+export interface WsClaimOp {
+  readonly type: 'claim' | 'releaseClaim' | 'listClaims'
+  readonly requestId: string
+  readonly task?: string
+  readonly note?: string
+  readonly to?: string
+}
+
 export type PluginToRouterMessage =
+  | WsClaimOp
   | WsRegisterNode
   | WsInboxOp
   | WsChannelPost

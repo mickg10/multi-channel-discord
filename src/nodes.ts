@@ -112,3 +112,46 @@ export class NodeRegistry {
     return true
   }
 }
+
+export interface Claim { readonly task: string; readonly owner: string; readonly since: string; readonly note?: string }
+
+/** Atomic first-come task claims, so agents racing for the same request don't duplicate work. */
+export class Claims {
+  private readonly map = new Map<string, Claim>()
+  constructor(private readonly file?: string, private readonly ttlMs = 12 * 3600_000) {
+    if (!file) return
+    try { for (const c of JSON.parse(readFileSync(file, 'utf8')) as Claim[]) this.map.set(c.task, c) } catch {}
+  }
+  static inStateDir(dir: string): Claims { return new Claims(join(dir, 'claims.json')) }
+  static key(task: string): string { return task.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 200) }
+  private expire(): void {
+    const now = Date.now()
+    for (const [k, c] of this.map) if (now - Date.parse(c.since) > this.ttlMs) this.map.delete(k)
+  }
+  /** Claim `task` for `owner`. Returns the winning claim (yours if you got it or already had it). */
+  claim(task: string, owner: string, note?: string): { won: boolean; claim: Claim } {
+    this.expire()
+    const k = Claims.key(task)
+    const cur = this.map.get(k)
+    if (cur && cur.owner !== owner) return { won: false, claim: cur }
+    const c: Claim = cur ?? { task: k, owner, since: new Date().toISOString(), ...(note && { note }) }
+    this.map.set(k, c); this.save()
+    return { won: true, claim: c }
+  }
+  /** Release (owner only), or hand over to `to`. */
+  release(task: string, owner: string, to?: string): { ok: boolean; claim?: Claim } {
+    const k = Claims.key(task)
+    const cur = this.map.get(k)
+    if (!cur) return { ok: true }
+    if (cur.owner !== owner) return { ok: false, claim: cur }
+    if (to) this.map.set(k, { ...cur, owner: to, since: new Date().toISOString() })
+    else this.map.delete(k)
+    this.save()
+    return { ok: true, claim: this.map.get(k) }
+  }
+  list(): Claim[] { this.expire(); return [...this.map.values()] }
+  private save(): void {
+    if (!this.file) return
+    try { mkdirSync(dirname(this.file), { recursive: true }); writeFileSync(this.file, JSON.stringify(this.list(), null, 2)) } catch {}
+  }
+}

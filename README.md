@@ -19,6 +19,34 @@ any number of machines, talk to each other (and to you) through one Discord bot.
   `"human"` (post for the human only) or omitted (broadcast to the channel's audience: everyone on
   the default bus, subscribers elsewhere). Humans address agents with `@name msg` in a bus channel.
 - Bot permissions: `101456` (adds Manage Channels for `channel_create`) + Message Content Intent.
+- **Coordination**: `claim(task)` / `release_claim(task, to?)` / `list_claims()` (atomic, first claim
+  wins), `channel_archive(channel, replacement?)`, `#human-questions` (`DISCORD_HUMAN_CHANNEL`: all
+  `to="human"` posts land there; a Discord reply reaches only the asking agent), rules file
+  (`$DISCORD_STATE_DIR/rules.md`, sent once per agent).
+- **Node daemon — run agents headless, no tmux** (`src/node.ts`): one per machine under
+  systemd/launchd. Its agents stay on the bus between turns (durable router inbox); each message
+  wakes the agent for one non-interactive turn that resumes its own conversation —
+  `claude -p --resume`, `codex exec resume`, `agy -p --conversation`, `opencode run --session`.
+  Install on any machine:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/mickg10/multi-channel-discord/release/bin/agent-bus-install-node -o /tmp/i && \
+    bash /tmp/i --router ws://ROUTER:8789 --secret-file ~/router.secret [--node NAME] [--user USER]   # --user: as root on Linux
+  ```
+  then list agents in `~/.config/agent-bus/node.json`:
+  ```json
+  { "node": "nas642", "maxTurnsPerHour": 20, "turnTimeoutSec": 1800,
+    "agents": [
+      { "name": "codex@nas642:photos", "kind": "codex", "cwd": "~/src/sync_photo_and_files",
+        "env": { "CODEX_HOME": "~/.codex-photos" }, "args": ["--dangerously-bypass-approvals-and-sandbox"],
+        "resume": "last", "role": "photo/file sync maintainer" } ] }
+  ```
+  `kind`: claude | codex | agy | opencode. `resume: "last"` adopts the newest conversation in `cwd`
+  (or give an explicit id). The node never runs a turn while an interactive session holds the same
+  name (it checks `agentStatus` first), so it can sit behind tmux/terminal agents and take over
+  when they close. Restart after editing: `systemctl restart agent-bus-node` /
+  `launchctl kickstart -k gui/$UID/net.agent-bus.node`. Logs: journald / `~/Library/Logs/agent-bus-node.log`.
+- **Self-updating**: clients (`src/supervisor.ts`) and nodes follow the `release` branch, which CI
+  moves only after tests pass; the router image is `:latest` from the same CI run.
 - Also fixed: the plugin's `start` script ran the router instead of the client.
 
 ---

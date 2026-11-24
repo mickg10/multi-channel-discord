@@ -165,3 +165,52 @@ describe('node auth', () => {
     expect(msgs(ok).find(m => m.requestId === 'c').data).toBe('0')
   })
 })
+
+describe('takeover + claims', () => {
+  test('pull-mode re-register replaces the stale slot (no -2 suffix)', () => {
+    const h = createWsHandlers(deps())
+    reg(h, 'claude@m:x', 'pull')
+    const s2 = makeWs(); h.message(s2 as any, JSON.stringify({ type: 'register', name: 'claude@m:x', projectPath: '/p', instanceId: 'other', mode: 'pull' }))
+    expect(msgs(s2)[0].name).toBe('claude@m:x')
+    expect(sessions.getSessions().map(s => s.name)).toEqual(['claude@m:x'])
+  })
+  test('first claim wins; handover works', () => {
+    const { Claims } = require('../nodes.js')
+    const h = createWsHandlers(deps({ claims: new Claims() }))
+    const a = reg(h, 'a@m:x'), b = reg(h, 'b@m:x')
+    const res = (ws: any, id: string) => JSON.parse(msgs(ws).find((m: any) => m.requestId === id).data)
+    h.message(a as any, JSON.stringify({ type: 'claim', requestId: '1', task: 'Opencode on NAS' }))
+    h.message(b as any, JSON.stringify({ type: 'claim', requestId: '2', task: 'opencode  on nas' }))
+    expect(res(a, '1').won).toBe(true)
+    expect(res(b, '2')).toMatchObject({ won: false, claim: { owner: 'a@m:x' } })
+    h.message(a as any, JSON.stringify({ type: 'releaseClaim', requestId: '3', task: 'opencode on nas', to: 'b@m:x' }))
+    h.message(b as any, JSON.stringify({ type: 'claim', requestId: '4', task: 'opencode on nas' }))
+    expect(res(b, '4').won).toBe(true)
+  })
+})
+
+describe('opencode kind', () => {
+  test('command + parse', () => {
+    const { args, env } = buildCommand({ name: 'opencode@nas642:glm', kind: 'opencode', args: ['--auto'] }, 'ses_1', 'P', { claudePlugin: false })
+    expect(args).toEqual(['run', '--format', 'json', '--session', 'ses_1', '--auto', 'P'])
+    expect(JSON.parse(env!.OPENCODE_CONFIG_CONTENT).mcp.discord.environment.DISCORD_SESSION_NAME).toBe('opencode@nas642:glm')
+    expect(parseTurnOutput('opencode', '{"type":"step_start","sessionID":"ses_9"}\n{"type":"text","sessionID":"ses_9","part":{"text":"hi"}}')).toMatchObject({ session: 'ses_9', summary: 'hi' })
+  })
+})
+
+describe('agentStatus + resume last', () => {
+  test('agentStatus reports live push and hands queued mail over', () => {
+    const h = createWsHandlers(deps())
+    const nodeWs = regNode(h, 'n', ['codex@n:q'])
+    const live = reg(h, 'codex@n:q')            // interactive session holds the name
+    inboxes.push('codex@n:q', 'queued during a gap', {})
+    h.message(nodeWs as any, JSON.stringify({ type: 'agentStatus', requestId: 's', agent: 'codex@n:q' }))
+    expect(JSON.parse(msgs(nodeWs).find(m => m.requestId === 's').data)).toMatchObject({ live: true, mode: 'push', pending: 0 })
+    expect(msgs(live).find(m => m.type === 'message' && m.content === 'queued during a gap')).toBeTruthy()
+  })
+  test('resume "last" maps to continue flags', () => {
+    expect(buildCommand({ name: 'c', kind: 'claude' }, 'last', 'P', { claudePlugin: true }).args).toContain('--continue')
+    expect(buildCommand({ name: 'c', kind: 'codex' }, 'last', 'P', { claudePlugin: false }).args.slice(-3)).toEqual(['resume', '--last', 'P'])
+    expect(buildCommand({ name: 'c', kind: 'agy' }, 'last', 'P', { claudePlugin: false }).args).toContain('--continue')
+  })
+})
