@@ -65,6 +65,8 @@ either from another agent (from="<agent session name>") or from the human postin
   channel_archive(channel=<newer>, replacement=<older>), which moves its subscribers. No debate.
 - HUMAN: questions/approvals for the human go with to="human"; the router puts them in #human-questions
   (tagged with the origin channel). The human answers there (a Discord reply reaches only you).
+- FILES: to show the human (or agents) a file — report, PDF, image, log — pass its local path in
+  files=[...] on bus_post / channel_post / reply. It is uploaded as a Discord attachment (max 4, 10 MB each).
 - RULES: the router sends the bus rules once (from="router"); follow them.
 - CLAIMS: before acting on a request several agents could take (especially the human's broadcasts),
   call claim(task="<short stable description>"). If it returns won=false, someone else owns it: do NOT
@@ -206,6 +208,19 @@ function claudeAlias(pid: string): string | undefined {
     const n = d.name?.trim()
     return n && d.nameSource !== 'auto' ? n.replace(/\s+/g, '-') : undefined
   } catch { return undefined }
+}
+
+/** Read local files for upload (the router is remote and never sees our filesystem). */
+function inlineFiles(paths: unknown): Array<{ name: string; data: string }> {
+  if (!Array.isArray(paths)) return []
+  const out: Array<{ name: string; data: string }> = []
+  for (const p of paths.slice(0, 4)) {
+    const path = String(p)
+    const buf = readFileSync(path)  // throws -> tool error with the path
+    if (buf.length > 10 * 1024 * 1024) throw new Error(`${path}: larger than 10 MB (Discord bot limit)`)
+    out.push({ name: path.split('/').pop() || 'file', data: buf.toString('base64') })
+  }
+  return out
 }
 
 /** Re-read connection settings from the .env file, overriding the process env. */
@@ -422,6 +437,7 @@ export async function startPlugin(): Promise<void> {
           properties: {
             text: { type: 'string', description: 'Message text' },
             to: { type: 'string', description: 'Target session name or unique prefix (see bus_sessions); "human" to answer the human operator only; omit to broadcast to all other agents.' },
+            files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of local files to attach (max 4, 10 MB each). Uploaded inline; the human sees them in Discord.' },
           },
           required: ['text'],
         },
@@ -435,6 +451,7 @@ export async function startPlugin(): Promise<void> {
             channel: { type: 'string', description: 'Channel id or name' },
             text: { type: 'string' },
             to: { type: 'string', description: 'Optional session name/prefix, or "human"' },
+            files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of local files to attach (max 4, 10 MB each)' },
           },
           required: ['channel', 'text'],
         },
@@ -608,20 +625,23 @@ export async function startPlugin(): Promise<void> {
           const files = args.files as string[] | undefined
           const chatId = args.chat_id as string | undefined
           if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
-          sendWs(JSON.stringify({ type: 'reply', text, ...(chatId && { chatId }), ...(replyTo && { replyTo }), ...(files && { files }) }))
+          const inline = inlineFiles(files)
+          sendWs(JSON.stringify({ type: 'reply', text, ...(chatId && { chatId }), ...(replyTo && { replyTo }), ...(inline.length && { files: inline }) }))
           return { content: [{ type: 'text', text: 'Message sent' }] }
         }
         case 'bus_post': {
           if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
           const to = args.to as string | undefined
-          sendWs(JSON.stringify({ type: 'busPost', text: args.text as string, ...(to && { to }) }))
-          return { content: [{ type: 'text', text: `Posted to ${to ?? 'all agents'} as ${currentName}` }] }
+          const inline = inlineFiles(args.files)
+          sendWs(JSON.stringify({ type: 'busPost', text: args.text as string, ...(to && { to }), ...(inline.length && { files: inline }) }))
+          return { content: [{ type: 'text', text: `Posted to ${to ?? 'all agents'} as ${currentName}${inline.length ? ` with ${inline.length} file(s)` : ''}` }] }
         }
         case 'channel_post': {
           if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
           const to = args.to as string | undefined
-          sendWs(JSON.stringify({ type: 'channelPost', channel: args.channel as string, text: args.text as string, ...(to && { to }) }))
-          return { content: [{ type: 'text', text: `Posted in ${String(args.channel)}${to ? ` to ${to}` : ''} as ${currentName}` }] }
+          const inline = inlineFiles(args.files)
+          sendWs(JSON.stringify({ type: 'channelPost', channel: args.channel as string, text: args.text as string, ...(to && { to }), ...(inline.length && { files: inline }) }))
+          return { content: [{ type: 'text', text: `Posted in ${String(args.channel)}${to ? ` to ${to}` : ''} as ${currentName}${inline.length ? ` with ${inline.length} file(s)` : ''}` }] }
         }
         case 'channel_list': {
           const list = JSON.parse(await sendToolRequest({ type: 'channelList' })) as Array<{ id: string; name: string; topic?: string; default: boolean; subscribed: boolean; subscribers: string[] }>

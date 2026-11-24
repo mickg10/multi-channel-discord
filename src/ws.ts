@@ -29,7 +29,7 @@ export interface ChannelOps {
   /** Move to the "archive" category and set its topic (optional: not all routers support it). */
   archive?(id: string, topic: string): Promise<void>
 }
-import { chunk, assertSendable } from './discord.js'
+import { chunk } from './discord.js'
 import { noteSent, getStateDir } from './access.js'
 import {
   ActionRowBuilder,
@@ -84,6 +84,28 @@ export interface WsDeps {
   readonly humanChannelId?: string
   /** Bus rules sent once to every session on (first) register. */
   readonly rules?: () => { text: string; seen(name: string): boolean; markSeen(name: string): void } | null
+}
+
+/** A file sent inline by a client (the router is remote: it must never open client-named paths). */
+export interface InlineFile { readonly name: string; readonly data: string }
+export const MAX_FILE_BYTES = 10 * 1024 * 1024
+export const MAX_FILES = 4
+type DiscordFile = { attachment: Buffer; name: string }
+
+/** Decode inline files; bare paths are rejected (they would be read on the router host). */
+export function decodeFiles(files: unknown): { files: DiscordFile[]; errors: string[] } {
+  const out: DiscordFile[] = [], errors: string[] = []
+  if (!Array.isArray(files)) return { files: out, errors }
+  for (const f of files.slice(0, MAX_FILES)) {
+    if (typeof f === 'string') { errors.push(`file path "${f}" ignored: send file contents (update the client)`); continue }
+    const g = f as Partial<InlineFile>
+    if (typeof g?.name !== 'string' || typeof g.data !== 'string') { errors.push('malformed file entry'); continue }
+    const buf = Buffer.from(g.data, 'base64')
+    if (buf.length > MAX_FILE_BYTES) { errors.push(`${g.name}: larger than ${MAX_FILE_BYTES / 1048576} MB`); continue }
+    out.push({ attachment: buf, name: g.name.replace(/[\/\\]/g, '_').slice(0, 100) || 'file' })
+  }
+  if (files.length > MAX_FILES) errors.push(`only the first ${MAX_FILES} files were attached`)
+  return { files: out, errors }
 }
 
 /** Sessions with mode 'pull' (no channel push): their traffic is queued, not pushed. */
@@ -255,14 +277,22 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         sendError(ws, 'busPost requires text')
         return
       }
-      handleBusPost(ws, parsed.text, parsed.to, deps)
+      {
+        const { files, errors } = decodeFiles((parsed as { files?: unknown }).files)
+        for (const e of errors) sendError(ws, e)
+        handleBusPost(ws, parsed.text, parsed.to, deps, files)
+      }
       break
     case 'channelPost':
       if (!hasString(parsed, 'channel') || !hasString(parsed, 'text')) {
         sendError(ws, 'channelPost requires channel and text')
         return
       }
-      void handleChannelPost(ws, parsed.channel, parsed.text, parsed.to, deps)
+      {
+        const { files, errors } = decodeFiles((parsed as { files?: unknown }).files)
+        for (const e of errors) sendError(ws, e)
+        void handleChannelPost(ws, parsed.channel, parsed.text, parsed.to, deps, files)
+      }
       break
     case 'channelList':
     case 'channelCreate':
@@ -340,10 +370,16 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         return
       }
       if (deps.busChannelId && parsed.chatId === deps.busChannelId) {
-        handleBusPost(ws, parsed.text, undefined, deps)
+        const { files, errors } = decodeFiles(parsed.files)
+        for (const e of errors) sendError(ws, e)
+        handleBusPost(ws, parsed.text, undefined, deps, files)
         return
       }
-      handleReply(ws, parsed.text, parsed.replyTo, parsed.files ? [...parsed.files] : undefined, deps, parsed.chatId)
+      {
+        const { files, errors } = decodeFiles(parsed.files)
+        for (const e of errors) sendError(ws, e)
+        handleReply(ws, parsed.text, parsed.replyTo, files.length ? files : undefined, deps, parsed.chatId)
+      }
       break
     case 'react':
       if (!hasString(parsed, 'chatId') || !hasString(parsed, 'messageId') || !hasString(parsed, 'emoji')) {
@@ -439,7 +475,7 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>): void
   ws.send(JSON.stringify(response))
 }
 
-function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: string[] | undefined, deps: Readonly<WsDeps>, explicitChatId?: string): void {
+function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: DiscordFile[] | undefined, deps: Readonly<WsDeps>, explicitChatId?: string): void {
   const sessionName = ws.data.sessionName
   if (!sessionName) {
     sendError(ws, 'Cannot reply: not registered')
@@ -449,9 +485,8 @@ function handleReply(ws: WsLike, text: string, replyTo: string | undefined, file
   // An explicit chat_id (e.g. a group channel the agent was addressed in) is honoured
   // directly; otherwise fall back to the human's most recent chat.
   if (explicitChatId && explicitChatId !== deps.chatId()) {
-    for (const c of chunk(`[${sessionName}] ${text}`, deps.chunkLimit, deps.chunkMode)) {
-      sendToDiscord(deps.client, explicitChatId, c)
-    }
+    const cs = chunk(`[${sessionName}] ${text}`, deps.chunkLimit, deps.chunkMode)
+    cs.forEach((c, i) => sendToDiscord(deps.client, explicitChatId, c, i === 0 ? replyTo : undefined, i === 0 ? files : undefined))
     return
   }
 
@@ -493,24 +528,14 @@ function handleReact(chatId: string, messageId: string, emoji: string, deps: Rea
   })()
 }
 
-function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly string[]): void {
+function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly DiscordFile[]): void {
   // Fire-and-forget: send to Discord asynchronously without blocking the caller
   void (async () => {
     try {
       const ch = await fetchTextChannelOrNull(client, chatId)
       if (!ch || !('send' in ch)) return
 
-      // Validate files
-      const validFiles: string[] = []
-      if (files) {
-        for (const f of files) {
-          try {
-            assertSendable(f)
-            validFiles.push(f)
-          } catch {}
-        }
-      }
-
+      const validFiles = files ?? []
       const sent = await ch.send({
         content: text,
         ...(validFiles.length > 0 ? { files: validFiles } : {}),
@@ -851,7 +876,7 @@ const HUMAN_TARGETS = new Set(['human', 'admin', 'user', 'me'])
  * deliver it to the target session, or to every other session when `to` is omitted.
  * `to` matches a session name exactly, else as a unique prefix (e.g. "codex-photos").
  */
-export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>): void {
+export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[]): void {
   if (!ws.data.sessionName) {
     sendError(ws, 'Cannot post to bus: not registered')
     return
@@ -860,7 +885,7 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
     sendError(ws, 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL')
     return
   }
-  postToChannel(ws, deps.busChannelId, undefined, text, to, deps)
+  postToChannel(ws, deps.busChannelId, undefined, text, to, deps, files)
 }
 
 /** Sessions that receive untargeted traffic in a channel: everyone for the default bus, else subscribers. */
@@ -871,14 +896,14 @@ function audience(channelId: string, deps: Readonly<WsDeps>): string[] {
   return live.filter(n => subs.has(n))
 }
 
-async function handleChannelPost(ws: WsLike, ref: string, text: string, to: string | undefined, deps: Readonly<WsDeps>): Promise<void> {
+async function handleChannelPost(ws: WsLike, ref: string, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[]): Promise<void> {
   if (!ws.data.sessionName) { sendError(ws, 'Cannot post: not registered'); return }
   const ch = deps.channelOps ? await deps.channelOps.resolve(ref).catch(() => null) : null
   if (!ch) { sendError(ws, `Unknown channel "${ref}" (use channel_list)`); return }
-  postToChannel(ws, ch.id, ch.name, text, to, deps)
+  postToChannel(ws, ch.id, ch.name, text, to, deps, files)
 }
 
-function postToChannel(ws: WsLike, channelId: string, channelName: string | undefined, text: string, to: string | undefined, deps: Readonly<WsDeps>): void {
+function postToChannel(ws: WsLike, channelId: string, channelName: string | undefined, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[]): void {
   const from = ws.data.sessionName!
 
   // Loop guard: cap posts per session per minute.
@@ -914,11 +939,11 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   const toHuman = toLabel === 'human' && deps.humanChannelId && deps.humanChannelId !== channelId
   const where = toHuman ? deps.humanChannelId! : channelId
   const origin = toHuman ? ` (from ${channelName ? `#${channelName}` : channelId === deps.busChannelId ? '#general' : channelId})` : ''
-  for (const c of chunk(`**[${from} → ${toLabel}]**${origin} ${text}`, deps.chunkLimit, deps.chunkMode)) {
-    sendToDiscord(deps.client, where, c)
-  }
+  chunk(`**[${from} → ${toLabel}]**${origin} ${text}`, deps.chunkLimit, deps.chunkMode)
+    .forEach((c, i) => sendToDiscord(deps.client, where, c, undefined, i === 0 && files?.length ? files : undefined))
 
   const meta: ChannelMeta = {
+    ...(files?.length && { attachments: files.map(f => f.name).join('; '), attachment_count: String(files.length) }),
     chat_id: channelId,
     ...(channelName && { channel: channelName }),
     user: from,

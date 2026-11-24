@@ -228,3 +228,20 @@ describe('admin subscribe', () => {
     expect(subs.has('agy@n:p1', 'cfd')).toBe(true)
   })
 })
+
+describe('inline attachments', () => {
+  test('files are decoded and attached on the first chunk; bare paths are refused', async () => {
+    const sent: any[] = []
+    const d = deps()
+    ;(d.client as any).channels.fetch = mock(async () => ({ isTextBased: () => true, send: mock(async (p: any) => { sent.push(p); return { id: 'm' } }) }))
+    const h = createWsHandlers(d)
+    const a = reg(h, 'claude@nas642:src'); reg(h, 'x@m:y')
+    const data = Buffer.from('%PDF-1.4 hello').toString('base64')
+    h.message(a as any, JSON.stringify({ type: 'busPost', text: 'report', to: 'human', files: [{ name: 'tt-hfd.pdf', data }, '/etc/passwd'] }))
+    await tick()
+    expect(sent[0].files[0].name).toBe('tt-hfd.pdf')
+    expect(sent[0].files[0].attachment.toString()).toBe('%PDF-1.4 hello')
+    expect(sent[0].files).toHaveLength(1)
+    expect(msgs(a).some(m => m.type === 'error' && m.message.includes('/etc/passwd'))).toBe(true)
+  })
+})

@@ -262,6 +262,8 @@ const wsServer = Bun.serve<WsData>({
     return undefined as unknown as Response
   },
   websocket: {
+    // Inline attachments (base64) can be several MB.
+    maxPayloadLength: 64 * 1024 * 1024,
     open(ws) {
       wsHandlers.open(toBunWsLike(ws))
     },

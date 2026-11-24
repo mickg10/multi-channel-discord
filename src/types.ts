@@ -43,7 +43,8 @@ export interface WsReply {
   /** Target channel. If it is the agent-bus channel the reply is treated as a busPost. */
   readonly chatId?: string
   readonly replyTo?: string
-  readonly files?: readonly string[]
+  /** Inline files {name, data: base64}. Bare paths are rejected by remote routers. */
+  readonly files?: ReadonlyArray<string | { readonly name: string; readonly data: string }>
 }
 
 /** Plugin → Router: react to a Discord message */
