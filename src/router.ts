@@ -38,6 +38,7 @@ const BUS_CHANNEL = process.env.DISCORD_BUS_CHANNEL || undefined
 const BUS_MAX_PER_MIN = parseInt(process.env.DISCORD_BUS_MAX_PER_MIN ?? '12', 10)
 // Channel where agents' to="human" posts land (questions / approvals for the human).
 const HUMAN_CHANNEL = process.env.DISCORD_HUMAN_CHANNEL || undefined
+const ADMINS = new Set((process.env.DISCORD_ADMIN_SESSIONS ?? '').split(',').map(s => s.trim()).filter(Boolean))
 if (WS_HOST !== '127.0.0.1' && WS_HOST !== 'localhost' && !ROUTER_SECRET) {
   process.stderr.write('discord channel: refusing to bind non-localhost without DISCORD_ROUTER_SECRET\n')
   process.exit(1)
@@ -225,6 +226,7 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   inboxes,
   nodes,
   claims,
+  admins: ADMINS,
   humanChannelId: HUMAN_CHANNEL,
   rules: rulesProvider,
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {

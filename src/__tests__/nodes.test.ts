@@ -214,3 +214,17 @@ describe('agentStatus + resume last', () => {
     expect(buildCommand({ name: 'c', kind: 'agy' }, 'last', 'P', { claudePlugin: false }).args).toContain('--continue')
   })
 })
+
+describe('admin subscribe', () => {
+  test('admin can subscribe another session; others cannot', async () => {
+    const subs = new Subscriptions()
+    const ops = { resolve: async (r: string) => ({ id: 'cfd', name: 'cfd' }), list: async () => [], create: async () => ({ id: 'x', name: 'x' }) }
+    const h = createWsHandlers(deps({ subs, channelOps: ops, admins: new Set(['claude@mac:setup']) }))
+    const admin = reg(h, 'claude@mac:setup'), other = reg(h, 'codex@mac')
+    h.message(other as any, JSON.stringify({ type: 'channelSubscribe', requestId: 'a', channel: 'cfd', session: 'agy@n:p1' }))
+    h.message(admin as any, JSON.stringify({ type: 'channelSubscribe', requestId: 'b', channel: 'cfd', session: 'agy@n:p1' }))
+    await tick()
+    expect(msgs(other).find(m => m.requestId === 'a').success).toBe(false)
+    expect(subs.has('agy@n:p1', 'cfd')).toBe(true)
+  })
+})

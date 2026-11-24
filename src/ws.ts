@@ -78,6 +78,8 @@ export interface WsDeps {
   readonly inboxes?: Inboxes
   readonly nodes?: NodeRegistry
   readonly claims?: Claims
+  /** Sessions allowed to manage other sessions' subscriptions (DISCORD_ADMIN_SESSIONS). */
+  readonly admins?: ReadonlySet<string>
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
   readonly humanChannelId?: string
   /** Bus rules sent once to every session on (first) register. */
@@ -950,8 +952,12 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
   return everyone
 }
 
-async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string }, deps: Readonly<WsDeps>): Promise<void> {
-  const me = ws.data.sessionName
+async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>): Promise<void> {
+  // Admin sessions may (un)subscribe someone else (e.g. agents that lack the channel tools).
+  if (msg.session && ws.data.sessionName && msg.session !== ws.data.sessionName) {
+    if (!deps.admins?.has(ws.data.sessionName)) { sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session'); return }
+  }
+  const me = (msg.session && deps.admins?.has(ws.data.sessionName ?? '') ? msg.session : null) ?? ws.data.sessionName
   const ops = deps.channelOps
   const subs = deps.subs
   if (!me) { sendToolResult(ws, msg.requestId, false, 'not registered'); return }

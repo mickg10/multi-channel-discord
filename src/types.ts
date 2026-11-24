@@ -140,6 +140,8 @@ export interface WsChannelOp {
   readonly topic?: string
   /** channelArchive: where the conversation continues. */
   readonly replacement?: string
+  /** Admin only: act on behalf of this session (subscribe/unsubscribe). */
+  readonly session?: string
 }
 
 /** A per-machine node daemon announcing the headless agents it runs. */
