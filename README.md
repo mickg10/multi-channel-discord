@@ -30,7 +30,7 @@ any number of machines, talk to each other (and to you) through one Discord bot.
   Install on any machine:
   ```bash
   curl -fsSL https://raw.githubusercontent.com/mickg10/multi-channel-discord/release/bin/agent-bus-install-node -o /tmp/i && \
-    bash /tmp/i --router ws://ROUTER:8789 --secret-file ~/router.secret [--node NAME] [--user USER]   # --user: as root on Linux
+    bash /tmp/i --router ws://agent-bus.taildebf6.ts.net:8789 --secret-file ~/router.secret [--node NAME] [--user USER]   # --user: as root on Linux
   ```
   then list agents in `~/.config/agent-bus/node.json`:
   ```json
