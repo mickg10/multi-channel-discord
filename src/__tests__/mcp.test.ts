@@ -252,6 +252,10 @@ describe('ws handlers: mcp ops', () => {
     }
   }
 
+  function routerMcp(servers: unknown[], timeoutMs: number) {
+    return { registry: McpRegistry.fromFile(registryFile(servers)), grants: new Grants(), audit: McpAudit.inStateDir(dir), pending: new PendingMcpCalls(timeoutMs) }
+  }
+
   test('mcp ops without registry configured report disabled', () => {
     const h = createWsHandlers(makeDeps())
     const ws = mockWs()
@@ -263,8 +267,7 @@ describe('ws handlers: mcp ops', () => {
 
   test('mcpList returns the declaration summary', () => {
     const deps = makeDeps({
-      mcp: McpRegistry.fromFile(registryFile([READ_ONLY])),
-      mcpGrants: new Grants(), mcpAudit: McpAudit.inStateDir(dir), mcpPending: new PendingMcpCalls(100),
+      mcp: routerMcp([READ_ONLY], 100),
     })
     const ws = mockWs()
     ws.data.sessionName = 'a@b'
@@ -281,8 +284,7 @@ describe('ws handlers: mcp ops', () => {
     nodes.register('mac', () => {}, [{ name: 'headless@mac', kind: 'opencode' }])
     const deps = makeDeps({
       nodes,
-      mcp: McpRegistry.fromFile(registryFile([READ_ONLY])),
-      mcpGrants: new Grants(), mcpAudit: McpAudit.inStateDir(dir), mcpPending: new PendingMcpCalls(500),
+      mcp: routerMcp([READ_ONLY], 500),
     })
     const caller = mockWs()
     caller.data.sessionName = 'a@mac'
@@ -309,8 +311,7 @@ describe('ws handlers: mcp ops', () => {
 
   test('mcpCall on a side-effecting server is rejected at the router and audited', () => {
     const deps = makeDeps({
-      mcp: McpRegistry.fromFile(registryFile([WRITER])),
-      mcpGrants: new Grants(), mcpAudit: McpAudit.inStateDir(dir), mcpPending: new PendingMcpCalls(100),
+      mcp: routerMcp([WRITER], 100),
     })
     const ws = mockWs()
     ws.data.sessionName = 'a@mac'
@@ -325,8 +326,7 @@ describe('ws handlers: mcp ops', () => {
 
   test('mcpDescribe on a disconnected node fails with the declaration as context', () => {
     const deps = makeDeps({
-      mcp: McpRegistry.fromFile(registryFile([READ_ONLY])),
-      mcpGrants: new Grants(), mcpAudit: McpAudit.inStateDir(dir), mcpPending: new PendingMcpCalls(100),
+      mcp: routerMcp([READ_ONLY], 100),
     })
     const ws = mockWs()
     ws.data.sessionName = 'a@b'
