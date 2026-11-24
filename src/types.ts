@@ -22,6 +22,8 @@ export interface WsRegister {
   /** Parent PID of the Claude Code process. Used to dedup multiple MCP spawns
    *  from the same instance while keeping separate instances as separate sessions. */
   readonly instanceId?: string
+  /** Shared secret; required when the router sets DISCORD_ROUTER_SECRET. */
+  readonly secret?: string
 }
 
 /** Plugin → Router: rename this session */
@@ -34,6 +36,8 @@ export interface WsRename {
 export interface WsReply {
   readonly type: 'reply'
   readonly text: string
+  /** Target channel. If it is the agent-bus channel the reply is treated as a busPost. */
+  readonly chatId?: string
   readonly replyTo?: string
   readonly files?: readonly string[]
 }
@@ -101,7 +105,23 @@ export interface WsPermissionRequest {
 }
 
 /** Union of all messages a plugin can send to the router */
+/** Post to the shared agent bus channel and fan out to other sessions. */
+export interface WsBusPost {
+  readonly type: 'busPost'
+  readonly text: string
+  /** Optional target session name; omitted = broadcast to every other session. */
+  readonly to?: string
+}
+
+/** Request the list of connected sessions (answered with a toolResult). */
+export interface WsListSessions {
+  readonly type: 'listSessions'
+  readonly requestId: string
+}
+
 export type PluginToRouterMessage =
+  | WsBusPost
+  | WsListSessions
   | WsRegister
   | WsRename
   | WsReply

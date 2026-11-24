@@ -10,7 +10,7 @@
 import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './access.js'
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
-import { createWsHandlers, handlePermissionButton } from './ws.js'
+import { createWsHandlers, handlePermissionButton, routeHumanBusMessage } from './ws.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete, updateSkillCommands, isSkillCommand } from './slash-commands.js'
@@ -23,6 +23,17 @@ loadEnvFile()
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const WS_PORT = parseInt(process.env.DISCORD_WS_PORT ?? '8789', 10)
+// Interface to bind. Default localhost; set to a Tailscale IP (or 0.0.0.0) for remote sessions.
+const WS_HOST = process.env.DISCORD_WS_HOST ?? '127.0.0.1'
+// Shared secret plugins must send on register. Strongly recommended when WS_HOST is not localhost.
+const ROUTER_SECRET = process.env.DISCORD_ROUTER_SECRET || undefined
+// Discord channel used as the agent bus (agent <-> agent messages). Unset = bus disabled.
+const BUS_CHANNEL = process.env.DISCORD_BUS_CHANNEL || undefined
+const BUS_MAX_PER_MIN = parseInt(process.env.DISCORD_BUS_MAX_PER_MIN ?? '12', 10)
+if (WS_HOST !== '127.0.0.1' && WS_HOST !== 'localhost' && !ROUTER_SECRET) {
+  process.stderr.write('discord channel: refusing to bind non-localhost without DISCORD_ROUTER_SECRET\n')
+  process.exit(1)
+}
 const STATE_DIR = getStateDir()
 
 if (!TOKEN) {
@@ -109,6 +120,9 @@ const wsHandlers = createWsHandlers({
   replyToMode: access.replyToMode ?? 'first',
   onReply: (chatId: string) => typingManager.stop(chatId),
   onSessionChange: () => updatePresence(),
+  busChannelId: BUS_CHANNEL,
+  secret: ROUTER_SECRET,
+  busMaxPerMinute: BUS_MAX_PER_MIN,
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
     updateSkillCommands(client, skills).catch((err: unknown) => {
       process.stderr.write(`discord channel: skill command registration failed: ${err instanceof Error ? err.message : String(err)}\n`)
@@ -131,9 +145,10 @@ function toBunWsLike(ws: BunServerWebSocket): WsLike {
 
 const wsServer = Bun.serve<WsData>({
   port: WS_PORT,
+  hostname: WS_HOST,
   fetch(req, server) {
     const upgraded = server.upgrade(req, {
-      data: { sessionName: null, sendCallback: null },
+      data: { sessionName: null, sendCallback: null, authed: false },
     })
     if (!upgraded) {
       return new Response('WebSocket upgrade required', { status: 426 })
@@ -153,7 +168,7 @@ const wsServer = Bun.serve<WsData>({
   },
 })
 
-process.stderr.write(`discord channel: WS server listening on port ${WS_PORT}\n`)
+process.stderr.write(`discord channel: WS server listening on ${WS_HOST}:${WS_PORT} (auth=${ROUTER_SECRET ? 'secret' : 'none'}, bus=${BUS_CHANNEL ?? 'off'})\n`)
 
 // ============================================================
 // PID management
@@ -176,7 +191,35 @@ const slashDeps: SlashCommandDeps = {
 // Inbound message handler
 // ============================================================
 
+async function handleBusInbound(msg: Message): Promise<void> {
+  // Only allowlisted humans may address agents on the bus.
+  const acc = loadAccess()
+  if (!acc.allowFrom.includes(msg.author.id)) {
+    process.stderr.write(`discord: bus message from non-allowlisted ${msg.author.username} dropped\n`)
+    return
+  }
+  const content = msg.content.replace(/<@!?\d+>\s*/g, '').trim()
+  if (!content) return
+  const meta: ChannelMeta = {
+    chat_id: msg.channelId,
+    message_id: msg.id,
+    user: msg.author.username,
+    user_id: msg.author.id,
+    source: 'agent-bus',
+    from: msg.author.username,
+    ts: msg.createdAt.toISOString(),
+  }
+  const delivered = routeHumanBusMessage(content, meta, sessions)
+  process.stderr.write(`discord: bus message from ${msg.author.username} -> ${delivered.join(',') || '(no sessions)'}\n`)
+  if (delivered.length === 0) {
+    await msg.reply('No agent sessions are connected.').catch(() => {})
+  } else {
+    void msg.react('📨').catch(() => {})
+  }
+}
+
 async function handleInbound(msg: Message): Promise<void> {
+  if (BUS_CHANNEL && msg.channelId === BUS_CHANNEL) return handleBusInbound(msg)
   process.stderr.write(`discord: inbound from ${msg.author.username}: "${msg.content.slice(0, 50)}" action=`)
   const result = await gate(msg)
   process.stderr.write(`${result.action}\n`)

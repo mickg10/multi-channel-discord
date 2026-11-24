@@ -1,18 +1,18 @@
 {
   "name": "multi-channel-discord",
   "owner": {
-    "name": "YassinCh"
+    "name": "mickg10"
   },
   "metadata": {
-    "description": "Discord multi-instance channel for Claude Code — multi-session routing with slash commands"
+    "description": "Discord multi-instance channel + cross-machine agent bus (Claude Code, Codex, agy)"
   },
   "plugins": [
     {
       "name": "discord",
       "source": "./",
-      "description": "Discord channel with multi-session routing — /switch, /list, /status, /kill, /broadcast, /spawn",
-      "version": "0.0.1",
-      "homepage": "https://github.com/YassinCh/multi-channel-discord"
+      "description": "Discord channel with multi-session routing and an agent-to-agent bus across machines",
+      "version": "0.1.0",
+      "homepage": "https://github.com/mickg10/multi-channel-discord"
     }
   ]
 }

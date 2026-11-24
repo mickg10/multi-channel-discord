@@ -35,6 +35,8 @@ export interface WsData {
   sessionName: string | null
   /** The send callback registered with SessionManager, kept for cleanup on close. */
   sendCallback: ((msg: string) => void) | null
+  /** True once the plugin has registered with the correct shared secret. */
+  authed?: boolean
 }
 
 export interface WsDeps {
@@ -49,6 +51,12 @@ export interface WsDeps {
   readonly onReply?: (chatId: string) => void
   readonly onSessionChange?: () => void
   readonly onSkillsRegistered?: (skills: ReadonlyArray<{ name: string; description: string }>) => void
+  /** Discord channel ID used as the shared agent bus (agent <-> agent traffic). */
+  readonly busChannelId?: string
+  /** Shared secret plugins must present on register. Unset = no auth (localhost-only use). */
+  readonly secret?: string
+  /** Max bus posts per session per minute (loop guard). Default 12. */
+  readonly busMaxPerMinute?: number
 }
 
 export interface WsLike {
@@ -122,12 +130,37 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
 }
 
 function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readonly<WsDeps>): void {
+  if (deps.secret && parsed.type !== 'register' && !ws.data.authed) {
+    sendError(ws, 'Not authenticated: register with the router secret first')
+    return
+  }
   switch (parsed.type) {
+    case 'busPost':
+      if (!hasString(parsed, 'text')) {
+        sendError(ws, 'busPost requires text')
+        return
+      }
+      handleBusPost(ws, parsed.text, parsed.to, deps)
+      break
+    case 'listSessions':
+      if (!hasString(parsed, 'requestId')) {
+        sendError(ws, 'listSessions requires requestId')
+        return
+      }
+      sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.sessions.getSessions().map(s => ({
+        name: s.name, projectPath: s.projectPath, connectedAt: new Date(s.connectedAt).toISOString(),
+      }))))
+      break
     case 'register':
       if (!hasString(parsed, 'name') || !hasString(parsed, 'projectPath')) {
         sendError(ws, 'register requires name and projectPath')
         return
       }
+      if (deps.secret && (parsed as { secret?: string }).secret !== deps.secret) {
+        sendError(ws, 'register rejected: bad or missing router secret')
+        return
+      }
+      ws.data.authed = true
       handleRegister(ws, parsed.name, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
       break
     case 'deregister':
@@ -145,7 +178,11 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         sendError(ws, 'reply requires text')
         return
       }
-      handleReply(ws, parsed.text, parsed.replyTo, parsed.files ? [...parsed.files] : undefined, deps)
+      if (deps.busChannelId && parsed.chatId === deps.busChannelId) {
+        handleBusPost(ws, parsed.text, undefined, deps)
+        return
+      }
+      handleReply(ws, parsed.text, parsed.replyTo, parsed.files ? [...parsed.files] : undefined, deps, parsed.chatId)
       break
     case 'react':
       if (!hasString(parsed, 'chatId') || !hasString(parsed, 'messageId') || !hasString(parsed, 'emoji')) {
@@ -241,10 +278,19 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>): void
   ws.send(JSON.stringify(response))
 }
 
-function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: string[] | undefined, deps: Readonly<WsDeps>): void {
+function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: string[] | undefined, deps: Readonly<WsDeps>, explicitChatId?: string): void {
   const sessionName = ws.data.sessionName
   if (!sessionName) {
     sendError(ws, 'Cannot reply: not registered')
+    return
+  }
+
+  // An explicit chat_id (e.g. a group channel the agent was addressed in) is honoured
+  // directly; otherwise fall back to the human's most recent chat.
+  if (explicitChatId && explicitChatId !== deps.chatId()) {
+    for (const c of chunk(`[${sessionName}] ${text}`, deps.chunkLimit, deps.chunkMode)) {
+      sendToDiscord(deps.client, explicitChatId, c)
+    }
     return
   }
 
@@ -630,4 +676,87 @@ function hasString<K extends string>(obj: unknown, key: K): obj is Record<K, str
 function sendError(ws: WsLike, message: string): void {
   const response: WsError = { type: 'error', message }
   ws.send(JSON.stringify(response))
+}
+
+// ============================================================
+// Agent bus — agent <-> agent messaging through one Discord channel
+// ============================================================
+
+const busPostTimes = new Map<string, number[]>()
+
+/**
+ * Post `[from → to] text` to the bus channel (so humans see the conversation) and
+ * deliver it to the target session, or to every other session when `to` is omitted.
+ * `to` matches a session name exactly, else as a unique prefix (e.g. "codex-photos").
+ */
+export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>): void {
+  const from = ws.data.sessionName
+  if (!from) {
+    sendError(ws, 'Cannot post to bus: not registered')
+    return
+  }
+  if (!deps.busChannelId) {
+    sendError(ws, 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL')
+    return
+  }
+
+  // Loop guard: cap posts per session per minute.
+  const now = Date.now()
+  const limit = deps.busMaxPerMinute ?? 12
+  const times = (busPostTimes.get(from) ?? []).filter(t => now - t < 60_000)
+  if (times.length >= limit) {
+    sendError(ws, `Agent bus rate limit: max ${limit} posts/minute. Wait before posting again.`)
+    return
+  }
+  times.push(now)
+  busPostTimes.set(from, times)
+
+  const names = deps.sessions.getSessions().map(s => s.name).filter(n => n !== from)
+  let targets: string[] = names
+  let toLabel = 'all'
+  if (to) {
+    const exact = names.filter(n => n === to)
+    const prefix = names.filter(n => n.startsWith(to))
+    const pick = exact.length === 1 ? exact : prefix
+    if (pick.length === 0) {
+      sendError(ws, `No connected session matches "${to}". Connected: ${names.join(', ') || '(none)'}`)
+      return
+    }
+    targets = pick
+    toLabel = pick.join(', ')
+  }
+
+  for (const c of chunk(`**[${from} → ${toLabel}]** ${text}`, deps.chunkLimit, deps.chunkMode)) {
+    sendToDiscord(deps.client, deps.busChannelId, c)
+  }
+
+  const meta: ChannelMeta = {
+    chat_id: deps.busChannelId,
+    user: from,
+    source: 'agent-bus',
+    from,
+    to: toLabel,
+    ts: new Date(now).toISOString(),
+  }
+  for (const name of targets) deps.sessions.routeToSession(name, text, meta)
+}
+
+/**
+ * Deliver a human-authored message posted in the bus channel. A leading "@name"
+ * (or "name:") targets one session; otherwise every session receives it.
+ */
+export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager): string[] {
+  const names = sessions.getSessions().map(s => s.name)
+  const m = content.match(/^\s*@?([\w.@:/-]+?)[:,]?\s+([\s\S]*)$/)
+  if (m) {
+    const want = m[1]
+    const exact = names.filter(n => n === want)
+    const pick = exact.length === 1 ? exact : names.filter(n => n.startsWith(want))
+    if (pick.length > 0) {
+      for (const n of pick) sessions.routeToSession(n, m[2], { ...meta, to: pick.join(', ') })
+      return pick
+    }
+  }
+  for (const n of names) sessions.routeToSession(n, content, { ...meta, to: 'all' })
+  return names
 }
