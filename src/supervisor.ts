@@ -21,11 +21,17 @@ import { join, resolve } from 'node:path'
 
 const log = (m: string) => process.stderr.write(`agent-bus supervisor: ${m}\n`)
 
+/** Dedicated runtime checkout (release branch, never edited by hand or by agents). */
+export const RUNTIME_DIR = join(homedir(), '.local/share/agent-bus/multi-channel-discord')
+
 function pickCodeDir(): string {
   const env = process.env.DISCORD_CLIENT_DIR
   if (env && existsSync(join(env, 'src/plugin.ts'))) return env
-  const clone = join(homedir(), 'src/multi-channel-discord')
-  if (existsSync(join(clone, '.git')) && existsSync(join(clone, 'src/plugin.ts'))) return clone
+  // Prefer the runtime checkout: ~/src/multi-channel-discord is a *development* clone that agents
+  // edit — live clients must never execute someone's uncommitted work.
+  for (const dir of [RUNTIME_DIR, join(homedir(), 'src/multi-channel-discord')]) {
+    if (existsSync(join(dir, '.git')) && existsSync(join(dir, 'src/plugin.ts'))) return dir
+  }
   return resolve(import.meta.dir, '..')
 }
 
