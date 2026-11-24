@@ -124,3 +124,15 @@ describe('human bus messages', () => {
     expect(routeHumanBusMessage('everyone report status', { user: 'me' }, sessions)).toHaveLength(2)
   })
 })
+
+describe('to human', () => {
+  test('posts to channel without fan-out', async () => {
+    const h = createWsHandlers(deps())
+    const a = register(h, 'claude@mac:src')
+    const b = register(h, 'codex@nas642:src')
+    h.message(a as any, JSON.stringify({ type: 'busPost', text: 'status: done', to: 'human' }))
+    await new Promise(r => setTimeout(r, 10))
+    expect(msgs(b).some(x => x.type === 'message')).toBe(false)
+    expect(posted[0]).toContain('[claude@mac:src → human]')
+  })
+})

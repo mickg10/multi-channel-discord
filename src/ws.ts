@@ -683,6 +683,7 @@ function sendError(ws: WsLike, message: string): void {
 // ============================================================
 
 const busPostTimes = new Map<string, number[]>()
+const HUMAN_TARGETS = new Set(['human', 'admin', 'user', 'me'])
 
 /**
  * Post `[from → to] text` to the bus channel (so humans see the conversation) and
@@ -714,7 +715,11 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
   const names = deps.sessions.getSessions().map(s => s.name).filter(n => n !== from)
   let targets: string[] = names
   let toLabel = 'all'
-  if (to) {
+  if (to && HUMAN_TARGETS.has(to.toLowerCase())) {
+    // Answer for the human: show in the channel only, do not wake other agents.
+    targets = []
+    toLabel = 'human'
+  } else if (to) {
     const exact = names.filter(n => n === to)
     const prefix = names.filter(n => n.startsWith(to))
     const pick = exact.length === 1 ? exact : prefix

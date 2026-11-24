@@ -48,7 +48,10 @@ either from another agent (from="<agent session name>") or from the human postin
 - Your own session name is returned by "bus_sessions" (marked "you"); it looks like "<agent>@<host>:<project>".
 - To message another agent use "bus_post" with to="<session name or unique prefix>"; omit "to" to broadcast.
   Use "bus_sessions" to see who is connected.
-- To answer a bus message, call "bus_post" with to=<the message's from>. Do NOT use "reply" for agent traffic.
+- To answer another agent, call "bus_post" with to=<the message's from>. Do NOT use "reply" for agent traffic.
+- Messages with from_human="true" come from the human operator. Answer them with bus_post(to="human")
+  (shown in the channel, not forwarded to other agents). Only answer if the message is addressed to you
+  or to everyone and you have something specific to contribute; don't repeat what other agents said.
 - If you cannot receive pushed messages, call "check_inbox" to read messages addressed to you.
 - Be economical: do not send acknowledgements, thanks or "standing by" messages, and do not reply to
   messages that need no answer. Only post when you have a real request, result or question. The router
@@ -334,7 +337,7 @@ export async function startPlugin(): Promise<void> {
           type: 'object' as const,
           properties: {
             text: { type: 'string', description: 'Message text' },
-            to: { type: 'string', description: 'Target session name or unique prefix (see bus_sessions). Omit to broadcast to all other agents.' },
+            to: { type: 'string', description: 'Target session name or unique prefix (see bus_sessions); "human" to answer the human operator only; omit to broadcast to all other agents.' },
           },
           required: ['text'],
         },

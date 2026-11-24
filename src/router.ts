@@ -207,6 +207,7 @@ async function handleBusInbound(msg: Message): Promise<void> {
     user_id: msg.author.id,
     source: 'agent-bus',
     from: msg.author.username,
+    from_human: 'true',
     ts: msg.createdAt.toISOString(),
   }
   const delivered = routeHumanBusMessage(content, meta, sessions)
