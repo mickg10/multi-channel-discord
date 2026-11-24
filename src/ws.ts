@@ -19,6 +19,7 @@ import type { PluginToRouterMessage, WsRegistered, WsRenamed, WsError, WsToolRes
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { Inboxes, NodeRegistry, Claims } from './nodes.js'
+import type { McpRegistry, Grants, McpAudit, PendingMcpCalls, McpServerDecl } from './mcp.js'
 
 /** Guild channel operations the router provides (mockable in tests). */
 export interface ChannelOps {
@@ -78,6 +79,11 @@ export interface WsDeps {
   readonly inboxes?: Inboxes
   readonly nodes?: NodeRegistry
   readonly claims?: Claims
+  /** Remote MCP over the bus (declaration, admission, audit, pending call map). */
+  readonly mcp?: McpRegistry
+  readonly mcpGrants?: Grants
+  readonly mcpAudit?: McpAudit
+  readonly mcpPending?: PendingMcpCalls
   /** Sessions allowed to manage other sessions' subscriptions (DISCORD_ADMIN_SESSIONS). */
   readonly admins?: ReadonlySet<string>
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
@@ -140,6 +146,54 @@ function sendRulesOnce(deps: Readonly<WsDeps>, name: string): void {
   if (!r || r.seen(name)) return
   r.markSeen(name)
   deliver(deps, name, r.text, { source: 'agent-bus', from: 'router', user: 'router', to: name, channel: 'rules', chat_id: deps.busChannelId })
+}
+
+/** Remote MCP over the bus: mcp_list / mcp_describe / mcp_call (see src/mcp.ts). */
+function handleMcpOp(ws: WsLike, parsed: import('./types.js').WsMcpOp, deps: Readonly<WsDeps>): void {
+  const me = ws.data.sessionName
+  if (!me || !deps.mcp || !deps.mcpGrants || !deps.mcpAudit || !deps.mcpPending || !deps.nodes) {
+    sendToolResult(ws, parsed.requestId, false, me ? 'remote MCP disabled on this router' : 'not registered')
+    return
+  }
+  if (parsed.type === 'mcpList') {
+    sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.mcp.list()))
+    return
+  }
+  if (!parsed.server) { sendToolResult(ws, parsed.requestId, false, 'server required'); return }
+  const decl = deps.mcp.get(parsed.server)
+  if (!decl) {
+    deps.mcpAudit.record(me, parsed.server, parsed.method ?? '', parsed.params, 'reject:undeclared')
+    sendToolResult(ws, parsed.requestId, false, `server "${parsed.server}" is not declared in the registry`)
+    return
+  }
+  if (parsed.type === 'mcpDescribe') {
+    // Declaration plus live tools/list from the hosting node: schemas load lazily, only on describe.
+    if (forwardMcpExec(ws, parsed.requestId, decl, 'tools/list', undefined, deps)) return
+    sendToolResult(ws, parsed.requestId, false, `hosting node "${decl.node}" is not connected (declaration: ${decl.class}, methods: ${decl.methods ? decl.methods.join(', ') : 'all'})`)
+    return
+  }
+  if (!parsed.method) { sendToolResult(ws, parsed.requestId, false, 'method required'); return }
+  const decision = deps.mcp.checkCall(parsed.server, parsed.method, deps.mcpGrants, me, parsed.grant)
+  if (!decision.ok) {
+    deps.mcpAudit.record(me, parsed.server, parsed.method, parsed.params, `reject:${decision.reason}`)
+    sendToolResult(ws, parsed.requestId, false, decision.reason)
+    return
+  }
+  deps.mcpAudit.record(me, parsed.server, parsed.method, parsed.params, parsed.grant ? `allow:grant:${parsed.grant}` : 'allow:read-only')
+  if (!forwardMcpExec(ws, parsed.requestId, decl, parsed.method, parsed.params, deps)) {
+    sendToolResult(ws, parsed.requestId, false, `hosting node "${decl.node}" is not connected`)
+  }
+}
+
+/** Forward one JSON-RPC method to the hosting node; register the pending answer. */
+function forwardMcpExec(ws: WsLike, requestId: string, decl: McpServerDecl, method: string, params: unknown, deps: Readonly<WsDeps>): boolean {
+  if (!deps.nodes?.nodeConnected(decl.node)) return false
+  deps.mcpPending!.register(requestId, ws)
+  return deps.nodes.sendToNode(decl.node, {
+    type: 'mcpExec', requestId, server: decl.name, command: decl.command,
+    ...(decl.args && { args: decl.args }), ...(decl.env && { env: decl.env }),
+    method, ...(params !== undefined && { params }), ...(decl.timeoutMs && { timeoutMs: decl.timeoutMs }),
+  })
 }
 
 export interface WsLike {
@@ -252,6 +306,20 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       if (!parsed.task) { sendToolResult(ws, parsed.requestId, false, 'task required'); return }
       const r = parsed.type === 'claim' ? deps.claims.claim(parsed.task, me, parsed.note) : deps.claims.release(parsed.task, me, parsed.to)
       sendToolResult(ws, parsed.requestId, true, JSON.stringify(r))
+      break
+    }
+    case 'mcpList':
+    case 'mcpDescribe':
+    case 'mcpCall': {
+      if (!hasString(parsed, 'requestId')) { sendError(ws, 'mcp op requires requestId'); return }
+      handleMcpOp(ws, parsed, deps)
+      break
+    }
+    case 'mcpResult': {
+      // Answer from a node daemon for a forwarded mcpExec.
+      if (!hasString(parsed, 'requestId') || typeof (parsed as { success?: unknown }).success !== 'boolean' || !hasString(parsed as { data?: unknown }, 'data')) return
+      if (!ws.data.nodeName || !deps.mcpPending) return
+      deps.mcpPending.resolve(parsed.requestId, (parsed as { success: boolean }).success, (parsed as { data: string }).data)
       break
     }
     case 'agentStatus': {

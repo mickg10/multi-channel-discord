@@ -191,6 +191,14 @@ Default policy is `pairing` — unknown senders get a code to approve. Switch to
 
 Details in [ACCESS.md](./ACCESS.md).
 
+## Remote MCP over the bus
+
+Shared MCP servers are tunnelled through the agent bus: clients call `mcp_list` / `mcp_describe` / `mcp_call`, the router enforces admission, and the hosting node's daemon spawns/forwards to the stdio server. No client config, keys or restarts; nothing is exposed on new ports; attach and revoke take effect mid-session.
+
+- **Declaration** — a git-reviewed JSON file (`mcp-registry.example.json` shows the shape) deployed next to the router state (override with `MCP_REGISTRY`). Each server declares its hosting `node`, spawn `command`, optional `env` (literals or `file:/path` resolved **on the node**, so secrets never transit the bus), an optional method allowlist, and its `class`.
+- **Enforcement (router-side, the only approval boundary most clients have)** — undeclared servers, non-allowlisted methods, and *side-effecting* classes are hard-rejected and logged. Round one is read-only only: zero grants exist. A side-effecting call additionally requires a Mick-issued grant ID (`bin/agent-bus-grant <stateDir> issue …`), checked and logged per call with an args hash in `mcp-audit.jsonl`.
+- **Runtime** — grants live in `<stateDir>/mcp-grants.json`; pending calls time out (`MCP_CALL_TIMEOUT_MS`, default 30 s); node daemons keep one stdio child per server and respawn on exit.
+
 ## Updating
 
 ```bash

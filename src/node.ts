@@ -27,6 +27,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
+import { McpChild } from './mcp.js'
 
 const HOME = homedir()
 const expand = (p: string) => p.replace(/^~(?=$|\/)/, HOME)
@@ -60,7 +61,8 @@ const ENV_FILE = expand(process.env.DISCORD_STATE_DIR ? `${process.env.DISCORD_S
 export const LAST = 'last'
 const DISCORD_TOOLS = ['bus_post', 'bus_sessions', 'check_inbox', 'reply', 'react', 'edit_message', 'fetch_messages',
   'download_attachment', 'ask_user', 'channel_post', 'channel_list', 'channel_create', 'channel_subscribe',
-  'channel_unsubscribe', 'channel_archive', 'claim', 'release_claim', 'list_claims']
+  'channel_unsubscribe', 'channel_archive', 'claim', 'release_claim', 'list_claims',
+  'mcp_list', 'mcp_describe', 'mcp_call']
 
 function readEnvFile(): Record<string, string> {
   const out: Record<string, string> = {}
@@ -209,6 +211,9 @@ async function main(): Promise<void> {
   let attempt = 0
   let reqId = 0
   const pending = new Map<string, (data: string) => void>()
+  // stdio MCP servers this node hosts for the bus (registry declaration arrives per call).
+  const mcpChild = new McpChild(undefined, log)
+  process.on('exit', () => mcpChild.close())
 
   for (const a of cfg.agents) {
     if (a.resume && a.resume !== 'last' && !state[a.name]?.session) state[a.name] = { ...state[a.name], session: a.resume }
@@ -294,6 +299,10 @@ async function main(): Promise<void> {
       else if (m.type === 'wake') {
         const a = cfg.agents.find(x => x.name === m.agent)
         if (a) void runTurn(a)
+      } else if (m.type === 'mcpExec' && typeof m.requestId === 'string') {
+        void mcpChild.call(m as import('./mcp.js').McpExecSpec).then(r => {
+          try { ws!.send(JSON.stringify({ type: 'mcpResult', requestId: m.requestId, success: r.ok, data: r.data })) } catch {}
+        })
       } else if (m.type === 'toolResult') { pending.get(m.requestId)?.(m.data); pending.delete(m.requestId) }
       else if (m.type === 'error') log(`router error: ${m.message}`)
     }
