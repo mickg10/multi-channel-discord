@@ -90,6 +90,8 @@ export interface WsDeps {
 export interface InlineFile { readonly name: string; readonly data: string }
 export const MAX_FILE_BYTES = 10 * 1024 * 1024
 export const MAX_FILES = 4
+export const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+export const MAX_DOWNLOAD_TOTAL = 45 * 1024 * 1024
 type DiscordFile = { attachment: Buffer; name: string }
 
 /** Decode inline files; bare paths are rejected (they would be read on the router host). */
@@ -528,6 +530,19 @@ function handleReact(chatId: string, messageId: string, emoji: string, deps: Rea
   })()
 }
 
+async function sendToDiscordAwait(client: Client, chatId: string, text: string, files?: readonly DiscordFile[]): Promise<string | undefined> {
+  try {
+    const ch = await fetchTextChannelOrNull(client, chatId)
+    if (!ch || !('send' in ch)) return undefined
+    const sent = await ch.send({ content: text, ...(files?.length ? { files: [...files] } : {}) })
+    noteSent(sent.id)
+    return sent.id
+  } catch (err: unknown) {
+    process.stderr.write(`discord: send failed: ${err instanceof Error ? err.message : String(err)}\n`)
+    return undefined
+  }
+}
+
 function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly DiscordFile[]): void {
   // Fire-and-forget: send to Discord asynchronously without blocking the caller
   void (async () => {
@@ -585,22 +600,22 @@ function handleDownloadAttachment(ws: WsLike, requestId: string, chatId: string,
         return
       }
 
-      const inboxDir = join(getStateDir(deps.stateDir), 'inbox')
-      await mkdir(inboxDir, { recursive: true })
-
-      const paths: string[] = []
+      // The router is remote: return the bytes; the client writes them to ITS local inbox.
+      const files: Array<{ name: string; size: number; data?: string; error?: string }> = []
+      let total = 0
       for (const att of msg.attachments.values()) {
-        const url = att.url
-        const resp = await fetch(url)
-        if (!resp.ok) continue
-        const buffer = await resp.arrayBuffer()
-        const safeName = (att.name ?? att.id).replace(/[^a-zA-Z0-9._-]/g, '_')
-        const filePath = join(inboxDir, `${att.id}_${safeName}`)
-        await writeFile(filePath, Buffer.from(buffer))
-        paths.push(filePath)
+        const safeName = `${att.id}_${(att.name ?? att.id).replace(/[^a-zA-Z0-9._-]/g, '_')}`
+        if (att.size > MAX_DOWNLOAD_BYTES || total + att.size > MAX_DOWNLOAD_TOTAL) {
+          files.push({ name: safeName, size: att.size, error: `too large to relay (${Math.round(att.size / 1048576)} MB); open in Discord: ${att.url}` })
+          continue
+        }
+        const resp = await fetch(att.url)
+        if (!resp.ok) { files.push({ name: safeName, size: att.size, error: `HTTP ${resp.status}` }); continue }
+        const buf = Buffer.from(await resp.arrayBuffer())
+        total += buf.length
+        files.push({ name: safeName, size: buf.length, data: buf.toString('base64') })
       }
-
-      sendToolResult(ws, requestId, true, JSON.stringify(paths))
+      sendToolResult(ws, requestId, true, JSON.stringify(files))
     } catch (err: unknown) {
       sendToolResult(ws, requestId, false, `Download failed: ${err instanceof Error ? err.message : String(err)}`)
     }
@@ -939,9 +954,6 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   const toHuman = toLabel === 'human' && deps.humanChannelId && deps.humanChannelId !== channelId
   const where = toHuman ? deps.humanChannelId! : channelId
   const origin = toHuman ? ` (from ${channelName ? `#${channelName}` : channelId === deps.busChannelId ? '#general' : channelId})` : ''
-  chunk(`**[${from} → ${toLabel}]**${origin} ${text}`, deps.chunkLimit, deps.chunkMode)
-    .forEach((c, i) => sendToDiscord(deps.client, where, c, undefined, i === 0 && files?.length ? files : undefined))
-
   const meta: ChannelMeta = {
     ...(files?.length && { attachments: files.map(f => f.name).join('; '), attachment_count: String(files.length) }),
     chat_id: channelId,
@@ -952,7 +964,24 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     to: toLabel,
     ts: new Date(now).toISOString(),
   }
-  for (const name of targets) deliver(deps, name, text, meta)
+
+  const chunks = chunk(`**[${from} → ${toLabel}]**${origin} ${text}`, deps.chunkLimit, deps.chunkMode)
+  if (files?.length) {
+    // Recipients need the Discord message id to download_attachment the files.
+    void sendToDiscordAwait(deps.client, where, chunks[0], files).then(id => {
+      chunks.slice(1).forEach(c => sendToDiscord(deps.client, where, c))
+      finish(id)
+    })
+    return
+  }
+  chunks.forEach(c => sendToDiscord(deps.client, where, c))
+  finish(undefined)
+
+  function finish(messageId: string | undefined): void {
+    const m: ChannelMeta = { ...meta, ...(messageId && { message_id: messageId, chat_id: where }) }
+    for (const name of targets) deliver(deps, name, text, m)
+  }
+
 }
 
 /**

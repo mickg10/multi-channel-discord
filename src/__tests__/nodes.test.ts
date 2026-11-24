@@ -245,3 +245,28 @@ describe('inline attachments', () => {
     expect(msgs(a).some(m => m.type === 'error' && m.message.includes('/etc/passwd'))).toBe(true)
   })
 })
+
+describe('download + file message ids', () => {
+  test('agent-to-agent file post delivers message_id so the recipient can download', async () => {
+    const d = deps()
+    ;(d.client as any).channels.fetch = mock(async () => ({ isTextBased: () => true, send: mock(async () => ({ id: 'MSG42' })) }))
+    const h = createWsHandlers(d)
+    const a = reg(h, 'claude@nas642:src'), b = reg(h, 'codex@mac')
+    h.message(a as any, JSON.stringify({ type: 'busPost', text: 'see file', to: 'codex@mac', files: [{ name: 'r.txt', data: Buffer.from('x').toString('base64') }] }))
+    await tick()
+    const m = msgs(b).find(x => x.type === 'message')
+    expect(m.meta).toMatchObject({ message_id: 'MSG42', attachments: 'r.txt', attachment_count: '1' })
+  })
+  test('downloadAttachment returns bytes, not router paths', async () => {
+    const d = deps()
+    const atts = new Map([['1', { id: '1', name: 'in.pdf', size: 3, url: 'data:application/pdf;base64,' + Buffer.from('PDF').toString('base64') }]])
+    ;(d.client as any).channels.fetch = mock(async () => ({ isTextBased: () => true, messages: { fetch: async () => ({ attachments: atts }) } }))
+    const h = createWsHandlers(d)
+    const a = reg(h, 'codex@mac')
+    h.message(a as any, JSON.stringify({ type: 'downloadAttachment', requestId: 'd', chatId: 'c', messageId: 'm' }))
+    await new Promise(r => setTimeout(r, 60))
+    const res = JSON.parse(msgs(a).find(m => m.requestId === 'd').data)
+    expect(res[0]).toMatchObject({ name: '1_in.pdf', size: 3 })
+    expect(Buffer.from(res[0].data, 'base64').toString()).toBe('PDF')
+  })
+})

@@ -67,6 +67,8 @@ either from another agent (from="<agent session name>") or from the human postin
   (tagged with the origin channel). The human answers there (a Discord reply reaches only you).
 - FILES: to show the human (or agents) a file — report, PDF, image, log — pass its local path in
   files=[...] on bus_post / channel_post / reply. It is uploaded as a Discord attachment (max 4, 10 MB each).
+  Incoming messages with attachments carry meta attachments=<names> plus chat_id/message_id; call
+  download_attachment(chat_id, message_id) to save them locally (returns local paths, up to 25 MB each).
 - RULES: the router sends the bus rules once (from="router"); follow them.
 - CLAIMS: before acting on a request several agents could take (especially the human's broadcasts),
   call claim(task="<short stable description>"). If it returns won=false, someone else owns it: do NOT
@@ -705,8 +707,19 @@ export async function startPlugin(): Promise<void> {
         }
         case 'download_attachment': {
           const result = await sendToolRequest({ type: 'downloadAttachment', chatId: args.chat_id, messageId: args.message_id })
-          const paths = JSON.parse(result) as string[]
-          return { content: [{ type: 'text', text: `Downloaded ${paths.length} file(s):\n${paths.join('\n')}` }] }
+          const items = JSON.parse(result) as Array<string | { name: string; size: number; data?: string; error?: string }>
+          // New routers send bytes; save them in THIS machine's inbox (old routers sent their own paths).
+          const dir = `${process.env.DISCORD_STATE_DIR ?? `${process.env.HOME}/.claude/channels/discord`}/inbox`
+          const { mkdirSync, writeFileSync } = await import('node:fs')
+          mkdirSync(dir, { recursive: true })
+          const lines = items.map(it => {
+            if (typeof it === 'string') return it
+            if (!it.data) return `${it.name}: ${it.error ?? 'not downloaded'}`
+            const path = `${dir}/${it.name}`
+            writeFileSync(path, Buffer.from(it.data, 'base64'))
+            return path
+          })
+          return { content: [{ type: 'text', text: `Downloaded ${lines.length} file(s):\n${lines.join('\n')}` }] }
         }
         case 'fetch_messages': {
           const result = await sendToolRequest({ type: 'fetchMessages', channel: args.channel, limit: args.limit })

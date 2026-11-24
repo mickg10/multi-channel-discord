@@ -306,9 +306,11 @@ async function handleBusInbound(msg: Message): Promise<void> {
     process.stderr.write(`discord: bus message from non-allowlisted ${msg.author.username} dropped\n`)
     return
   }
-  const content = msg.content.replace(/<@!?\d+>\s*/g, '').trim()
+  const atts = [...msg.attachments.values()].map(a => `${safeAttName(a.name ?? a.id, a.id)} (${a.contentType ?? 'unknown'}, ${(a.size / 1024).toFixed(0)}KB)`)
+  const content = msg.content.replace(/<@!?\d+>\s*/g, '').trim() || (atts.length ? '(attachment — use download_attachment)' : '')
   if (!content) return
   const meta: ChannelMeta = {
+    ...(atts.length && { attachments: atts.join('; '), attachment_count: String(atts.length) }),
     chat_id: msg.channelId,
     message_id: msg.id,
     user: msg.author.username,
