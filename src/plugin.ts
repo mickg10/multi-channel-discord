@@ -11,7 +11,7 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
-import { readNamingContext } from './naming.js'
+import { readNamingContext, findClaudeSession, readClaudeSession, sessionAlias } from './naming.js'
 import { ensureRouter } from './ensure-router.js'
 import { computeBackoff } from './reconnect.js'
 import { discoverSkills } from './skills.js'
@@ -207,15 +207,6 @@ async function findTmuxPane(tmuxBin: string): Promise<string | undefined> {
   return undefined
 }
 
-/** The user-set /name of the Claude Code session whose process id is `pid`, if any. */
-function claudeAlias(pid: string): string | undefined {
-  try {
-    const d = JSON.parse(readFileSync(`${process.env.HOME}/.claude/sessions/${pid}.json`, 'utf8')) as { name?: string; nameSource?: string }
-    const n = d.name?.trim()
-    return n && d.nameSource !== 'auto' ? n.replace(/\s+/g, '-') : undefined
-  } catch { return undefined }
-}
-
 /** Read local files for upload (the router is remote and never sees our filesystem). */
 function inlineFiles(paths: unknown): Array<{ name: string; data: string }> {
   if (!Array.isArray(paths)) return []
@@ -260,20 +251,23 @@ export async function startPlugin(): Promise<void> {
   // Walk up the process tree to find Claude Code's cwd (the real project dir).
   // Client config (router URL, secret, agent label) lives in the same .env as the bot token.
   loadEnvFile()
-  const cwd = await getProjectDir()
+  const inChatGPT = underChatGPTApp()
+  const agent = inChatGPT ? 'chatgpt-codex' : (process.env.DISCORD_AGENT || 'claude')
+  // Claude tells us its project directory and keeps a session file; guessing from the process
+  // tree fails under the supervisor (the runner's cwd is the plugin cache).
+  const claude = agent === 'claude' ? findClaudeSession(String(process.ppid)) : undefined
+  const cwd = (agent === 'claude' && (process.env.CLAUDE_PROJECT_DIR || claude?.cwd)) || await getProjectDir()
   process.stderr.write(`discord plugin: project="${cwd}"\n`)
   const wsPort = parseInt(process.env.DISCORD_WS_PORT ?? '8789', 10)
 
   const namingCtx = await readNamingContext(cwd)
   // Session name: DISCORD_SESSION_NAME overrides; else "<agent>@<host>:<project>".
-  const inChatGPT = underChatGPTApp()
-  const agent = inChatGPT ? 'chatgpt-codex' : (process.env.DISCORD_AGENT || 'claude')
   const hostLabel = process.env.DISCORD_HOST_LABEL || hostname().split('.')[0].toLowerCase()
   // The ChatGPT app's Codex shares ~/.codex/config.toml with the CLI, so ignore the CLI's
   // fixed name and tmux wake target there.
   // Claude: the session's /name alias (in ~/.claude/sessions/<pid>.json) names it, and is followed live.
-  const claudePid = process.env.DISCORD_PARENT_PID || String(process.ppid)
-  const alias = agent === 'claude' ? claudeAlias(claudePid) : undefined
+  const claudeAlias = (): string | undefined => claude && sessionAlias(readClaudeSession(claude.pid))
+  const alias = claudeAlias()
   const sessionName = (!inChatGPT && process.env.DISCORD_SESSION_NAME) || `${agent}@${hostLabel}:${alias ?? namingCtx.dirName}`
 
   // Inbox: every inbound message is also queued here so clients without channel push
@@ -404,9 +398,9 @@ export async function startPlugin(): Promise<void> {
 
   let aliasTimer: ReturnType<typeof setInterval> | null = null
   function startAliasWatch(): void {
-    if (aliasTimer || process.env.DISCORD_SESSION_NAME || agent !== 'claude') return
+    if (aliasTimer || process.env.DISCORD_SESSION_NAME || !claude) return
     aliasTimer = setInterval(() => {
-      const a = claudeAlias(claudePid)
+      const a = claudeAlias()
       const want = `${agent}@${hostLabel}:${a ?? namingCtx.dirName}`
       if (want !== currentName && currentWs && currentWs.readyState === WebSocket.OPEN) {
         process.stderr.write(`discord plugin: /name changed -> ${want}\n`)
