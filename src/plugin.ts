@@ -17,6 +17,7 @@ import { computeBackoff } from './reconnect.js'
 import { discoverSkills } from './skills.js'
 import { loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
+import { existsSync } from 'node:fs'
 import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
 
@@ -151,6 +152,25 @@ async function getProjectDir(): Promise<string> {
   return process.env.OLDPWD ?? process.cwd()
 }
 
+/** Find the tmux pane hosting this process by matching ancestor PIDs to pane PIDs. */
+async function findTmuxPane(tmuxBin: string): Promise<string | undefined> {
+  try {
+    const { execFileSync } = await import('child_process')
+    const panes = new Map<string, string>()
+    for (const line of execFileSync(tmuxBin, ['list-panes', '-a', '-F', '#{pane_pid} #{pane_id}']).toString().split('\n')) {
+      const [pid, id] = line.trim().split(' ')
+      if (pid && id) panes.set(pid, id)
+    }
+    let pid = String(process.pid)
+    for (let i = 0; i < 30 && pid && pid !== '0' && pid !== '1'; i++) {
+      const hit = panes.get(pid)
+      if (hit) return hit
+      pid = execFileSync('ps', ['-o', 'ppid=', '-p', pid]).toString().trim()
+    }
+  } catch {}
+  return undefined
+}
+
 /** Start the MCP plugin. */
 export async function startPlugin(): Promise<void> {
   // Claude Code sets --cwd to the plugin cache dir, not the actual project.
@@ -174,7 +194,10 @@ export async function startPlugin(): Promise<void> {
 
   // Optional wake-up for clients without push: type a nudge into the agent's tmux pane.
   const wakeMode = process.env.DISCORD_WAKE // 'tmux' to enable
-  const wakePane = process.env.DISCORD_WAKE_PANE || process.env.TMUX_PANE
+  const tmuxBin = ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'].find(p => { try { return existsSync(p) } catch { return false } }) ?? 'tmux'
+  let wakePane = process.env.DISCORD_WAKE_PANE || process.env.TMUX_PANE
+  if (wakeMode === 'tmux' && !wakePane) wakePane = await findTmuxPane(tmuxBin)
+  if (wakeMode === 'tmux') process.stderr.write(`discord plugin: tmux wake ${wakePane ? `-> pane ${wakePane}` : 'disabled (no pane found)'}\n`)
   const wakeText = process.env.DISCORD_WAKE_TEXT || 'New agent-bus/Discord message(s): call the discord check_inbox tool and handle them.'
   let wakeTimer: ReturnType<typeof setTimeout> | null = null
   function wake(): void {
@@ -182,7 +205,7 @@ export async function startPlugin(): Promise<void> {
     wakeTimer = setTimeout(() => {
       wakeTimer = null
       const run = (args: string[]) => new Promise<void>(res => {
-        const p = spawnProc('tmux', args, { stdio: 'ignore' })
+        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
         p.on('close', () => res()); p.on('error', () => res())
       })
       void run(['send-keys', '-t', wakePane, '-l', wakeText]).then(() => new Promise(r => setTimeout(r, 300)))

@@ -1,0 +1,7 @@
+#!/bin/sh
+# MCP stdio server for non-Claude agents (Codex, agy, ...): same client as the Claude plugin.
+# Config comes from ~/.claude/channels/discord/.env plus env vars set by the agent's MCP config
+# (DISCORD_AGENT, DISCORD_WAKE=tmux, ...).
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+BUN="${BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
+exec "$BUN" "$DIR/src/plugin.ts"
