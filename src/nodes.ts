@@ -111,6 +111,17 @@ export class NodeRegistry {
     try { send(JSON.stringify({ type: 'wake', agent: name, pending })) } catch { return false }
     return true
   }
+
+  /** Send a raw message to a named node's daemon (e.g. mcpExec). False if it is not connected. */
+  sendToNode(node: string, msg: unknown): boolean {
+    const send = this.nodes.get(node)
+    if (!send) return false
+    try { send(JSON.stringify(msg)) } catch { return false }
+    return true
+  }
+
+  /** Is a daemon connected under this node name? */
+  nodeConnected(node: string): boolean { return this.nodes.has(node) }
 }
 
 export interface Claim { readonly task: string; readonly owner: string; readonly since: string; readonly note?: string }

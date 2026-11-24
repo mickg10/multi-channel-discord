@@ -19,6 +19,7 @@ import type { ChannelMeta } from './types.js'
 import { ActivityType, ChannelType, type Message, type Guild } from 'discord.js'
 import { Subscriptions } from './subscriptions.js'
 import { Inboxes, NodeRegistry, Claims } from './nodes.js'
+import { McpRegistry, Grants, McpAudit, PendingMcpCalls } from './mcp.js'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join as pjoin } from 'node:path'
@@ -128,6 +129,15 @@ const inboxes = Inboxes.inStateDir(STATE_DIR)
 const nodes = new NodeRegistry()
 const claims = Claims.inStateDir(STATE_DIR)
 
+// Remote MCP over the bus: git-declared registry (MCP_REGISTRY or state dir), runtime in state dir.
+// A missing registry file = feature present but empty (mcp_list returns []); a malformed file
+// fails startup closed — a broken declaration must not silently widen admission.
+const MCP_REGISTRY_FILE = process.env.MCP_REGISTRY ?? pjoin(STATE_DIR, 'mcp-registry.json')
+const mcp = McpRegistry.fromFileOrNull(MCP_REGISTRY_FILE)
+const mcpGrants = Grants.inStateDir(STATE_DIR)
+const mcpAudit = McpAudit.inStateDir(STATE_DIR)
+const mcpPending = new PendingMcpCalls(Number(process.env.MCP_CALL_TIMEOUT_MS ?? 30_000))
+
 // Rules of comms: ${STATE_DIR}/rules.md, delivered once per session name per rules version.
 const RULES_FILE = pjoin(STATE_DIR, 'rules.md')
 const RULES_SEEN = pjoin(STATE_DIR, 'rules-seen.json')
@@ -226,6 +236,10 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   inboxes,
   nodes,
   claims,
+  mcp: mcp ?? undefined,
+  mcpGrants,
+  mcpAudit,
+  mcpPending,
   admins: ADMINS,
   humanChannelId: HUMAN_CHANNEL,
   rules: rulesProvider,

@@ -169,7 +169,32 @@ export interface WsClaimOp {
   readonly to?: string
 }
 
+/** Remote MCP access over the bus (option 4: tunnelled, no new ports).
+ *  Round one is read-only: side-effecting servers require a grant ID and none are issued. */
+export interface WsMcpOp {
+  readonly type: 'mcpList' | 'mcpDescribe' | 'mcpCall'
+  readonly requestId: string
+  readonly server?: string
+  /** Tool name for mcpCall. */
+  readonly method?: string
+  /** Tool arguments (JSON) for mcpCall. */
+  readonly params?: unknown
+  /** Mick-issued grant ID; required for side-effecting servers. */
+  readonly grant?: string
+}
+
+/** Node → Router: result of an mcpExec the router forwarded to that node.
+ *  callId is router-minted; results are accepted only from the node the call was sent to. */
+export interface WsNodeMcpResult {
+  readonly type: 'mcpResult'
+  readonly callId: string
+  readonly success: boolean
+  readonly data: string
+}
+
 export type PluginToRouterMessage =
+  | WsMcpOp
+  | WsNodeMcpResult
   | WsClaimOp
   | WsRegisterNode
   | WsInboxOp

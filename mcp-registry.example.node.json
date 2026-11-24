@@ -1,0 +1,18 @@
+{
+  "_comment": "NODE-side example: the \"mcpServers\" section of a node daemon's config (~/.config/agent-bus/node.json). This is the local allowlist that decides which shared MCP servers this node will actually spawn — the router never sends commands. env values may be literals or 'file:/abs/path' (resolved on this node at spawn, so keys never transit the bus). 'methods' is an optional local allowlist on top of the router's. Only names present in BOTH this file and the router registry are callable.",
+  "node": "nas642",
+  "agents": [],
+  "mcpServers": {
+    "inventory": {
+      "command": "bun",
+      "args": ["/srv/agent-bus/mcp/inventory/server.ts"],
+      "env": { "INVENTORY_EXPORT_FILE": "/srv/agent-bus/mcp/inventory/export.json" }
+    },
+    "web-tools": {
+      "command": "bunx",
+      "args": ["-y", "zai-mcp-server"],
+      "env": { "ZAI_API_KEY": "file:/srv/agent-bus/secrets/zai.key" },
+      "methods": ["web_search", "read_url"]
+    }
+  }
+}
