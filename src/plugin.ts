@@ -99,7 +99,12 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
     ws.onopen = () => {
       // process.ppid IS the Claude Code process (confirmed via process tree).
       // Multiple MCP spawns from the same Claude Code share this PID.
-      const instanceId = String(process.ppid)
+      // Claude Code spawns several MCP instances per session (same ppid) and they must merge.
+      // Codex hosts many threads' MCP servers in one app-server daemon (also same ppid), so
+      // non-Claude agents use their own pid to avoid being merged into another thread's session.
+      const agentKind = process.env.DISCORD_AGENT || 'claude'
+      const instanceId = process.env.DISCORD_INSTANCE_ID
+        || (agentKind === 'claude' ? String(process.ppid) : `${process.ppid}-${process.pid}`)
       const secret = process.env.DISCORD_ROUTER_SECRET || undefined
       ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, ...(secret && { secret }) }))
     }
