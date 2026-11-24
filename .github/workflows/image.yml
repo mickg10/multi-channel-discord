@@ -2,21 +2,28 @@ name: router-image
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'bin/**', 'package.json', 'bun.lock', 'Dockerfile', '.github/workflows/image.yml']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 permissions:
   contents: write
   packages: write
 jobs:
-  build:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile && bun x tsc --noEmit && bun test
+  release:
+    # Only after tests pass on main: move `release` (live clients/nodes follow it) and publish the router image.
+    if: github.event_name != 'pull_request'
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history so pushing HEAD:release can fast-forward
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile && bun test
-      # Live clients (src/supervisor.ts) follow 'release'; move it only after tests pass.
       - run: git push origin HEAD:refs/heads/release
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
