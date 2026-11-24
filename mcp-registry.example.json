@@ -1,13 +1,10 @@
 {
-  "_comment": "Remote MCP servers shared over the agent bus (see src/mcp.ts and README 'Remote MCP'). Deploy to the router state dir (or point MCP_REGISTRY at this file). Git is the reviewed source of truth; the router loads it at start. class must be 'read-only' or 'side-effecting'; side-effecting calls additionally need a Mick-issued grant ID (bin/agent-bus-grant) and are otherwise hard-rejected. env values may be literals or 'file:/abs/path' resolved on the hosting node at spawn time, so secrets never transit the bus. Address hosts by their stable node name, never by tailnet IP.",
+  "_comment": "ROUTER-side registry: admission facts only (deploy to the router state dir, or point MCP_REGISTRY at it). Git is the reviewed source of truth. command/args/env intentionally do NOT live here — they belong to each node's own node.json \"mcpServers\" allowlist (see mcp-registry.example.node.json), so a compromised router can never select a program to run on a node. class must be 'read-only' or 'side-effecting'; side-effecting calls additionally need a Mick-issued grant ID (bin/agent-bus-grant) and are otherwise hard-rejected. Address hosts by their stable node name, never by tailnet IP.",
   "servers": [
     {
       "name": "inventory",
       "description": "Read-only infra inventory (generated, secret-free export of aikeys assets — no credentials)",
       "node": "nas642",
-      "command": "bun",
-      "args": ["/srv/agent-bus/mcp/inventory/server.ts"],
-      "env": { "INVENTORY_EXPORT": "file:/srv/agent-bus/mcp/inventory/export.json" },
       "owner": "opencode_ops",
       "class": "read-only",
       "methods": ["lookup", "list"],
@@ -17,9 +14,6 @@
       "name": "web-tools",
       "description": "z.ai web search + reader for clients without built-in search (key stays on the hosting node)",
       "node": "vps2",
-      "command": "bunx",
-      "args": ["-y", "zai-mcp-server"],
-      "env": { "ZAI_API_KEY": "file:/srv/agent-bus/secrets/zai.key" },
       "owner": "claude_setup",
       "class": "read-only"
     }

@@ -183,10 +183,11 @@ export interface WsMcpOp {
   readonly grant?: string
 }
 
-/** Node → Router: result of an mcpExec the router forwarded to that node. */
+/** Node → Router: result of an mcpExec the router forwarded to that node.
+ *  callId is router-minted; results are accepted only from the node the call was sent to. */
 export interface WsNodeMcpResult {
   readonly type: 'mcpResult'
-  readonly requestId: string
+  readonly callId: string
   readonly success: boolean
   readonly data: string
 }

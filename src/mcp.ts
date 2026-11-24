@@ -1,38 +1,37 @@
 /**
- * Remote MCP over the agent bus (consensus T20, draft v2.1).
+ * Remote MCP over the agent bus (consensus T20, draft v2.1 + PR #2 review fixes).
  *
- * The registry *declaration* lives in a git-reviewed JSON file (deployed next to the
- * router state, e.g. mickg-containers/vps2/agent-bus/mcp-registry.json). It declares
- * each server: hosting node, spawn command, allowlisted methods and its class.
- * The *runtime* (grants, health, pending calls) lives in the router state dir.
+ * Trust model after review:
+ *  - The router's git-declared registry (MCP_REGISTRY or state-dir mcp-registry.json) holds
+ *    ONLY admission facts: name, hosting node, class, optional method allowlist. It never
+ *    carries command/args/env, so nothing that reaches a node can select a program to run.
+ *  - Each node daemon keeps its OWN allowlist in node.json ("mcpServers": {name → command,
+ *    args, env}) and refuses servers that are not declared locally, even if the router asks.
+ *    The router→node message is exactly {callId, server, method, params, timeoutMs}.
+ *  - Pending calls are keyed by router-minted call ids (client requestIds can collide) and
+ *    bound to the declared host node: an mcpResult from any other node connection is ignored.
+ *  - class "side-effecting" requires a grant ID; grants live in mcp-grants.json and are
+ *    reloaded when the file changes, so CLI revocations apply to the running router.
+ *  - Every admission decision is appended to mcp-audit.jsonl (session, server, tool, args-hash).
  *
- * Enforcement model (the router is the only approval boundary most clients have):
- *  - undeclared server          → reject
- *  - method outside allowlist   → reject
- *  - class "side-effecting"     → reject unless the call carries a valid grant ID
- *    (round one issues zero grants, so side-effecting is default-deny)
- *  - every decision is appended to mcp-audit.jsonl (session, server, tool, args-hash).
- *
- * env values in the declaration may be literals or "file:/abs/path" — file refs are
- * resolved by the *hosting node* at spawn time, so secrets never transit the bus.
+ * env values in a node's local config may be literals or "file:/abs/path" — resolved by the
+ * hosting node at spawn time and merged into the child's environment, so secrets never
+ * transit the bus and never enter client configs.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { readFileSync, writeFileSync, mkdirSync, appendFileSync, existsSync, renameSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, appendFileSync, existsSync, renameSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
 export type McpClass = 'read-only' | 'side-effecting'
 
-/** One declared MCP server (git-reviewed source of truth). */
+/** One declared MCP server on the router (git-reviewed; admission facts only). */
 export interface McpServerDecl {
   readonly name: string
   readonly description?: string
-  /** Node name (as registered by its daemon) that hosts/spawns this server. */
+  /** Node name (as registered by its daemon) that hosts this server. */
   readonly node: string
-  readonly command: string
-  readonly args?: readonly string[]
-  readonly env?: Readonly<Record<string, string>>
   readonly owner?: string
   readonly class: McpClass
   /** Allowlisted tool names. Omit to allow every tool the server lists (class still gates). */
@@ -60,14 +59,17 @@ export class McpRegistry {
 
   /** Load and validate a registry file. Throws on malformed entries (fail closed). */
   static fromFile(file: string): McpRegistry {
-    const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<McpRegistryFile>
+    const raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<McpRegistryFile> & { servers?: unknown }
     if (!raw || !Array.isArray(raw.servers)) throw new Error(`${file}: "servers" must be an array`)
-    for (const s of raw.servers) {
-      if (typeof s?.name !== 'string' || typeof s?.node !== 'string' || typeof s?.command !== 'string') {
-        throw new Error(`${file}: server entries need name, node and command`)
+    for (const s of raw.servers as Array<Partial<McpServerDecl> & Record<string, unknown>>) {
+      if (typeof s?.name !== 'string' || typeof s?.node !== 'string') {
+        throw new Error(`${file}: server entries need name and node`)
       }
       if (s.class !== 'read-only' && s.class !== 'side-effecting') {
         throw new Error(`${file}: server "${s.name}": class must be "read-only" or "side-effecting"`)
+      }
+      if (s.command !== undefined || s.env !== undefined || s.args !== undefined) {
+        throw new Error(`${file}: server "${s.name}": command/args/env must live in the node's own config, not the registry (review blocker 1)`)
       }
     }
     return new McpRegistry(raw.servers as readonly McpServerDecl[], file)
@@ -112,6 +114,7 @@ export class McpRegistry {
 
 // ---------------------------------------------------------------------------
 // Grants (router state). Round one issues none; issuance is CLI-only for Mick.
+// The file is re-checked (mtime) before every admission so CLI revocations apply live.
 // ---------------------------------------------------------------------------
 
 export interface McpGrant {
@@ -125,14 +128,35 @@ export interface McpGrant {
 
 export class Grants {
   private readonly map = new Map<string, McpGrant>()
+  private fileStamp = ''
   constructor(private readonly file?: string) {
     if (!file) return
-    try { for (const g of JSON.parse(readFileSync(file, 'utf8')) as McpGrant[]) this.map.set(g.id, g) } catch {}
+    this.reload()
+    this.fileStamp = this.stamp()
   }
   static inStateDir(dir: string): Grants { return new Grants(join(dir, 'mcp-grants.json')) }
 
+  private stamp(): string {
+    if (!this.file) return ''
+    try { const s = statSync(this.file); return `${s.mtimeMs}:${s.size}` } catch { return '' }
+  }
+
+  /** Reload the persisted grants if the file changed since the last load (live revocation). */
+  reload(force = false): void {
+    if (!this.file) return
+    const now = this.stamp()
+    if (!force && now === this.fileStamp) return
+    this.fileStamp = now
+    try {
+      const next = new Map<string, McpGrant>()
+      for (const g of JSON.parse(readFileSync(this.file, 'utf8')) as McpGrant[]) next.set(g.id, g)
+      this.map.clear()
+      for (const [k, v] of next) this.map.set(k, v)
+    } catch {}
+  }
+
   issue(server: string, opts: { session?: string; ttlHours?: number; note?: string } = {}): McpGrant {
-    const id = `mcpgr_${createHash('sha256').update(cryptoRandom()).digest('hex').slice(0, 24)}`
+    const id = `mcpgr_${randomBytes(16).toString('hex').slice(0, 24)}`
     const g: McpGrant = {
       id,
       server,
@@ -142,26 +166,24 @@ export class Grants {
     }
     this.map.set(id, g)
     this.save()
+    this.fileStamp = this.stamp()
     return g
   }
 
   check(id: string, server: string, session: string): boolean {
+    this.reload()
     const g = this.map.get(id)
     if (!g || g.server !== server) return false
     if (g.session && g.session !== session) return false
     return Date.parse(g.expires) > Date.now()
   }
 
-  revoke(id: string): boolean { const had = this.map.delete(id); if (had) this.save(); return had }
-  list(): McpGrant[] { return [...this.map.values()] }
+  revoke(id: string): boolean { const had = this.map.delete(id); if (had) { this.save(); this.fileStamp = this.stamp() } return had }
+  list(): McpGrant[] { this.reload(); return [...this.map.values()] }
   private save(): void {
     if (!this.file) return
-    try { mkdirSync(dirname(this.file), { recursive: true }); writeFileSync(this.file, JSON.stringify(this.list(), null, 2)) } catch {}
+    try { mkdirSync(dirname(this.file), { recursive: true }); writeFileSync(this.file, JSON.stringify([...this.map.values()], null, 2)) } catch {}
   }
-}
-
-function cryptoRandom(): string {
-  return randomBytes(16).toString('hex')
 }
 
 // ---------------------------------------------------------------------------
@@ -196,52 +218,123 @@ export class McpAudit {
 }
 
 // ---------------------------------------------------------------------------
-// Pending mcpCall accounting on the router: requestId → answering websocket.
+// Pending mcpCall accounting on the router: router-minted call ids, bound to the
+// declared host node and mapped back to (caller ws, client requestId).
 // ---------------------------------------------------------------------------
 
 export interface PendingTarget { send(msg: string): void }
 
+interface PendingEntry {
+  readonly target: PendingTarget
+  readonly clientRequestId: string
+  readonly node: string
+  readonly timer: ReturnType<typeof setTimeout>
+}
+
+export function newCallId(): string { return `mcp_${randomBytes(12).toString('hex')}` }
+
 export class PendingMcpCalls {
-  private readonly map = new Map<string, { target: PendingTarget; timer: ReturnType<typeof setTimeout> }>()
+  private readonly map = new Map<string, PendingEntry>()
   constructor(private readonly timeoutMs = 30_000) {}
 
-  register(requestId: string, target: PendingTarget): void {
-    this.clear(requestId)
+  /** Register a router-minted call id for (target, clientRequestId) on node `node`. */
+  register(callId: string, target: PendingTarget, clientRequestId: string, node: string): void {
+    this.clear(callId)
     const timer = setTimeout(() => {
-      if (this.map.delete(requestId)) {
-        target.send(JSON.stringify({ type: 'toolResult', requestId, success: false, data: `mcp call timed out after ${this.timeoutMs} ms` }))
-      }
+      const p = this.map.get(callId)
+      if (!p) return
+      this.map.delete(callId)
+      p.target.send(JSON.stringify({ type: 'toolResult', requestId: p.clientRequestId, success: false, data: `mcp call timed out after ${this.timeoutMs} ms` }))
     }, this.timeoutMs)
-    this.map.set(requestId, { target, timer })
+    this.map.set(callId, { target, clientRequestId, node, timer })
   }
 
-  resolve(requestId: string, success: boolean, data: string): boolean {
-    const p = this.map.get(requestId)
+  /** Resolve a call — only from the node it was forwarded to. Unknown ids are ignored. */
+  resolve(callId: string, fromNode: string | undefined, success: boolean, data: string): boolean {
+    const p = this.map.get(callId)
     if (!p) return false
+    if (!fromNode || fromNode !== p.node) return false // answered by the wrong node: ignore
     clearTimeout(p.timer)
-    this.map.delete(requestId)
-    p.target.send(JSON.stringify({ type: 'toolResult', requestId, success, data }))
+    this.map.delete(callId)
+    p.target.send(JSON.stringify({ type: 'toolResult', requestId: p.clientRequestId, success, data }))
     return true
   }
 
-  private clear(requestId: string): void {
-    const p = this.map.get(requestId)
-    if (p) { clearTimeout(p.timer); this.map.delete(requestId) }
+  private clear(callId: string): void {
+    const p = this.map.get(callId)
+    if (p) { clearTimeout(p.timer); this.map.delete(callId) }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Node side: stdio JSON-RPC child processes, one per server, respawned on exit.
+// Node side: local server allowlist + stdio JSON-RPC children, one per server.
 // ---------------------------------------------------------------------------
 
-export type SpawnFn = (command: string, args: readonly string[]) => ChildProcessWithoutNullStreams
-const defaultSpawn: SpawnFn = (command, args) => spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'] }) as ChildProcessWithoutNullStreams
+/** A server a node is willing to host, from its own node.json (never from the bus). */
+export interface LocalMcpEntry {
+  readonly command: string
+  readonly args?: readonly string[]
+  readonly env?: Readonly<Record<string, string>>
+  /** Optional local method allowlist (defense in depth on top of the router's). */
+  readonly methods?: readonly string[]
+}
+
+export type LocalMcpConfig = Record<string, LocalMcpEntry>
+
+/** Validate a node.json "mcpServers" section. Throws with the offending server name. */
+export function validateLocalMcp(cfg: unknown): LocalMcpConfig {
+  const out: Record<string, LocalMcpEntry> = {}
+  if (cfg === undefined || cfg === null) return out
+  if (typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('node.json: "mcpServers" must be an object')
+  for (const [name, v] of Object.entries(cfg as Record<string, Partial<LocalMcpEntry>>)) {
+    if (typeof v?.command !== 'string' || !v.command) throw new Error(`node.json: mcpServers.${name} needs a command`)
+    out[name] = {
+      command: v.command,
+      ...(Array.isArray(v.args) && { args: v.args }),
+      ...(v.env && typeof v.env === 'object' && { env: v.env as Record<string, string> }),
+      ...(Array.isArray(v.methods) && { methods: v.methods }),
+    }
+  }
+  return out
+}
+
+/** Router-requested exec, reduced to facts a node may act on (no command, no env). */
+export interface McpExecRequest {
+  readonly callId: string
+  readonly server: string
+  readonly method: string
+  readonly params?: unknown
+  readonly timeoutMs?: number
+}
+
+/** Look up a router request against the node's local allowlist. Fails closed. */
+export function resolveLocalMcp(local: LocalMcpConfig, req: McpExecRequest): { ok: true; spec: McpExecSpec } | { ok: false; reason: string } {
+  const entry = local[req.server]
+  if (!entry) return { ok: false, reason: `node refuses to host "${req.server}": not in this node's mcpServers allowlist` }
+  if (entry.methods && !entry.methods.includes(req.method)) {
+    return { ok: false, reason: `node-local allowlist: method "${req.method}" not permitted for "${req.server}"` }
+  }
+  return {
+    ok: true,
+    spec: {
+      server: req.server, command: entry.command,
+      ...(entry.args && { args: entry.args }), ...(entry.env && { env: entry.env }),
+      method: req.method, ...(req.params !== undefined && { params: req.params }),
+      timeoutMs: req.timeoutMs,
+    },
+  }
+}
+
+export type SpawnFn = (command: string, args: readonly string[], env: Record<string, string>) => ChildProcessWithoutNullStreams
+const defaultSpawn: SpawnFn = (command, args, env) => spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] }) as ChildProcessWithoutNullStreams
 
 interface ChildState {
   proc: ChildProcessWithoutNullStreams
   nextId: number
   pending: Map<number, { resolve(v: { ok: boolean; data: string }): void; timer: ReturnType<typeof setTimeout> }>
   buffer: string
+  /** Shared readiness: initialize handshake completed (notifications/initialized sent). */
+  ready: Promise<{ ok: boolean; data: string }>
 }
 
 export interface McpExecSpec {
@@ -269,9 +362,68 @@ export class McpChild {
   constructor(private readonly spawnFn: SpawnFn = defaultSpawn, private readonly log: (m: string) => void = () => {}) {}
 
   /** Run one method ('tools/list' or a tool name via 'tools/call') on a (re)spawned child. */
-  call(spec: McpExecSpec): Promise<{ ok: boolean; data: string }> {
-    const timeoutMs = spec.timeoutMs ?? 20_000
-    return this.withChild(spec, child => new Promise<{ ok: boolean; data: string }>(resolve => {
+  async call(spec: McpExecSpec): Promise<{ ok: boolean; data: string }> {
+    const child = this.ensureChild(spec)
+    const ready = await child.ready
+    if (!ready.ok) return ready
+    return this.request(child, spec, spec.timeoutMs ?? 20_000)
+  }
+
+  /** Kill every child (node shutdown). */
+  close(): void {
+    for (const [, c] of this.children) try { c.proc.kill('SIGTERM') } catch {}
+    this.children.clear()
+  }
+
+  /** Get or spawn the child for a server; every concurrent caller shares one readiness promise. */
+  private ensureChild(spec: McpExecSpec): ChildState {
+    const existing = this.children.get(spec.server)
+    if (existing && existing.proc.exitCode === null && !existing.proc.killed) return existing
+    const proc = this.spawnFn(spec.command, spec.args ?? [], { ...(process.env as Record<string, string>), ...resolveEnv(spec.env) })
+    const child: ChildState = { proc, nextId: 1, pending: new Map(), buffer: '', ready: Promise.resolve({ ok: false, data: 'unreachable' }) }
+    this.children.set(spec.server, child)
+    proc.stdout.on('data', (d: Buffer) => this.onStdout(spec.server, d.toString()))
+    proc.stderr.on('data', (d: Buffer) => this.log(`${spec.server} stderr: ${String(d).trim().slice(0, 200)}`))
+    const failAll = (msg: string) => {
+      const c = this.children.get(spec.server)
+      if (c === child) this.children.delete(spec.server)
+      for (const [, p] of c?.pending ?? []) { clearTimeout(p.timer); p.resolve({ ok: false, data: `${spec.server}: ${msg}` }) }
+    }
+    // Spawn errors (ENOENT etc.) arrive asynchronously as 'error', not from spawn() itself.
+    proc.on('error', (err: Error) => failAll(`spawn failed: ${err.message}`))
+    proc.on('exit', () => failAll('server process exited'))
+    child.ready = this.initialize(spec, child)
+    return child
+  }
+
+  /** initialize → wait for the response → send notifications/initialized (MCP lifecycle). */
+  private initialize(spec: McpExecSpec, child: ChildState): Promise<{ ok: boolean; data: string }> {
+    return new Promise(resolve => {
+      const id = child.nextId++
+      const timer = setTimeout(() => {
+        child.pending.delete(id)
+        resolve({ ok: false, data: `${spec.server}: initialize handshake timed out` })
+      }, 10_000)
+      child.pending.set(id, {
+        resolve: v => {
+          clearTimeout(timer)
+          if (v.ok) {
+            try { child.proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`) } catch { /* server already gone; next write fails */ }
+          }
+          resolve(v.ok ? { ok: true, data: '' } : v)
+        },
+        timer,
+      })
+      const rpc = {
+        jsonrpc: '2.0', id, method: 'initialize',
+        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'agent-bus', version: '0.1' } },
+      }
+      try { child.proc.stdin.write(`${JSON.stringify(rpc)}\n`) } catch { clearTimeout(timer); resolve({ ok: false, data: `${spec.server}: server closed during initialize` }) }
+    })
+  }
+
+  private request(child: ChildState, spec: McpExecSpec, timeoutMs: number): Promise<{ ok: boolean; data: string }> {
+    return new Promise(resolve => {
       const id = child.nextId++
       const timer = setTimeout(() => {
         child.pending.delete(id)
@@ -285,60 +437,6 @@ export class McpChild {
         child.pending.delete(id); clearTimeout(timer)
         resolve({ ok: false, data: `${spec.server}: write failed: ${err instanceof Error ? err.message : String(err)}` })
       }
-    }))
-  }
-
-  /** Kill every child (node shutdown). */
-  close(): void {
-    for (const [, c] of this.children) try { c.proc.kill('SIGTERM') } catch {}
-    this.children.clear()
-  }
-
-  private withChild(spec: McpExecSpec, fn: (child: ChildState) => Promise<{ ok: boolean; data: string }>): Promise<{ ok: boolean; data: string }> {
-    let child = this.children.get(spec.server)
-    if (!child || child.proc.exitCode !== null || child.proc.killed) {
-      let proc: ChildProcessWithoutNullStreams
-      try {
-        proc = this.spawnFn(spec.command, spec.args ?? [])
-      } catch (err: unknown) {
-        return Promise.resolve({ ok: false, data: `${spec.server}: spawn failed: ${err instanceof Error ? err.message : String(err)}` })
-      }
-      child = { proc, nextId: 1, pending: new Map(), buffer: '' }
-      this.children.set(spec.server, child)
-      proc.stdout.on('data', (d: Buffer) => this.onStdout(spec.server, d.toString()))
-      proc.stderr.on('data', (d: Buffer) => this.log(`${spec.server} stderr: ${String(d).trim().slice(0, 200)}`))
-      // Spawn errors (ENOENT etc.) arrive asynchronously as 'error', not from spawn() itself.
-      proc.on('error', (err: Error) => {
-        const c = this.children.get(spec.server)
-        if (c === child) this.children.delete(spec.server)
-        for (const [, p] of c?.pending ?? []) { clearTimeout(p.timer); p.resolve({ ok: false, data: `${spec.server}: spawn failed: ${err.message}` }) }
-      })
-      proc.on('exit', () => {
-        const c = this.children.get(spec.server)
-        if (c === child) this.children.delete(spec.server)
-        for (const [, p] of c?.pending ?? []) { clearTimeout(p.timer); p.resolve({ ok: false, data: `${spec.server}: server process exited` }) }
-      })
-      return this.initialize(spec, child).then(init => {
-        if (!init.ok) return init
-        return fn(child!)
-      })
-    }
-    return fn(child)
-  }
-
-  private initialize(spec: McpExecSpec, child: ChildState): Promise<{ ok: boolean; data: string }> {
-    return new Promise(resolve => {
-      const id = child.nextId++
-      const timer = setTimeout(() => {
-        child.pending.delete(id)
-        resolve({ ok: false, data: `${spec.server}: initialize handshake timed out` })
-      }, 10_000)
-      child.pending.set(id, { resolve, timer })
-      const rpc = {
-        jsonrpc: '2.0', id, method: 'initialize',
-        params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'agent-bus', version: '0.1' } },
-      }
-      try { child.proc.stdin.write(`${JSON.stringify(rpc)}\n`) } catch { clearTimeout(timer); resolve({ ok: false, data: `${spec.server}: server closed during initialize` }) }
     })
   }
 
@@ -353,7 +451,7 @@ export class McpChild {
       if (!line) continue
       let msg: { id?: number; result?: unknown; error?: { message?: string } }
       try { msg = JSON.parse(line) } catch { this.log(`${server}: non-JSON stdout ignored`); continue }
-      if (typeof msg.id !== 'number') continue // notification (e.g. initialized)
+      if (typeof msg.id !== 'number') continue // notification
       const p = child.pending.get(msg.id)
       if (!p) continue
       child.pending.delete(msg.id)

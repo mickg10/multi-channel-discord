@@ -17,6 +17,8 @@
  *         "resume": "<optional existing session/thread/conversation id to adopt>" } ] }
  * State (session ids): ~/.config/agent-bus/node-state.json. Router URL/secret:
  * ~/.claude/channels/discord/.env (re-read on every reconnect).
+ * "mcpServers" in node.json is the local allowlist of shared MCP servers this node hosts
+ * (name → command/args/env). The router only ever sends {callId, server, method, params}.
  *
  * Runs under systemd (Linux) or launchd (macOS) with restart-always; see bin/agent-bus-install-node.
  * Self-update: every 5 min fast-forwards the checkout to origin/release (CI-gated); when HEAD
@@ -27,7 +29,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
-import { McpChild } from './mcp.js'
+import { McpChild, validateLocalMcp, resolveLocalMcp, type LocalMcpConfig, type McpExecRequest } from './mcp.js'
 
 const HOME = homedir()
 const expand = (p: string) => p.replace(/^~(?=$|\/)/, HOME)
@@ -50,6 +52,10 @@ export interface NodeConfig {
   agents: AgentConfig[]
   maxTurnsPerHour?: number
   turnTimeoutSec?: number
+  /** MCP servers this node is willing to host: name → {command, args?, env?, methods?}.
+   *  The router never sends commands — it only names a server; the local allowlist decides
+   *  what may actually be spawned here. env values may be "file:/path" (resolved at spawn). */
+  mcpServers?: LocalMcpConfig
 }
 
 const CODE_DIR = resolve(import.meta.dir, '..')
@@ -81,6 +87,7 @@ function loadConfig(): NodeConfig {
   for (const a of c.agents) {
     if (!a.name || !['claude', 'codex', 'agy', 'opencode'].includes(a.kind)) throw new Error(`bad agent entry: ${JSON.stringify(a)}`)
   }
+  validateLocalMcp(c.mcpServers)
   return c
 }
 
@@ -202,6 +209,7 @@ async function main(): Promise<void> {
   const cfg = loadConfig()
   const node = cfg.node ?? hostname().split('.')[0].toLowerCase()
   const state = loadState()
+  const localMcp = validateLocalMcp(cfg.mcpServers)
   const timeoutMs = (cfg.turnTimeoutSec ?? 1800) * 1000
   const claudePlugin = claudeHasPlugin()
   const running = new Set<string>()
@@ -299,9 +307,11 @@ async function main(): Promise<void> {
       else if (m.type === 'wake') {
         const a = cfg.agents.find(x => x.name === m.agent)
         if (a) void runTurn(a)
-      } else if (m.type === 'mcpExec' && typeof m.requestId === 'string') {
-        void mcpChild.call(m as import('./mcp.js').McpExecSpec).then(r => {
-          try { ws!.send(JSON.stringify({ type: 'mcpResult', requestId: m.requestId, success: r.ok, data: r.data })) } catch {}
+      } else if (m.type === 'mcpExec' && typeof m.callId === 'string') {
+        // The router names a server; only the local allowlist decides what may be spawned.
+        const r = resolveLocalMcp(localMcp, m as McpExecRequest)
+        void (r.ok ? mcpChild.call(r.spec) : Promise.resolve({ ok: false, data: r.reason })).then(out => {
+          try { ws!.send(JSON.stringify({ type: 'mcpResult', callId: m.callId, success: out.ok, data: out.data })) } catch {}
         })
       } else if (m.type === 'toolResult') { pending.get(m.requestId)?.(m.data); pending.delete(m.requestId) }
       else if (m.type === 'error') log(`router error: ${m.message}`)

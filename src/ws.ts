@@ -20,6 +20,7 @@ import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { Inboxes, NodeRegistry, Claims } from './nodes.js'
 import type { McpRegistry, Grants, McpAudit, PendingMcpCalls, McpServerDecl } from './mcp.js'
+import { newCallId } from './mcp.js'
 
 /** Guild channel operations the router provides (mockable in tests). */
 export interface ChannelOps {
@@ -185,14 +186,15 @@ function handleMcpOp(ws: WsLike, parsed: import('./types.js').WsMcpOp, deps: Rea
   }
 }
 
-/** Forward one JSON-RPC method to the hosting node; register the pending answer. */
-function forwardMcpExec(ws: WsLike, requestId: string, decl: McpServerDecl, method: string, params: unknown, deps: Readonly<WsDeps>): boolean {
+/** Forward one method to the hosting node under a router-minted call id.
+ *  The node receives only {callId, server, method, params, timeoutMs} — never command/env. */
+function forwardMcpExec(ws: WsLike, clientRequestId: string, decl: McpServerDecl, method: string, params: unknown, deps: Readonly<WsDeps>): boolean {
   if (!deps.nodes?.nodeConnected(decl.node)) return false
-  deps.mcpPending!.register(requestId, ws)
+  const callId = newCallId()
+  deps.mcpPending!.register(callId, ws, clientRequestId, decl.node)
   return deps.nodes.sendToNode(decl.node, {
-    type: 'mcpExec', requestId, server: decl.name, command: decl.command,
-    ...(decl.args && { args: decl.args }), ...(decl.env && { env: decl.env }),
-    method, ...(params !== undefined && { params }), ...(decl.timeoutMs && { timeoutMs: decl.timeoutMs }),
+    type: 'mcpExec', callId, server: decl.name, method,
+    ...(params !== undefined && { params }), ...(decl.timeoutMs && { timeoutMs: decl.timeoutMs }),
   })
 }
 
@@ -316,10 +318,10 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       break
     }
     case 'mcpResult': {
-      // Answer from a node daemon for a forwarded mcpExec.
-      if (!hasString(parsed, 'requestId') || typeof (parsed as { success?: unknown }).success !== 'boolean' || !hasString(parsed as { data?: unknown }, 'data')) return
+      // Answer from a node daemon — accepted only from the node the call was forwarded to.
+      if (!hasString(parsed as { callId?: unknown }, 'callId') || typeof (parsed as { success?: unknown }).success !== 'boolean' || !hasString(parsed as { data?: unknown }, 'data')) return
       if (!ws.data.nodeName || !deps.mcpPending) return
-      deps.mcpPending.resolve(parsed.requestId, (parsed as { success: boolean }).success, (parsed as { data: string }).data)
+      deps.mcpPending.resolve(parsed.callId, ws.data.nodeName, (parsed as { success: boolean }).success, (parsed as { data: string }).data)
       break
     }
     case 'agentStatus': {
