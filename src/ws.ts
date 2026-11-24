@@ -43,6 +43,7 @@ import {
   type TextBasedChannel,
 } from 'discord.js'
 import { writeFile, mkdir } from 'node:fs/promises'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { join, basename } from 'node:path'
 
 export interface WsData {
@@ -87,6 +88,11 @@ export interface WsDeps {
   readonly mcpGrants?: Grants
   readonly mcpAudit?: McpAudit
   readonly mcpPending?: PendingMcpCalls
+  /**
+   * Per-node secrets: node name -> sha256(secret) hex. A listed node must present its own
+   * secret; unlisted nodes are rejected when `require` is set (else accepted with a warning).
+   */
+  readonly nodeSecrets?: () => { readonly hashes: Readonly<Record<string, string>>; readonly require: boolean }
   /** Sessions allowed to manage other sessions' subscriptions (DISCORD_ADMIN_SESSIONS). */
   readonly admins?: ReadonlySet<string>
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
@@ -285,6 +291,21 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
     case 'registerNode': {
       if (deps.secret && parsed.secret !== deps.secret) { sendError(ws, 'register rejected: bad or missing router secret'); return }
       if (!deps.nodes || !hasString(parsed, 'node') || !Array.isArray(parsed.agents)) { sendError(ws, 'registerNode requires node and agents (and a router with nodes enabled)'); return }
+      {
+        // The shared router secret only proves "some client of this bus". Node names own wakes
+        // and MCP execution, so each node proves its identity with its own secret.
+        const ns = deps.nodeSecrets?.()
+        const want = ns?.hashes[parsed.node]
+        const got = (parsed as { nodeSecret?: string }).nodeSecret
+        if (want) {
+          const h = got ? createHash('sha256').update(got).digest('hex') : ''
+          if (!h || !timingSafeEqual(Buffer.from(h), Buffer.from(want))) { sendError(ws, `register rejected: bad or missing node secret for "${parsed.node}"`); return }
+        } else if (ns?.require) {
+          sendError(ws, `register rejected: node "${parsed.node}" has no node secret on the router`); return
+        } else if (ns) {
+          process.stderr.write(`discord channel: node "${parsed.node}" registered WITHOUT a node secret (set one; DISCORD_REQUIRE_NODE_SECRET=1 will reject this)\n`)
+        }
+      }
       ws.data.authed = true
       ws.data.nodeName = parsed.node
       const send = (m: string) => ws.send(m)

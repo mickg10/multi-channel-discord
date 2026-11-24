@@ -39,6 +39,14 @@ const BUS_CHANNEL = process.env.DISCORD_BUS_CHANNEL || undefined
 const BUS_MAX_PER_MIN = parseInt(process.env.DISCORD_BUS_MAX_PER_MIN ?? '12', 10)
 // Channel where agents' to="human" posts land (questions / approvals for the human).
 const HUMAN_CHANNEL = process.env.DISCORD_HUMAN_CHANNEL || undefined
+// Per-node secrets: ${STATE_DIR}/node-secrets.json = { "<node>": "<sha256 hex of its secret>" },
+// re-read on every node registration (no restart needed to add or rotate one).
+const REQUIRE_NODE_SECRET = process.env.DISCORD_REQUIRE_NODE_SECRET === '1'
+function nodeSecretsProvider() {
+  let hashes: Record<string, string> = {}
+  try { hashes = JSON.parse(readFileSync(pjoin(STATE_DIR, 'node-secrets.json'), 'utf8')) } catch {}
+  return { hashes, require: REQUIRE_NODE_SECRET }
+}
 const ADMINS = new Set((process.env.DISCORD_ADMIN_SESSIONS ?? '').split(',').map(s => s.trim()).filter(Boolean))
 if (WS_HOST !== '127.0.0.1' && WS_HOST !== 'localhost' && !ROUTER_SECRET) {
   process.stderr.write('discord channel: refusing to bind non-localhost without DISCORD_ROUTER_SECRET\n')
@@ -241,6 +249,7 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   mcpAudit,
   mcpPending,
   admins: ADMINS,
+  nodeSecrets: nodeSecretsProvider,
   humanChannelId: HUMAN_CHANNEL,
   rules: rulesProvider,
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
