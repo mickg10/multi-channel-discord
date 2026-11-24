@@ -136,3 +136,70 @@ describe('to human', () => {
     expect(posted[0]).toContain('[claude@mac:src → human]')
   })
 })
+
+describe('channels', () => {
+  const { Subscriptions } = require('../subscriptions.js')
+  function chDeps(subs: any) {
+    const chans = [{ id: 'bus1', name: 'general' }, { id: 'c2', name: 'photos-debug', topic: 't' }]
+    return deps({
+      subs,
+      channelOps: {
+        resolve: async (r: string) => chans.find(c => c.id === r || c.name === r.replace(/^#/, '')) ?? null,
+        list: async () => chans,
+        create: async (name: string) => { const c = { id: 'c3', name }; chans.push(c); return c },
+      },
+    })
+  }
+  const tick = () => new Promise(r => setTimeout(r, 10))
+
+  test('channel_post reaches subscribers only, mirrored to that channel', async () => {
+    const subs = new Subscriptions()
+    const h = createWsHandlers(chDeps(subs))
+    const a = register(h, 'claude@mac:src'), b = register(h, 'codex@nas642'), c = register(h, 'agy@mac:src')
+    subs.add('codex@nas642', 'c2')
+    h.message(a as any, JSON.stringify({ type: 'channelPost', channel: '#photos-debug', text: 'hi' }))
+    await tick()
+    const got = msgs(b).find(x => x.type === 'message')
+    expect(got.content).toBe('hi')
+    expect(got.meta.chat_id).toBe('c2')
+    expect(got.meta.channel).toBe('photos-debug')
+    expect(msgs(c).some(x => x.type === 'message')).toBe(false)
+    expect(posted[0]).toContain('[claude@mac:src → subscribers]')
+  })
+
+  test('subscribe / list / unsubscribe / create', async () => {
+    const subs = new Subscriptions()
+    const h = createWsHandlers(chDeps(subs))
+    const a = register(h, 'claude@mac:src')
+    const res = (id: string) => msgs(a).find(x => x.type === 'toolResult' && x.requestId === id)
+    h.message(a as any, JSON.stringify({ type: 'channelSubscribe', requestId: 's1', channel: 'photos-debug' }))
+    await tick()
+    expect(subs.has('claude@mac:src', 'c2')).toBe(true)
+    h.message(a as any, JSON.stringify({ type: 'channelList', requestId: 'l1' }))
+    await tick()
+    const list = JSON.parse(res('l1').data)
+    expect(list.find((c: any) => c.id === 'c2').subscribed).toBe(true)
+    expect(list.find((c: any) => c.id === 'bus1').default).toBe(true)
+    h.message(a as any, JSON.stringify({ type: 'channelUnsubscribe', requestId: 'u1', channel: 'c2' }))
+    await tick()
+    expect(subs.has('claude@mac:src', 'c2')).toBe(false)
+    h.message(a as any, JSON.stringify({ type: 'channelCreate', requestId: 'k1', name: 'new-task', topic: 'x' }))
+    await tick()
+    expect(JSON.parse(res('k1').data).created).toBe(true)
+    expect(subs.has('claude@mac:src', 'c3')).toBe(true)
+  })
+
+  test('human message in a subscribed channel goes to subscribers only', () => {
+    const h = createWsHandlers(deps())
+    register(h, 'claude@mac:src'); const b = register(h, 'codex@nas642')
+    const out = routeHumanBusMessage('status?', { user: 'me' }, sessions, ['codex@nas642'])
+    expect(out).toEqual(['codex@nas642'])
+    expect(msgs(b).find(x => x.type === 'message').meta.to).toBe('subscribers')
+  })
+
+  test('subscriptions persist to disk', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'subs-'))
+    const s1 = Subscriptions.inStateDir(dir); s1.add('x', 'c9')
+    expect(Subscriptions.inStateDir(dir).subscribers('c9')).toEqual(['x'])
+  })
+})

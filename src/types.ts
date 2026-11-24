@@ -119,7 +119,26 @@ export interface WsListSessions {
   readonly requestId: string
 }
 
+/** Post to a specific Discord channel (id or name); delivered to its subscribers. */
+export interface WsChannelPost {
+  readonly type: 'channelPost'
+  readonly channel: string
+  readonly text: string
+  readonly to?: string
+}
+
+/** Channel management, answered with a toolResult. */
+export interface WsChannelOp {
+  readonly type: 'channelList' | 'channelCreate' | 'channelSubscribe' | 'channelUnsubscribe'
+  readonly requestId: string
+  readonly channel?: string
+  readonly name?: string
+  readonly topic?: string
+}
+
 export type PluginToRouterMessage =
+  | WsChannelPost
+  | WsChannelOp
   | WsBusPost
   | WsListSessions
   | WsRegister

@@ -17,6 +17,15 @@
 
 import type { PluginToRouterMessage, WsRegistered, WsRenamed, WsError, WsToolResult, WsPermissionVerdict, WsAskUser, WsRegisterSkills, ChannelMeta } from './types.js'
 import type { SessionManager, ProjectHistory } from './sessions.js'
+import type { Subscriptions } from './subscriptions.js'
+
+/** Guild channel operations the router provides (mockable in tests). */
+export interface ChannelOps {
+  /** Resolve a channel id, "name" or "#name" to a text channel in the bus guild. */
+  resolve(ref: string): Promise<{ id: string; name: string } | null>
+  list(): Promise<Array<{ id: string; name: string; topic?: string | null }>>
+  create(name: string, topic?: string): Promise<{ id: string; name: string }>
+}
 import { chunk, assertSendable } from './discord.js'
 import { noteSent, getStateDir } from './access.js'
 import {
@@ -57,6 +66,9 @@ export interface WsDeps {
   readonly secret?: string
   /** Max bus posts per session per minute (loop guard). Default 12. */
   readonly busMaxPerMinute?: number
+  /** Channel subscriptions (agent bus beyond the default channel). */
+  readonly subs?: Subscriptions
+  readonly channelOps?: ChannelOps
 }
 
 export interface WsLike {
@@ -141,6 +153,23 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         return
       }
       handleBusPost(ws, parsed.text, parsed.to, deps)
+      break
+    case 'channelPost':
+      if (!hasString(parsed, 'channel') || !hasString(parsed, 'text')) {
+        sendError(ws, 'channelPost requires channel and text')
+        return
+      }
+      void handleChannelPost(ws, parsed.channel, parsed.text, parsed.to, deps)
+      break
+    case 'channelList':
+    case 'channelCreate':
+    case 'channelSubscribe':
+    case 'channelUnsubscribe':
+      if (!hasString(parsed, 'requestId')) {
+        sendError(ws, 'channel operation requires requestId')
+        return
+      }
+      void handleChannelOp(ws, parsed, deps)
       break
     case 'listSessions':
       if (!hasString(parsed, 'requestId')) {
@@ -691,8 +720,7 @@ const HUMAN_TARGETS = new Set(['human', 'admin', 'user', 'me'])
  * `to` matches a session name exactly, else as a unique prefix (e.g. "codex-photos").
  */
 export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>): void {
-  const from = ws.data.sessionName
-  if (!from) {
+  if (!ws.data.sessionName) {
     sendError(ws, 'Cannot post to bus: not registered')
     return
   }
@@ -700,6 +728,26 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
     sendError(ws, 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL')
     return
   }
+  postToChannel(ws, deps.busChannelId, undefined, text, to, deps)
+}
+
+/** Sessions that receive untargeted traffic in a channel: everyone for the default bus, else subscribers. */
+function audience(channelId: string, deps: Readonly<WsDeps>): string[] {
+  const live = deps.sessions.getSessions().map(s => s.name)
+  if (channelId === deps.busChannelId) return live
+  const subs = new Set(deps.subs?.subscribers(channelId) ?? [])
+  return live.filter(n => subs.has(n))
+}
+
+async function handleChannelPost(ws: WsLike, ref: string, text: string, to: string | undefined, deps: Readonly<WsDeps>): Promise<void> {
+  if (!ws.data.sessionName) { sendError(ws, 'Cannot post: not registered'); return }
+  const ch = deps.channelOps ? await deps.channelOps.resolve(ref).catch(() => null) : null
+  if (!ch) { sendError(ws, `Unknown channel "${ref}" (use channel_list)`); return }
+  postToChannel(ws, ch.id, ch.name, text, to, deps)
+}
+
+function postToChannel(ws: WsLike, channelId: string, channelName: string | undefined, text: string, to: string | undefined, deps: Readonly<WsDeps>): void {
+  const from = ws.data.sessionName!
 
   // Loop guard: cap posts per session per minute.
   const now = Date.now()
@@ -713,8 +761,8 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
   busPostTimes.set(from, times)
 
   const names = deps.sessions.getSessions().map(s => s.name).filter(n => n !== from)
-  let targets: string[] = names
-  let toLabel = 'all'
+  let targets: string[] = audience(channelId, deps).filter(n => n !== from)
+  let toLabel = channelId === deps.busChannelId ? 'all' : 'subscribers'
   if (to && HUMAN_TARGETS.has(to.toLowerCase())) {
     // Answer for the human: show in the channel only, do not wake other agents.
     targets = []
@@ -732,11 +780,12 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
   }
 
   for (const c of chunk(`**[${from} → ${toLabel}]** ${text}`, deps.chunkLimit, deps.chunkMode)) {
-    sendToDiscord(deps.client, deps.busChannelId, c)
+    sendToDiscord(deps.client, channelId, c)
   }
 
   const meta: ChannelMeta = {
-    chat_id: deps.busChannelId,
+    chat_id: channelId,
+    ...(channelName && { channel: channelName }),
     user: from,
     source: 'agent-bus',
     from,
@@ -750,8 +799,9 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
  * Deliver a human-authored message posted in the bus channel. A leading "@name"
  * (or "name:") targets one session; otherwise every session receives it.
  */
-export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager): string[] {
+export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager, audienceNames?: readonly string[]): string[] {
   const names = sessions.getSessions().map(s => s.name)
+  const everyone = audienceNames ? names.filter(n => audienceNames.includes(n)) : names
   const m = content.match(/^\s*@?([\w.@:/-]+?)[:,]?\s+([\s\S]*)$/)
   if (m) {
     const want = m[1]
@@ -762,6 +812,45 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
       return pick
     }
   }
-  for (const n of names) sessions.routeToSession(n, content, { ...meta, to: 'all' })
-  return names
+  for (const n of everyone) sessions.routeToSession(n, content, { ...meta, to: audienceNames ? 'subscribers' : 'all' })
+  return everyone
+}
+
+async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string }, deps: Readonly<WsDeps>): Promise<void> {
+  const me = ws.data.sessionName
+  const ops = deps.channelOps
+  const subs = deps.subs
+  if (!me) { sendToolResult(ws, msg.requestId, false, 'not registered'); return }
+  if (!ops || !subs) { sendToolResult(ws, msg.requestId, false, 'channels disabled: router has no DISCORD_BUS_CHANNEL'); return }
+  try {
+    if (msg.type === 'channelList') {
+      const list = await ops.list()
+      const out = list.map(c => ({
+        id: c.id, name: c.name, topic: c.topic ?? undefined,
+        default: c.id === deps.busChannelId,
+        subscribed: c.id === deps.busChannelId || subs.has(me, c.id),
+        subscribers: c.id === deps.busChannelId ? ['(everyone)'] : subs.subscribers(c.id),
+      }))
+      sendToolResult(ws, msg.requestId, true, JSON.stringify(out))
+      return
+    }
+    if (msg.type === 'channelCreate') {
+      if (!msg.name) { sendToolResult(ws, msg.requestId, false, 'channel_create requires name'); return }
+      const existing = await ops.resolve(msg.name)
+      const ch = existing ?? await ops.create(msg.name, msg.topic)
+      subs.add(me, ch.id)
+      sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, created: !existing, subscribed: true }))
+      return
+    }
+    const ch = msg.channel ? await ops.resolve(msg.channel) : null
+    if (!ch) { sendToolResult(ws, msg.requestId, false, `Unknown channel "${msg.channel ?? ''}" (use channel_list)`); return }
+    if (ch.id === deps.busChannelId) {
+      sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, note: 'default bus channel: every session always receives it' }))
+      return
+    }
+    const changed = msg.type === 'channelSubscribe' ? subs.add(me, ch.id) : subs.remove(me, ch.id)
+    sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, subscribed: msg.type === 'channelSubscribe', changed }))
+  } catch (err: unknown) {
+    sendToolResult(ws, msg.requestId, false, `${msg.type} failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
