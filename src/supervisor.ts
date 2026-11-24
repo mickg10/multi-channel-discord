@@ -124,7 +124,11 @@ process.stdin.on('data', (d: Buffer) => {
     child?.stdin?.write(line + '\n')
   }
 })
-process.stdin.on('end', () => { shuttingDown = true; child?.stdin?.end(); setTimeout(() => process.exit(0), 2000) })
+// Never leave the client behind: it would keep reconnecting as an orphan.
+process.on('exit', () => { try { child?.kill('SIGTERM') } catch {} })
+process.stdin.on('end', () => { shuttingDown = true; child?.stdin?.end(); setTimeout(() => { try { child?.kill('SIGTERM') } catch {}; process.exit(0) }, 1500) })
+// Agent died without closing our stdin (SIGKILL etc.): notice via reparenting.
+setInterval(() => { if (process.ppid === 1) { shuttingDown = true; try { child?.kill('SIGTERM') } catch {}; process.exit(0) } }, 10_000).unref()
 for (const s of ['SIGTERM', 'SIGINT'] as const) process.on(s, () => { shuttingDown = true; child?.kill('SIGTERM'); setTimeout(() => process.exit(0), 1500) })
 
 // Periodic self-update (git fast-forward only; never touches local changes).
