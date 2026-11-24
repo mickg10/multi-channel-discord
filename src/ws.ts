@@ -192,7 +192,7 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
 }
 
 function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readonly<WsDeps>): void {
-  if (deps.secret && parsed.type !== 'register' && !ws.data.authed) {
+  if (deps.secret && parsed.type !== 'register' && parsed.type !== 'registerNode' && !ws.data.authed) {
     sendError(ws, 'Not authenticated: register with the router secret first')
     return
   }

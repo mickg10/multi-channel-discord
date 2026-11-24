@@ -153,3 +153,15 @@ describe('node daemon command lines', () => {
     expect(p).toContain('"agy@m:x"'); expect(p).toContain('check_inbox'); expect(p).toContain('photo QA')
   })
 })
+
+describe('node auth', () => {
+  test('registerNode works with the router secret and is rejected without it', () => {
+    const h = createWsHandlers(deps({ secret: 's' }))
+    const bad = makeWs(); h.message(bad as any, JSON.stringify({ type: 'registerNode', node: 'n', agents: [] }))
+    expect(msgs(bad)[0].message).toContain('register rejected')
+    const ok = makeWs(); h.message(ok as any, JSON.stringify({ type: 'registerNode', node: 'n', secret: 's', agents: [{ name: 'a@n:x', kind: 'agy' }] }))
+    expect(msgs(ok)[0].type).toBe('nodeRegistered')
+    h.message(ok as any, JSON.stringify({ type: 'inboxCount', requestId: 'c', agent: 'a@n:x' }))
+    expect(msgs(ok).find(m => m.requestId === 'c').data).toBe('0')
+  })
+})
