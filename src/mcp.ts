@@ -153,14 +153,20 @@ export class Grants {
     const now = this.stamp()
     if (!force && now === this.fileStamp) return
     this.fileStamp = now
-    let next: McpGrant[] = []
+    const next = new Map<string, McpGrant>()
     try {
-      next = JSON.parse(readFileSync(this.file, 'utf8')) as McpGrant[]
+      const raw: unknown = JSON.parse(readFileSync(this.file, 'utf8'))
+      if (!Array.isArray(raw)) throw new Error('top level must be an array')
+      for (const g of raw as Array<Partial<McpGrant> | null>) {
+        if (typeof g?.id !== 'string' || typeof g.server !== 'string' || typeof g.expires !== 'string') throw new Error('malformed grant entry')
+        next.set(g.id, g as McpGrant)
+      }
     } catch (err: unknown) {
       process.stderr.write(`discord channel: mcp grants file unreadable (${errText(err)}); failing closed\n`)
+      next.clear()
     }
     this.map.clear()
-    for (const g of next) this.map.set(g.id, g)
+    for (const [k, v] of next) this.map.set(k, v)
   }
 
   issue(server: string, opts: { session?: string; instance?: string; ttlHours?: number; note?: string } = {}): McpGrant {

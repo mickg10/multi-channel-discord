@@ -144,6 +144,23 @@ describe('Grants persistence + live reload', () => {
     expect(running.check(g.id, 'unifi', { session: 'a@b' })).toBe(false)
   })
 
+  test('grants fail CLOSED (no throw, no partial map) on valid JSON with a bad shape', async () => {
+    const file = join(dir, 'g.json')
+    const g = new Grants(file).issue('unifi', { session: 'a@b', ttlHours: 1 })
+    const running = new Grants(file)
+    const ok = () => running.check(g.id, 'unifi', { session: 'a@b' })
+    expect(ok()).toBe(true)
+    // Each write differs in size so the mtime:size stamp always changes.
+    for (const bad of ['{}', '[null]', JSON.stringify([g, { note: 'no id' }]), JSON.stringify([g, 42, 'padding-padding'])]) {
+      await writeFile(file, bad)
+      expect(ok).not.toThrow()
+      expect(ok()).toBe(false) // the valid entry alongside a bad one is dropped too
+      expect(running.list()).toEqual([])
+    }
+    await writeFile(file, JSON.stringify([g]))
+    expect(ok()).toBe(true) // recovers once the file is valid again
+  })
+
   test('grants can bind to a client instance id', () => {
     const grants = new Grants()
     const g = grants.issue('unifi', { session: 'a@b', instance: 'inst-1' })
