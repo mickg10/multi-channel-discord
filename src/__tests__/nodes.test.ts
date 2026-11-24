@@ -286,3 +286,28 @@ describe('per-node secrets', () => {
     expect(regN(createWsHandlers(deps({ nodeSecrets: () => ({ hashes: {}, require: true }) })), 'newbox').message).toContain('has no node secret')
   })
 })
+
+describe('node: nvm PATH + local conversation guard', () => {
+  const { nvmBinDir, conversationHeldLocally } = require('../node.js')
+  const fs = require('node:fs'); const path = require('node:path'); const os = require('node:os')
+  test('nvmBinDir follows alias/default and picks the newest for "node"', () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'nvm-'))
+    for (const v of ['v24.10.0', 'v26.5.0', 'v26.12.1']) fs.mkdirSync(path.join(d, 'versions/node', v, 'bin'), { recursive: true })
+    fs.mkdirSync(path.join(d, 'alias'))
+    fs.writeFileSync(path.join(d, 'alias/default'), 'v26.5.0\n'); expect(nvmBinDir(d)).toBe(path.join(d, 'versions/node/v26.5.0/bin'))
+    fs.writeFileSync(path.join(d, 'alias/default'), 'node'); expect(nvmBinDir(d)).toBe(path.join(d, 'versions/node/v26.12.1/bin'))
+    fs.writeFileSync(path.join(d, 'alias/default'), '24'); expect(nvmBinDir(d)).toBe(path.join(d, 'versions/node/v24.10.0/bin'))
+    expect(nvmBinDir(path.join(d, 'nope'))).toBeUndefined()
+  })
+  test('conversationHeldLocally sees a TUI resumed by id and a live Claude session file', () => {
+    const ps = () => '  111 codex -s danger-full-access resume 01a20df8-a08f\n  222 bash\n'
+    expect(conversationHeldLocally('01a20df8-a08f', ps, '/nonexistent')).toBe('pid 111')
+    expect(conversationHeldLocally('other-id', ps, '/nonexistent')).toBeUndefined()
+    expect(conversationHeldLocally('last', ps, '/nonexistent')).toBeUndefined()
+    const sd = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-'))
+    fs.writeFileSync(path.join(sd, `${process.pid}.json`), JSON.stringify({ pid: process.pid, sessionId: 'S-live' }))
+    fs.writeFileSync(path.join(sd, '999999.json'), JSON.stringify({ pid: 999999, sessionId: 'S-dead' }))
+    expect(conversationHeldLocally('S-live', () => '', sd)).toBe(`claude pid ${process.pid}`)
+    expect(conversationHeldLocally('S-dead', () => '', sd)).toBeUndefined()
+  })
+})

@@ -26,7 +26,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process'
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync } from 'node:fs'
 import { homedir, hostname } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
 import { McpChild, validateLocalMcp, resolveLocalMcp, type LocalMcpConfig, type McpExecRequest } from './mcp.js'
@@ -63,6 +63,50 @@ const MCP_LAUNCHER = join(CODE_DIR, 'bin', 'agent-bus-mcp')
 const CONFIG_FILE = expand(process.env.AGENT_BUS_NODE_CONFIG ?? '~/.config/agent-bus/node.json')
 const STATE_FILE = join(dirname(CONFIG_FILE), 'node-state.json')
 const ENV_FILE = expand(process.env.DISCORD_STATE_DIR ? `${process.env.DISCORD_STATE_DIR}/.env` : '~/.claude/channels/discord/.env')
+/**
+ * bin dir of nvm's current default node, resolved on every turn so a node upgrade never leaves a
+ * stale pinned PATH (codex/opencode often live only there; service units don't load nvm).
+ */
+export function nvmBinDir(nvmDir = process.env.NVM_DIR || join(HOME, '.nvm')): string | undefined {
+  const versions = join(nvmDir, 'versions/node')
+  if (!existsSync(versions)) return undefined
+  let alias = ''
+  try { alias = readFileSync(join(nvmDir, 'alias/default'), 'utf8').trim() } catch {}
+  const all = readdirSync(versions).filter(v => /^v\d+\.\d+\.\d+$/.test(v))
+  const byVer = (a: string, b: string) => {
+    const pa = a.slice(1).split('.').map(Number), pb = b.slice(1).split('.').map(Number)
+    return pa[0] - pb[0] || pa[1] - pb[1] || pa[2] - pb[2]
+  }
+  const want = alias.replace(/^v?/, 'v')
+  const pick = all.includes(want) ? want
+    : all.filter(v => /^\d+$/.test(alias) ? v.startsWith(`v${alias}.`) : true).sort(byVer).pop()
+  return pick ? join(versions, pick, 'bin') : undefined
+}
+
+/**
+ * Is some local process already running this conversation (an interactive TUI resumed by id, or a
+ * Claude session whose session file names it)? The name-only router check misses a live process
+ * whose bus client is briefly down; running a headless turn then would fork the conversation.
+ */
+export function conversationHeldLocally(session: string | undefined, ps: () => string = defaultPs, claudeSessions = join(HOME, '.claude/sessions')): string | undefined {
+  if (!session || session === LAST) return undefined
+  for (const line of ps().split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(.*)$/)
+    if (m && Number(m[1]) !== process.pid && m[2].includes(session)) return `pid ${m[1]}`
+  }
+  try {
+    for (const f of readdirSync(claudeSessions)) {
+      if (!f.endsWith('.json')) continue
+      try {
+        const d = JSON.parse(readFileSync(join(claudeSessions, f), 'utf8')) as { pid?: number; sessionId?: string }
+        if (d.sessionId === session && d.pid) { try { process.kill(d.pid, 0); return `claude pid ${d.pid}` } catch {} }
+      } catch {}
+    }
+  } catch {}
+  return undefined
+}
+const defaultPs = (): string => { try { return execFileSync('ps', ['-eo', 'pid=,args=']).toString() } catch { return '' } }
+
 /** Sentinel session: continue the most recent conversation in the agent's cwd (adopt an existing one). */
 export const LAST = 'last'
 const DISCORD_TOOLS = ['bus_post', 'bus_sessions', 'check_inbox', 'reply', 'react', 'edit_message', 'fetch_messages',
@@ -255,6 +299,8 @@ async function main(): Promise<void> {
     try {
       const st = JSON.parse(await request('agentStatus', { agent: a.name })) as { live: boolean; mode: string | null }
       if (st.live && st.mode === 'push') { log(`${a.name}: interactive session is live; mail handed to it, no headless turn`); return }
+      const holder = conversationHeldLocally(state[a.name]?.session ?? (a.resume !== LAST ? a.resume : undefined))
+      if (holder) { log(`${a.name}: conversation is open in ${holder} (its bus client is down); mail stays queued, no headless turn`); return }
     } catch {}
     if (!budgetOk(a)) { log(`${a.name}: turn budget exhausted, messages stay queued`); return }
     running.add(a.name)
@@ -264,7 +310,9 @@ async function main(): Promise<void> {
     // An adopted conversation already has context; still tell it how headless turns work.
     const prompt = st.session ? WAKE_PROMPT : `${bootstrapPrompt(a, node)}\n\n${WAKE_PROMPT}`
     const { cmd, args, env: cmdEnv } = buildCommand(a, session, prompt, { claudePlugin })
-    const env = { ...process.env, ...cmdEnv, ...Object.fromEntries(Object.entries(a.env ?? {}).map(([k, v]) => [k, expand(v)])),
+    const nvm = nvmBinDir()
+    const basePath = nvm && !(process.env.PATH ?? '').split(':').includes(nvm) ? `${nvm}:${process.env.PATH ?? ''}` : process.env.PATH
+    const env = { ...process.env, PATH: basePath, ...cmdEnv, ...Object.fromEntries(Object.entries(a.env ?? {}).map(([k, v]) => [k, expand(v)])),
       DISCORD_SESSION_NAME: a.name, DISCORD_AGENT: a.kind, DISCORD_MODE: 'pull', DISCORD_WAKE: '' }
     const cwd = expand(a.cwd ?? '~')
     log(`${a.name}: turn start (${st.session ? `resume ${st.session.slice(0, 8)}` : session === LAST ? 'adopt last conversation' : 'new session'}) in ${cwd}`)
