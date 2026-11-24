@@ -270,3 +270,19 @@ describe('download + file message ids', () => {
     expect(Buffer.from(res[0].data, 'base64').toString()).toBe('PDF')
   })
 })
+
+describe('per-node secrets', () => {
+  const { createHash } = require('node:crypto')
+  const h = (s: string) => createHash('sha256').update(s).digest('hex')
+  const regN = (hd: any, node: string, nodeSecret?: string) => { const ws = makeWs(); hd.message(ws as any, JSON.stringify({ type: 'registerNode', node, agents: [], ...(nodeSecret && { nodeSecret }) })); return msgs(ws)[0] }
+  test('listed node needs its own secret', () => {
+    const hd = createWsHandlers(deps({ nodeSecrets: () => ({ hashes: { nas642: h('n-s') }, require: false }) }))
+    expect(regN(hd, 'nas642').message).toContain('bad or missing node secret')
+    expect(regN(hd, 'nas642', 'wrong').message).toContain('bad or missing node secret')
+    expect(regN(hd, 'nas642', 'n-s').type).toBe('nodeRegistered')
+  })
+  test('unlisted node: allowed (warn) unless require is set', () => {
+    expect(regN(createWsHandlers(deps({ nodeSecrets: () => ({ hashes: {}, require: false }) })), 'newbox').type).toBe('nodeRegistered')
+    expect(regN(createWsHandlers(deps({ nodeSecrets: () => ({ hashes: {}, require: true }) })), 'newbox').message).toContain('has no node secret')
+  })
+})

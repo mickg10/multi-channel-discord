@@ -299,6 +299,7 @@ async function main(): Promise<void> {
     ws.onopen = () => {
       attempt = 0
       ws!.send(JSON.stringify({ type: 'registerNode', node, secret: env.DISCORD_ROUTER_SECRET,
+        ...(env.DISCORD_NODE_SECRET && { nodeSecret: env.DISCORD_NODE_SECRET }),
         agents: cfg.agents.map(a => ({ name: a.name, kind: a.kind, cwd: expand(a.cwd ?? '~') })) }))
     }
     ws.onmessage = e => {
