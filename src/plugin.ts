@@ -17,7 +17,7 @@ import { computeBackoff } from './reconnect.js'
 import { discoverSkills } from './skills.js'
 import { loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
 
@@ -111,8 +111,9 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       // Codex hosts many threads' MCP servers in one app-server daemon (also same ppid), so
       // non-Claude agents use their own pid to avoid being merged into another thread's session.
       const agentKind = process.env.DISCORD_AGENT || 'claude'
+      const parent = process.env.DISCORD_PARENT_PID || String(process.ppid)
       const instanceId = process.env.DISCORD_INSTANCE_ID
-        || (agentKind === 'claude' ? String(process.ppid) : `${process.ppid}-${process.pid}`)
+        || (agentKind === 'claude' ? parent : `${parent}-${process.pid}`)
       const secret = process.env.DISCORD_ROUTER_SECRET || undefined
       ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, ...(secret && { secret }) }))
     }
@@ -159,7 +160,9 @@ async function getProjectDir(): Promise<string> {
   try {
     const { execSync } = await import('child_process')
     // Grandparent PID = Claude Code process (us → bun → claude)
-    const ppid = execSync(`ps -p ${process.ppid} -o ppid=`).toString().trim()
+    const parent = process.env.DISCORD_PARENT_PID || String(process.ppid)
+    // Without the supervisor our parent is bun (plugin runner) -> its parent is the agent.
+    const ppid = process.env.DISCORD_PARENT_PID ? parent : execSync(`ps -p ${parent} -o ppid=`).toString().trim()
     if (ppid && ppid !== '0' && ppid !== '1') {
       const cwd = execSync(`lsof -p ${ppid} 2>/dev/null | grep cwd | awk '{print $NF}'`).toString().trim()
       if (cwd && !cwd.includes('.claude/plugins')) return cwd
@@ -187,6 +190,31 @@ async function findTmuxPane(tmuxBin: string): Promise<string | undefined> {
   return undefined
 }
 
+/** Re-read connection settings from the .env file, overriding the process env. */
+function reloadClientEnv(): void {
+  try {
+    const file = `${process.env.DISCORD_STATE_DIR ?? `${process.env.HOME}/.claude/channels/discord`}/.env`
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      const m = line.match(/^(DISCORD_ROUTER_URL|DISCORD_ROUTER_SECRET|DISCORD_WS_PORT)=(.*)$/)
+      if (m) process.env[m[1]] = m[2]
+    }
+  } catch {}
+}
+
+/** True if an ancestor process is the ChatGPT desktop app (its built-in Codex). */
+function underChatGPTApp(): boolean {
+  try {
+    const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
+    let pid = String(process.pid)
+    for (let i = 0; i < 12 && pid && pid !== '0' && pid !== '1'; i++) {
+      const line = execFileSync('ps', ['-o', 'ppid=,command=', '-p', pid]).toString().trim()
+      if (line.includes('/Applications/ChatGPT.app/')) return true
+      pid = line.split(/\s+/)[0]
+    }
+  } catch {}
+  return false
+}
+
 /** Start the MCP plugin. */
 export async function startPlugin(): Promise<void> {
   // Claude Code sets --cwd to the plugin cache dir, not the actual project.
@@ -199,9 +227,12 @@ export async function startPlugin(): Promise<void> {
 
   const namingCtx = await readNamingContext(cwd)
   // Session name: DISCORD_SESSION_NAME overrides; else "<agent>@<host>:<project>".
-  const agent = process.env.DISCORD_AGENT || 'claude'
+  const inChatGPT = underChatGPTApp()
+  const agent = inChatGPT ? 'chatgpt-codex' : (process.env.DISCORD_AGENT || 'claude')
   const hostLabel = process.env.DISCORD_HOST_LABEL || hostname().split('.')[0].toLowerCase()
-  const sessionName = process.env.DISCORD_SESSION_NAME || `${agent}@${hostLabel}:${namingCtx.dirName}`
+  // The ChatGPT app's Codex shares ~/.codex/config.toml with the CLI, so ignore the CLI's
+  // fixed name and tmux wake target there.
+  const sessionName = (!inChatGPT && process.env.DISCORD_SESSION_NAME) || `${agent}@${hostLabel}:${namingCtx.dirName}`
 
   // Inbox: every inbound message is also queued here so clients without channel push
   // (Codex, agy) can read them with the check_inbox tool.
@@ -209,7 +240,7 @@ export async function startPlugin(): Promise<void> {
   const INBOX_MAX = 200
 
   // Optional wake-up for clients without push: type a nudge into the agent's tmux pane.
-  const wakeMode = process.env.DISCORD_WAKE // 'tmux' to enable
+  const wakeMode = inChatGPT ? undefined : process.env.DISCORD_WAKE // 'tmux' to enable
   const tmuxBin = ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'].find(p => { try { return existsSync(p) } catch { return false } }) ?? 'tmux'
   let wakePane = process.env.DISCORD_WAKE_PANE || process.env.TMUX_PANE
   if (wakeMode === 'tmux' && !wakePane) wakePane = await findTmuxPane(tmuxBin)
@@ -284,6 +315,9 @@ export async function startPlugin(): Promise<void> {
   }
 
   async function connect(): Promise<void> {
+    // Re-read router URL / secret each (re)connect so moving the router or rotating the
+    // secret needs no agent restart.
+    reloadClientEnv()
     // Don't auto-spawn the router — it's a Discord bot that must be started manually.
     // The plugin just connects to it.
     try {

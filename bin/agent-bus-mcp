@@ -4,4 +4,5 @@
 # (DISCORD_AGENT, DISCORD_WAKE=tmux, ...).
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUN="${BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
-exec "$BUN" "$DIR/src/plugin.ts"
+# The supervisor self-updates the git checkout and hot-restarts the client under the agent.
+exec "$BUN" "$DIR/src/supervisor.ts"
