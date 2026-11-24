@@ -823,11 +823,24 @@ export async function startPlugin(): Promise<void> {
   const transport = new StdioServerTransport()
   await mcp.connect(transport)
 
-  transport.onclose = () => {
+  // Exit when the agent goes away. Reconnect timers would otherwise keep this process alive as
+  // an orphan that holds a router connection (seen: 18 leaked clients after opencode restarts).
+  const exitSoon = (why: string) => {
+    if (shuttingDown) return
     shuttingDown = true
-    sendWs(JSON.stringify({ type: 'deregister' }))
-    currentWs?.close()
+    process.stderr.write(`discord plugin: exiting (${why})\n`)
+    try { sendWs(JSON.stringify({ type: 'deregister' })) } catch {}
+    try { currentWs?.close() } catch {}
+    setTimeout(() => process.exit(0), 500)
   }
+  transport.onclose = () => exitSoon('stdio closed')
+  process.stdin.on('end', () => exitSoon('stdin ended'))
+  const parentPid = Number(process.env.DISCORD_PARENT_PID || process.ppid)
+  setInterval(() => {
+    let alive = true
+    try { process.kill(parentPid, 0) } catch { alive = false }
+    if (!alive || process.ppid === 1) exitSoon(`agent process ${parentPid} gone`)
+  }, 10_000).unref()
 
   // Initial connection
   await connect()
