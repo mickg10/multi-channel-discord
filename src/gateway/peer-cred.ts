@@ -125,7 +125,13 @@ function currentUid(): number {
   return process.getuid()
 }
 
-/** Linux `SO_PEERCRED`, then `/proc/<pid>/exe` and `/proc/<pid>/stat`. A mismatch fails closed. */
+/**
+ * Linux `SO_PEERCRED`, then `/proc/<pid>/exe` and `/proc/<pid>/stat`. A mismatch fails closed.
+ * Accepted residual risk: the pid from getsockopt is not pinned to those `/proc` reads.
+ * A hit needs an fd handoff, reuse of that pid by the configured pipe, and a parent whose pid
+ * and start time are still a registered agent. That sits inside the same-user baseline.
+ * Start time narrows reuse. It does not close the window. `SO_PEERPIDFD` is not used.
+ */
 export function peerFromLinux(fd: number, selfUid = currentUid()): PeerInfo | undefined {
   const buf = new Uint8Array(12)
   const len = new Uint32Array([12])
@@ -146,6 +152,7 @@ export function peerFromLinux(fd: number, selfUid = currentUid()): PeerInfo | un
 /**
  * macOS `LOCAL_PEERPID` and `LOCAL_PEERCRED`, then `proc_pidpath` / `proc_pidinfo`.
  * Either socket option missing, or a uid other than this process, fails closed.
+ * The same accepted pid-reuse window sits between those socket options and `proc_pidinfo`.
  */
 export function peerFromDarwin(fd: number, selfUid: number, sys: DarwinSys): PeerInfo | undefined {
   const pidBuf = new Uint8Array(4)
