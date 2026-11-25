@@ -217,3 +217,90 @@ bun run check  # type checking
 ## License
 
 Apache-2.0. Forked from [Anthropic's official Discord plugin](https://github.com/anthropics/claude-plugins-official).
+
+### Native gateway discovery API
+
+On each host, the operator writes a private `gateway-bindings.json` owned by the
+gateway's current UID with mode `0600`. The gateway rereads this regular file on
+each refresh. The size limit is 1 MiB. Discovery never writes or creates it.
+Use the exact fleet aliases and explicit native conversation IDs.
+
+```json
+{
+  "codex@nas642": { "kind": "codex", "conv": "thread-id" },
+  "opencode_nas642_glm53_abli": { "kind": "opencode", "conv": "ses_example" }
+}
+```
+
+An optional positive integer `pid` on a binding must match the selected Codex
+daemon or OpenCode service PID. Aliases come from the operator file and are
+never inferred from working directory, title, or active-session order. Several
+conversations can share a PID and working directory.
+
+Configure the local native endpoints separately in `config.discoveries`.
+
+```json
+{
+  "discoveries": [
+    {
+      "id": "codex-primary",
+      "kind": "codex",
+      "controlSocket": "/absolute/private/control.sock",
+      "pid": 1234
+    },
+    {
+      "id": "opencode-primary",
+      "kind": "opencode",
+      "servicePath": "/absolute/private/service.json"
+    }
+  ]
+}
+```
+
+Give each selected endpoint a unique source ID. The Codex daemon PID is required
+in the source definition and must be updated after a restart. Discovery reads
+the OpenCode PID from the private service descriptor on each pass.
+
+The separate `gateway-alias-hosts.json` proves host ownership. A bare alias
+such as `opencode_nas642_glm53_abli` requires an exact entry for the local host.
+Qualified aliases must name the local host and agree with any owner entry.
+
+```json
+{
+  "opencode_nas642_glm53_abli": "nas642"
+}
+```
+
+A host runtime can create discovery with its authenticated host and user, its
+gateway, and a callback that reloads the trusted config and ownership record.
+
+```ts
+const discovery = new NativeDiscovery({
+  host,
+  user,
+  gateway,
+  bindingsPath: "/absolute/private/gateway-bindings.json",
+  async readConfig(signal) {
+    const config = await readHostConfig(signal)
+    const gatewayAliasHosts = await readAliasHosts(signal)
+    return { discoveries: config.discoveries, gatewayAliasHosts }
+  },
+})
+discovery.start()
+```
+
+A binding must match exactly one configured source of the same kind across
+complete native listings. Unknown native sessions stay unregistered. Invalid
+bindings and conflicts prevent all registration writes in that pass. A failed
+or incomplete source prevents updates for its kind. A missing listing or
+removed binding preserves the registration and its mail. Retained aliases
+continue to own their native identities until explicitly released or rebound.
+An unchanged registration keeps its generation. A changed source PID or a
+confirmed explicit conversation rebind updates it.
+
+Call `await discovery.refresh()` for a one-shot pass or to supersede an older
+pass. `await discovery.stop()` cancels polling and fences off stale results.
+The default poll interval is 30 seconds and the default whole-pass deadline is
+5 seconds. Results report status codes, configured source IDs and aliases, and
+counts of unmapped conversations. The host owns router reconnect and replay of
+retained registrations.

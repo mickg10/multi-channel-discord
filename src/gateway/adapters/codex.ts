@@ -7,6 +7,7 @@ import type { Adapter, Target, Nudge, WakeResult } from "../../types.js";
 
 type Method =
   | "initialize"
+  | "thread/loaded/list"
   | "thread/queue/add"
   | "thread/queue/list"
   | "thread/read"
@@ -105,7 +106,7 @@ export function supportsCodexUnixWebSocket(version: string | undefined): boolean
     (major > 1 || (major === 1 && (minor > 3 || (minor === 3 && patch >= 13))));
 }
 
-const connectUnix: Connect = async (registeredPath, signal) => {
+export const connectCodexUnix: Connect = async (registeredPath, signal) => {
   // The control endpoint uses WebSocket-over-Unix, which requires Bun >=1.3.13.
   if (!supportsCodexUnixWebSocket(process.versions.bun) || typeof WebSocket !== "function") {
     throw new Unavailable();
@@ -242,7 +243,7 @@ const connectUnix: Connect = async (registeredPath, signal) => {
   };
 }
 
-function supportedVersion(userAgent: unknown): boolean {
+export function supportedVersion(userAgent: unknown): boolean {
   if (typeof userAgent !== "string") return false;
   const match = /^[^/\r\n]+\/(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?: |$)/.exec(userAgent);
   if (!match) return false;
@@ -372,7 +373,7 @@ export interface CodexAdapterOptions {
 
 export function createCodexAdapter({
   resolveControlSocket,
-  connect = connectUnix,
+  connect = connectCodexUnix,
   deadlineMs = DEADLINE_MS,
 }: CodexAdapterOptions): Adapter {
   async function run(

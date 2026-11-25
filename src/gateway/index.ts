@@ -10,3 +10,7 @@ export {
   type Adapter, type DeliveryResult, type GatewayToRouterMessage, type Kind, type LeaseResult, type Nudge,
   type RouterToGatewayMessage, type Target, type Transport, type WakeResult,
 } from './types.js'
+export {
+  NativeDiscovery, type DiscoveryBinding, type DiscoveryConfig, type DiscoveryOptions,
+  type DiscoveryResult, type DiscoverySource,
+} from './discovery.js'
