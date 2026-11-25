@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.9** (after R9), entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v5.0 FROZEN** (after R10, 2026-11-25 17:1xZ). Changes from here need a leader-approved amendment., entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -59,7 +59,7 @@ Gateway stamps `(host,user,kind,conv-id)` on every call to the router; router re
 
 ## 4. Durability (fixes live router bugs found by codex_nas)
 **Every admitted directed message is committed to Inboxes *before* any transport, live-push or wake-budget decision.** Today's live-push and over-budget paths skip the inbox entirely (R6#2, verified on 8697214). If commit fails, the sender gets an explicit error.
-Per message, one stable msg id across reconnects: **committed** (router fsync, synchronous) → **woken** (a native ack such as Codex queue/add or opencode prompt means the *adapter's nudge was admitted*, not that mail was read) → **accepted** (the gateway finished writing the recipient's `check_inbox` tool result for that lease; no new tool). Terminal side-states: **held / refused / uncertain**, operator-visible, mail still readable, no fallback (N4). Implementation is a **focused Inboxes and protocol refactor**, not a router rewrite (R5#3). It needs a synchronous atomic commit, entries with id, state and lease, a lease/ACK on drain, wake attempt and ACK records, restart recovery, and overflow surfaced to the sender instead of dropping at 501.
+Per message, one stable msg id across reconnects: **committed** (router fsync, synchronous) → **woken** (a native ack such as Codex queue/add or opencode prompt means the *adapter's nudge was admitted*, not that mail was read) → **accepted**. Each `check_inbox` result carries an opaque **receipt** bound to (identity, msg ids, lease generation). The agent's **next** `check_inbox` echoes the previous receipt, and only that exact receipt acks; there is no new tool (R10, superseding R9#4). A lost result or an unrelated call leaves mail leased, and lease expiry redelivers with the same ids. Terminal side-states: **held / refused / uncertain**, operator-visible, mail still readable, no fallback (N4). Implementation is a **focused Inboxes and protocol refactor**, not a router rewrite (R5#3). It needs a synchronous atomic commit, entries with id, state and lease, a lease/ACK on drain, wake attempt and ACK records, restart recovery, and overflow surfaced to the sender instead of dropping at 501.
 Commit-before-ack on enqueue; lease by msg id on drain; ack only after recipient accepted; overflow is an
 error to the sender, never silent oldest-drop; uncertain inject → "unresolved", reconciled, never replayed blindly.
 
@@ -74,7 +74,7 @@ with their own conversation id, (b) never restarts itself or the shared Codex da
 ### 4a. Router changes for M0 (R7, claude_setup, verified against 8697214)
 - `deliver()` has four exits that never commit (push = bare ws.send, over-budget = unread.bump, offline non-node = drop, approval without a conversation = drop). New order: **admit (known identity only, else sender error) → commit → the budget gates the *wake* only → transport.** PR #9 semantics are kept: passive traffic is a count; from_human and rules are exempt.
 - Inboxes storage: **append-only JSONL** of commit, lease and ack records, compacted on start. It replaces the whole-map JSON on a 200 ms timer, where an fsync per message would be O(total).
-- Drain becomes a **lease** (10 min) acked after the gateway writes the tool result; it redelivers with the same id. `agentStatus` (L393) is observational; the backlog flush happens only on register.
+- Drain becomes a **lease** (10 min) acked by the echoed receipt (§4); it redelivers with the same id. **Sender publish:** `bus_post` returns `{publish_id, committed:[targets]}`, and a retry with the same `publish_id` dedups (one delivery per target, even across a Discord outage). **Wake attempts are persisted before native I/O**; a crash before `wakeResult` leaves the message `uncertain`, and it is reconciled, never re-woken blindly. Unbound legacy mail is preserved when an alias changes owner, then reconciled. `agentStatus` (L393) is observational; the backlog flush happens only on register.
 - Inbox **key = identity (host/user/kind/conv)**, which folds in Conversations and the bound-approval hold. M0 does a one-time re-key of name-queued mail when an alias binds.
 - Gateway protocol: `registerGateway{host,user,proto}` with the node secret **required** (timing-safe compare, replacing today's `!==`); `registerAgent{kind,conv,alias}` bound to ws.data.nodeName, with a host match. Every op carries `as`, which must be in that gateway's set; ops without it are rejected.
 - Coexistence: a gateway-bound alias rejects a legacy `register` with `replaced`, because the PR #11 takeover would otherwise steal it.
@@ -84,7 +84,7 @@ with their own conversation id, (b) never restarts itself or the shared Codex da
 Baseline: a same-user process is **not** a boundary. The goal is to limit what a prompt-injected agent shell or MCP child can do.
 - **Per-call `_meta` identity is trusted only from a verified pipe.** The peer on the gateway socket must be `agent-bus-pipe` (exe path check) whose parent is the registered daemon or agent pid. Residual risk: a shell that `exec`s the pipe from under the daemon still passes, so this is a mitigation, not a proof. **Ack must carry the lease id** issued to that identity, so you can't ack mail you weren't leased.
 - **Registration is verified, not trusted.** Hook payloads give only a hint. The gateway checks the hook peer's ancestry against `CLAUDE_PID` and takes the socket path and sessionId from `claude agents --json`, never from the payload. agy LS address and CSRF are accepted only from a peer descended from that agy pid.
-- **Host identity:** `registerGateway{host}` is self-declared when per-node secrets are absent. That is **accepted risk** (Mick: "impersonation is fine"): one leaked shared secret lets an attacker read and ack any host's mail. Where a per-node secret is configured, host↔secret is enforced for drain and ack.
+- **Host identity:** gateways **require a per-node secret** (R7 and R10; the gateway is new, so there is no legacy constraint), and host↔secret is enforced for addressed drain and ack. Legacy plugin clients keep today's rules, including Mick's accepted impersonation, until their scope migrates. Held/refused stay final, and the external sender identity is preserved.
 - **Secrets:** the inbox-socket auth line, opencode password and agy CSRF are redacted in the serializer and raw frames are never logged. The opencode password goes in a header, never in the URL or argv. The gateway runs with `ulimit -c 0`.
 - **opencode allowlist** (replaces the denylist): GET `/api/session`, `/api/session/active`, `/api/session/{id}/inbox`, `/api/event`, `/api/session/{id}/message/*`, and POST `/api/session/{id}/prompt` with `delivery:"queue"` only.
 - Verified OK: the router sets `from_human` only for `allowFrom` authors (router.ts:355), and dispatcher re-delivery uses only the saved humanMail (ws.ts:1196).
@@ -107,7 +107,7 @@ interface Adapter { kind: Kind; probe(t: Target): Promise<{ok:boolean}>; wake(t:
 - **PR split:** PR1 router (JSONL inbox, admit→commit→lease/ack, observational status). PR2 gateway skeleton (frames, registry, Adapter type, no native I/O). PR3 Codex adapter. PR4 opencode adapter. PR3 and PR4 depend only on PR2 and land in parallel.
 
 ## 5b. Codex RPC contract (pinned, R5#2)
-`initialize{capabilities.experimentalApi:true}` → version and capability allowlist (≥0.170; `thread/queue/add` present) → `thread/queue/add{threadId, input:[fixed nudge], clientUserMessageId}` and **nothing else**. Reconcile with `thread/queue/list` plus `thread/read{includeTurns:true, itemsView:"full"}`, paged to `nextCursor:null`, matching `clientUserMessageId` / `userMessage.clientId`. `clientUserMessageId` = hash(recipient threadId, bus msg id), immutable. The control socket must be owned by the user (stat check), mode 0600.
+`initialize{capabilities.experimentalApi:true}` → version and capability allowlist (≥0.170; `thread/queue/add` present) → `thread/queue/add{threadId, input:[fixed nudge], clientUserMessageId}` and **nothing else**. Reconcile with `thread/queue/list` plus history: `thread/read{includeTurns:true}` (no itemsView or cursor there), then page `thread/turns/list{itemsView:"full"}` to `nextCursor:null`, and `thread/items/list` where needed (R10 correction), matching `clientUserMessageId` / `userMessage.clientId`. `clientUserMessageId` = hash(recipient threadId, bus msg id), immutable. The control socket must be owned by the user (stat check), mode 0600.
 
 ## 6. Migration (per kind, old client stopped in the same step its adapter goes live)
 M0 gateway + Inboxes refactor + JSON check_inbox, no adapters, **no tmux restarts**. Build order (R5#5): M0, then **Codex (Mac) and opencode in parallel**, since both have passing canaries and opencode's tmux wake is broken today. Then Claude (after Q1), then agy/grok. No generic adapter framework or status UI: a minimal `Adapter{probe, wake, reconcile}` interface only. M1 Claude (hook + inbox socket). M2 opencode. M3 Codex (queue+nudge first,
@@ -193,3 +193,27 @@ GLM may still post R3 critique; it will be appended.
 4. The definition of "accepted" contradicted itself → **fixed**: the gateway's write of the check_inbox result is the ack.
 5. Single router state machine, no re-wake of woken/uncertain → **accepted**.
 6. Guessed values pinned: id hashes, overflow `inbox_full` at 5000, canary scope.
+
+### R10 codex@nas642 (84da816) → FREEZE
+Corrections adopted: recipient-echoed receipt ack; wake attempt persisted before native I/O; sender publish_id dedup; legacy mail preserved on owner change; gateways require a per-node secret (the §4a/§4b contradiction is resolved); Codex history paging corrected; opencode evidence confirmed (TUI render, retry/restart, `_meta["ai.opencode/sessionID"]`).
+
+## Acceptance tests (required, R10)
+**PR1 router:** (1) commit, then the sender's reply is lost, then a retry during a Discord outage → one delivery per target; (2) a lost inbox result plus an unrelated call leaves mail leased, and only the exact current receipt acks; (3) status, budget exhaustion and a failed push all preserve mail across a restart. Plus: the agentStatus/failed-push regression and `inbox_full`.
+**PR2 gateway:** (1) same-cwd parent/child calls cannot read each other's mail; (2) held/refused → zero fallback attempts and zero model turns; (3) a crash between the native send and wakeResult reconciles with no duplicate wake.
+**PR3 Codex:** (1) busy A, then queued B, renders two TUI turns; (2) a lost add reply reconciles by clientId with no blind retry; (3) the enqueue-only producer gets zero approvals, and the owner can decline.
+**PR4 opencode:** (1) two sessions on one MCP process report distinct, correct ids; (2) busy A plus a retried B renders once, including a retry after restart; (3) the target can reject a tool, the neighbour sees no request, and nothing executes.
+
+## Team (leader-assigned, 2026-11-25)
+| Role | Session | Model |
+|---|---|---|
+| Leader / architect / integrator / final review | claude@mac:ops-tmux-fixer | Opus 5.5 |
+| PR1 router (Inboxes JSONL, admit→commit→lease/receipt, publish_id, observational status) | **I1: new codex on Mac** (launched by ops-upgrader) | gpt-6.2-sol |
+| PR2 gateway skeleton (frames, registry, Adapter type, socket server, wake-attempt store) | grok@nas642:src | grok-4.7 |
+| PR3 Codex adapter | codex-photos' isolated worker (plan + fixtures ready) | gpt-6.2-sol low |
+| PR4 opencode adapter | **I2: codex@mac:infra relaunched** | gpt-6.2-sol low |
+| Tests/scaffolding helpers | any implementer may spawn | gpt-6-luna |
+| Router review + merge | claude@mac:discord-integrator | Opus (review only) |
+| Security review (every PR) | claude@mac:ops-upgrader | Opus (review only) |
+| Evidence / acceptance tests | codex@nas642 | review only |
+| Migration operator (tmux-0 restarts, last) | claude@mac:ops-upgrader | — |
+| Never-down controller | the per-host gateway (launchd KeepAlive / systemd --user) | not an LLM |
