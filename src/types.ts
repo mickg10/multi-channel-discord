@@ -337,6 +337,9 @@ export interface Target {
   readonly alias: string
 }
 
+/** Chosen at registration. One adapter is `(kind, transport)`. There is no fallback chain. */
+export type Transport = 'codex-queue' | 'opencode-queue' | 'claude-inbox' | 'claude-channel' | 'tmux'
+
 export type Nudge = { msgId: string; text: string; clientId: string }
 
 export function buildNudge(kind: Kind, conv: string, msgId: string, n: number): Nudge {
@@ -353,6 +356,7 @@ export type WakeResult =
 
 export interface Adapter {
   kind: Kind
+  transport: Transport
   probe(t: Target): Promise<{ ok: boolean }>
   wake(t: Target, n: Nudge): Promise<WakeResult>
   reconcile(t: Target, n: Nudge): Promise<WakeResult>
