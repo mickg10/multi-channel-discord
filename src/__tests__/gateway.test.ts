@@ -56,7 +56,7 @@ async function gateway(agents: Array<typeof parent> = [parent, child]) {
   }
   gw = new Gateway({
     host: 'nas642', user: 'mickg', secret: 'node-secret',
-    storePath: join(dir, 'wakes.json'),
+    storePath: join(dir, 'wakes.json'), pipePath: pipeBin,
     send, audit: frame => audit.push(frame), readPeer: () => peer,
   })
   for (const agent of agents) gw.registerAgent(agent)
@@ -200,6 +200,12 @@ describe('gateway skeleton', () => {
       const viaLink = await rpc(g.sock, g.setPeer, { pid: 8, exe: link, ppid: child.pid, started: 'linux:2', parentStarted: 'linux:1' }, { op: 'check_inbox', conv: child.conv })
       expect(viaLink).toMatchObject({ ok: false, error: 'peer is not agent-bus-pipe' })
       const missingExe = await rpc(g.sock, g.setPeer, { pid: 7, exe: join(g.dir, 'missing-agent-bus-pipe'), ppid: child.pid, started: 'linux:2', parentStarted: 'linux:1' }, { op: 'check_inbox', conv: child.conv })
+      const otherDir = join(g.dir, 'other-pipe')
+      mkdirSync(otherDir)
+      const otherPipe = join(otherDir, 'agent-bus-pipe')
+      writeFileSync(otherPipe, '')
+      const sameName = await rpc(g.sock, g.setPeer, { ...pipe(child.pid), exe: otherPipe }, { op: 'check_inbox', conv: child.conv })
+      expect(sameName).toMatchObject({ ok: false, error: 'peer is not agent-bus-pipe' })
       const reused = await rpc(g.sock, g.setPeer, { ...pipe(child.pid), parentStarted: 'linux:999' }, { op: 'check_inbox', conv: child.conv })
       expect(reused).toMatchObject({ ok: false, error: 'parent is not a registered agent' })
       expect(missingExe).toMatchObject({ ok: false, error: 'peer is not agent-bus-pipe' })
@@ -489,7 +495,7 @@ describe('gateway skeleton', () => {
     const seen: string[] = []
     const gw = new Gateway({
       host: 'nas642', user: 'mickg', secret: 'node-secret', storePath: join(dir, 'wakes.json'),
-      send: () => {}, readPeer: () => pipe(parent.pid),
+      pipePath: pipeBin, send: () => {}, readPeer: () => pipe(parent.pid),
       onVerifiedConnection: (_sock, agents) => { seen.push(agents.map(agent => agent.alias).join(',')) },
     })
     gw.registerAgent(parent)
@@ -502,6 +508,21 @@ describe('gateway skeleton', () => {
       expect(seen).toEqual([parent.alias])
       socket.end()
     } finally { await gw.close() }
+  })
+
+  test('a socket directory owned by another user refuses to listen', async () => {
+    const parentStat = await stat('/tmp')
+    const getuid = process.getuid
+    if (getuid === undefined) throw new Error('no uid')
+    expect(parentStat.uid).not.toBe(getuid())
+    const mode = parentStat.mode
+    const gw = new Gateway({
+      host: 'nas642', user: 'mickg', secret: 'node-secret',
+      storePath: join(tmpdir(), 'gw-foreign-not-created.json'), send: () => {},
+    })
+    await expect(gw.listen('/tmp/agent-bus-foreign-owner.sock')).rejects.toThrow('owned by another user')
+    expect((await stat('/tmp')).mode).toBe(mode)
+    await gw.close()
   })
 
   test('a bad wake store is left untouched', async () => {

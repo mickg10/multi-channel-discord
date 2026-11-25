@@ -1,16 +1,22 @@
 import { describe, expect, test } from 'bun:test'
-import { chmodSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, readlinkSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { FakeAdapter, Registry, adaptersFor, builtinAdapters, darwinStartTime, loadConfig, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, readNodeSecret, startHost, startTimeFromStat, verifyPipePeer, type AdapterBinding, type DarwinSys, type GatewayToRouterMessage } from '../gateway/index.js'
+import { FakeAdapter, Registry, adaptersFor, builtinAdapters, darwinStartTime, loadConfig, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, readNodeSecret, startHost, startTimeFromStat, verifyPipePeer, type AdapterBinding, type DarwinSys, type GatewayToRouterMessage } from '../gateway/index.js'
 import { LOCAL_PEERCRED, LOCAL_PEERPID, SOL_LOCAL } from '../gateway/peer-cred.js'
 
 const root = join(import.meta.dir, '../..')
 
 async function tempDir(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'gw-host-'))
+}
+
+function uid(): number {
+  const getuid = process.getuid
+  if (getuid === undefined) throw new Error('no uid')
+  return getuid()
 }
 
 test('ppid is the field after a command that contains parentheses', () => {
@@ -24,7 +30,7 @@ test('ppid is the field after a command that contains parentheses', () => {
   expect(darwinStartTime(info)).toBe('darwin:10.4')
   const self = processIdentity(process.pid)
   expect(self?.pid).toBe(process.pid)
-  expect(self?.started.startsWith('linux:')).toBe(true)
+  expect(self?.started.startsWith(process.platform === 'darwin' ? 'darwin:' : 'linux:')).toBe(true)
 })
 
 test('a gateway config names absolute paths and kind/transport pairs', async () => {
@@ -35,20 +41,43 @@ test('a gateway config names absolute paths and kind/transport pairs', async () 
     { kind: 'opencode', transport: 'opencode-queue' },
     { kind: 'codex', transport: 'codex-queue' },
   ]
-  writeFileSync(file, JSON.stringify({
-    host: 'nas642', user: 'mickg', routerUrl: 'ws://127.0.0.1/bus',
+  const base = {
+    host: 'nas642', user: 'mickg', routerUrl: 'wss://router.example/bus',
     secretFile: join(dir, 'secret'), socketPath: join(dir, 'gw.sock'), wakeStore: join(dir, 'wakes.json'),
     pipePath, adapters: bindings,
-  }))
+  }
+  writeFileSync(file, JSON.stringify(base), { mode: 0o600 })
+  chmodSync(file, 0o600)
   expect(loadConfig(file).adapters).toEqual(bindings)
   expect(loadConfig(join(root, 'contrib/gateway.example.json')).adapters).toEqual([])
-  expect(loadConfig(join(root, 'contrib/gateway.example.json')).pipePath).toBe('/usr/local/bin/agent-bus-pipe')
-  writeFileSync(file, JSON.stringify({ host: 'nas642', user: 'mickg', routerUrl: 'http://nope', secretFile: '/s', socketPath: '/g', wakeStore: '/w', pipePath: '/p', adapters: [] }))
+  expect(loadConfig(join(root, 'contrib/gateway.example.json')).pipePath).toBe('/home/mickg/.local/libexec/agent-bus/agent-bus-pipe')
+  writeFileSync(file, JSON.stringify({ ...base, routerUrl: 'http://nope', secretFile: '/s', socketPath: '/g', wakeStore: '/w', pipePath: '/p', adapters: [] }))
   expect(() => loadConfig(file)).toThrow('websocket')
-  writeFileSync(file, JSON.stringify({ host: 'nas642', user: 'mickg', routerUrl: 'ws://127.0.0.1', secretFile: 'secret', socketPath: '/g', wakeStore: '/w', pipePath: '/p', adapters: [] }))
+  writeFileSync(file, JSON.stringify({ ...base, routerUrl: 'wss://router.example/bus', secretFile: 'secret', socketPath: '/g', wakeStore: '/w', pipePath: '/p', adapters: [] }))
   expect(() => loadConfig(file)).toThrow('absolute')
-  writeFileSync(file, JSON.stringify({ host: 'nas642', user: 'mickg', routerUrl: 'ws://127.0.0.1', secretFile: '/s', socketPath: '/g', wakeStore: '/w', pipePath: '/p', adapters: [{ kind: 'codex', transport: 'codex-queue' }, { kind: 'codex', transport: 'codex-queue' }] }))
+  writeFileSync(file, JSON.stringify({ ...base, routerUrl: 'wss://router.example/bus', secretFile: '/s', socketPath: '/g', wakeStore: '/w', pipePath: '/p', adapters: [{ kind: 'codex', transport: 'codex-queue' }, { kind: 'codex', transport: 'codex-queue' }] }))
   expect(() => loadConfig(file)).toThrow('twice')
+  writeFileSync(file, JSON.stringify({ ...base, pipePath: undefined }))
+  expect(() => loadConfig(file)).toThrow('pipePath')
+  writeFileSync(file, JSON.stringify({ ...base, routerUrl: 'ws://127.0.0.1/bus' }))
+  expect(() => loadConfig(file)).toThrow('tailnet')
+  writeFileSync(file, JSON.stringify({ ...base, routerUrl: 'ws://10.1.2.3/bus' }))
+  expect(() => loadConfig(file)).toThrow('tailnet')
+  writeFileSync(file, JSON.stringify({ ...base, routerUrl: 'ws://100.128.0.1/bus' }))
+  expect(() => loadConfig(file)).toThrow('tailnet')
+  writeFileSync(file, JSON.stringify({ ...base, routerUrl: 'ws://100.64.8.9/bus' }))
+  expect(loadConfig(file).routerUrl).toBe('ws://100.64.8.9/bus')
+  writeFileSync(file, JSON.stringify({ ...base, routerUrl: 'ws://nas.taildebf6.ts.net:8789/bus' }))
+  expect(loadConfig(file).routerUrl).toBe('ws://nas.taildebf6.ts.net:8789/bus')
+  chmodSync(file, 0o666)
+  expect(() => loadConfig(file)).toThrow('0644')
+  chmodSync(file, 0o644)
+  expect(loadConfig(file).routerUrl).toBe('ws://nas.taildebf6.ts.net:8789/bus')
+  chmodSync(file, 0o600)
+  symlinkSync(file, join(dir, 'gateway-link.json'))
+  expect(() => loadConfig(join(dir, 'gateway-link.json'))).toThrow('symlink')
+  expect(statSync('/etc/passwd').uid).not.toBe(uid())
+  expect(() => loadConfig('/etc/passwd')).toThrow('owned by another user')
   expect(() => adaptersFor([{ kind: 'codex', transport: 'codex-queue' }])).toThrow('no adapter for codex/codex-queue')
   const made: string[] = []
   const table = new Map([
@@ -75,9 +104,31 @@ test('a group-readable node secret is refused', async () => {
   const file = join(dir, 'secret')
   writeFileSync(file, 'sekrit\n', { mode: 0o600 })
   chmodSync(file, 0o640)
-  expect(() => readNodeSecret(file)).toThrow('group or others')
+  expect(() => readNodeSecret(file)).toThrow('0600')
+  chmodSync(file, 0o400)
+  expect(() => readNodeSecret(file)).toThrow('0600')
   chmodSync(file, 0o600)
   expect(readNodeSecret(file)).toBe('sekrit')
+  symlinkSync(file, join(dir, 'secret-link'))
+  expect(() => readNodeSecret(join(dir, 'secret-link'))).toThrow('symlink')
+  expect(statSync('/etc/passwd').uid).not.toBe(uid())
+  expect(() => readNodeSecret('/etc/passwd')).toThrow('owned by another user')
+})
+
+test('a socket directory owned by another user refuses to start', async () => {
+  const parentStat = statSync('/tmp')
+  expect(parentStat.uid).not.toBe(uid())
+  const mode = parentStat.mode
+  const dir = await tempDir()
+  const secretFile = join(dir, 'secret')
+  writeFileSync(secretFile, 'sekrit\n', { mode: 0o600 })
+  chmodSync(secretFile, 0o600)
+  await expect(startHost({
+    host: 'nas642', user: 'mickg', routerUrl: 'wss://router.example/bus',
+    secretFile, socketPath: '/tmp/agent-bus-foreign-host.sock', wakeStore: join(dir, 'wakes.json'),
+    pipePath: join(dir, 'agent-bus-pipe'), adapters: [],
+  }, { adapters: [] })).rejects.toThrow('owned by another user')
+  expect(statSync('/tmp').mode).toBe(mode)
 })
 
 test('the gateway main requires a config path', async () => {
@@ -319,12 +370,17 @@ describe('peer credentials', () => {
     expect(peer).toEqual({ pid: 40, exe: pipeBin, ppid: 9, started: 'darwin:10.4', parentStarted: 'darwin:10.4' })
     const reg = new Registry()
     reg.add({ host: 'nas642', user: 'mickg', kind: 'codex', conv: 'c', alias: 'codex@nas642', pid: 9, transport: 'codex-queue', started: 'darwin:10.4' })
-    expect(verifyPipePeer(peer!, reg).ok).toBe(true)
-    if (verifyPipePeer(peer!, reg).ok) expect(verifyPipePeer(peer!, reg)).toMatchObject({ agents: [{ alias: 'codex@nas642', pid: 9 }] })
+    expect(verifyPipePeer(peer!, reg, pipeBin).ok).toBe(true)
+    if (verifyPipePeer(peer!, reg, pipeBin).ok) expect(verifyPipePeer(peer!, reg, pipeBin)).toMatchObject({ agents: [{ alias: 'codex@nas642', pid: 9 }] })
+    expect(verifyPipePeer(peer!, reg)).toEqual({ ok: false, error: 'peer is not agent-bus-pipe' })
     reg.add({ host: 'nas642', user: 'mickg', kind: 'codex', conv: 'c', alias: 'codex@nas642', pid: 9, transport: 'codex-queue', started: 'darwin:1.0' })
-    expect(verifyPipePeer(peer!, reg)).toEqual({ ok: false, error: 'parent is not a registered agent' })
+    expect(verifyPipePeer(peer!, reg, pipeBin)).toEqual({ ok: false, error: 'parent is not a registered agent' })
     expect(peerFromDarwin(3, 8, sys())).toBeUndefined()
     expect(peerFromDarwin(3, 7, sys('pid'))).toBeUndefined()
     expect(peerFromDarwin(3, 7, sys('cred'))).toBeUndefined()
+    const identified = processIdentityFromDarwin(40, sys())
+    expect(identified).toEqual({ pid: 40, exe: realpathSync(pipeBin), started: 'darwin:10.4' })
+    expect(processIdentityFromDarwin(0, sys())).toBeUndefined()
+    expect(processIdentityFromDarwin(40, { ...sys(), pidpath: () => 0 })).toBeUndefined()
   })
 })

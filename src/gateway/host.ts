@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs'
+import { chmodSync, closeSync, constants, fstatSync, mkdirSync, openSync, readSync, statSync } from 'node:fs'
 import { isAbsolute, dirname } from 'node:path'
 import { computeBackoff } from '../reconnect.js'
 import { Gateway } from './gateway.js'
@@ -85,9 +85,64 @@ function abs(value: unknown, label: string): string {
   return path
 }
 
+/** `100.64.0.0/10`, or a name under `*.ts.net`. Plain `ws://` is allowed only for these. */
+function tailnetHost(hostname: string): boolean {
+  const host = hostname.endsWith('.') ? hostname.slice(0, -1) : hostname
+  if (host.toLowerCase().endsWith('.ts.net') && host.length > '.ts.net'.length) return true
+  const parts = host.split('.')
+  if (parts.length !== 4) return false
+  const oct = parts.map(part => /^(?:0|[1-9]\d{0,2})$/.test(part) ? Number(part) : Number.NaN)
+  if (oct.some(n => !Number.isInteger(n) || n > 255)) return false
+  return oct[0] === 100 && oct[1]! >= 64 && oct[1]! <= 127
+}
+
+function assertRouterUrl(routerUrl: string): void {
+  let url: URL
+  try { url = new URL(routerUrl) } catch { throw new Error('routerUrl must be a websocket url') }
+  if (url.protocol === 'wss:') return
+  if (url.protocol !== 'ws:') throw new Error('routerUrl must be a websocket url')
+  if (!tailnetHost(url.hostname)) throw new Error('routerUrl must be wss:// or a tailnet ws:// host')
+}
+
+/** Open the path itself. A symlink is refused before it is followed. */
+function openNoFollow(path: string, label: string): number {
+  try {
+    return openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW)
+  } catch (err) {
+    const code = err && typeof err === 'object' && 'code' in err ? String((err as { code?: unknown }).code) : ''
+    if (code === 'ELOOP') throw new Error(`${label} is a symlink`)
+    throw new Error(`${label} is unreadable`)
+  }
+}
+
+function readOwnedFile(path: string, label: string, mode: 'secret' | 'config'): string {
+  const fd = openNoFollow(path, label)
+  try {
+    const st = fstatSync(fd)
+    if (!st.isFile()) throw new Error(mode === 'secret' ? `${label} is not a regular file` : `${label} is unreadable`)
+    if (process.getuid === undefined) throw new Error('no uid')
+    if (st.uid !== process.getuid()) throw new Error(`${label} is owned by another user`)
+    const bits = st.mode & 0o777
+    if (mode === 'secret') {
+      if (bits !== 0o600) throw new Error(`${label} must be mode 0600`)
+    } else if ((bits & ~0o644) !== 0 || (bits & 0o400) === 0) {
+      throw new Error(`${label} must be mode 0600 or 0644 at most`)
+    }
+    const buf = Buffer.alloc(st.size)
+    const n = st.size === 0 ? 0 : readSync(fd, buf, 0, st.size, 0)
+    return buf.subarray(0, n).toString('utf8')
+  } finally {
+    closeSync(fd)
+  }
+}
+
 export function loadConfig(path: string): GatewayConfig {
   let parsed: unknown
-  try { parsed = JSON.parse(readFileSync(path, 'utf8')) } catch { throw new Error('gateway config is unreadable') }
+  try { parsed = JSON.parse(readOwnedFile(path, 'gateway config', 'config')) } catch (err) {
+    if (err instanceof Error && err.message.startsWith('gateway config')) throw err
+    if (err instanceof Error && err.message === 'no uid') throw err
+    throw new Error('gateway config is unreadable')
+  }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('gateway config is unreadable')
   const raw = parsed as Record<string, unknown>
   const host = str(raw.host, 'host')
@@ -95,7 +150,7 @@ export function loadConfig(path: string): GatewayConfig {
   const routerUrl = str(raw.routerUrl, 'routerUrl')
   if (!HOST.test(host)) throw new Error('host is invalid')
   if (!USER.test(user)) throw new Error('user is invalid')
-  if (!/^wss?:\/\//.test(routerUrl)) throw new Error('routerUrl must be a websocket url')
+  assertRouterUrl(routerUrl)
   if (!Array.isArray(raw.adapters)) throw new Error('adapters must be a list of kind and transport')
   const adapters: AdapterBinding[] = []
   const seen = new Set<string>()
@@ -122,17 +177,16 @@ export function loadConfig(path: string): GatewayConfig {
   }
 }
 
-/** Mode 0600. The contents are never included in an error. */
+/** Mode 0700. A directory owned by another user refuses startup and is not chmod'd. */
 function privateDir(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 })
+  if (process.getuid === undefined) throw new Error('no uid')
+  if (statSync(path).uid !== process.getuid()) throw new Error('directory is owned by another user')
   chmodSync(path, 0o700)
 }
 
 export function readNodeSecret(path: string): string {
-  const st = statSync(path)
-  if (!st.isFile()) throw new Error('node secret file is not a regular file')
-  if ((st.mode & 0o077) !== 0) throw new Error('node secret file is readable by the group or others')
-  const secret = readFileSync(path, 'utf8').trim()
+  const secret = readOwnedFile(path, 'node secret file', 'secret').trim()
   assertNodeSecret(secret)
   return secret
 }
@@ -280,7 +334,7 @@ async function loadNativeDiscovery(config: GatewayConfig, gateway: Gateway, conf
       gateway,
       bindingsPath: config.bindingsPath,
       readConfig: () => {
-        const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as { discoveries?: unknown; gatewayAliasHosts?: unknown }
+        const parsed = JSON.parse(readOwnedFile(configPath, 'gateway config', 'config')) as { discoveries?: unknown; gatewayAliasHosts?: unknown }
         return {
           discoveries: Array.isArray(parsed.discoveries) ? parsed.discoveries : [],
           gatewayAliasHosts: parsed.gatewayAliasHosts && typeof parsed.gatewayAliasHosts === 'object' ? parsed.gatewayAliasHosts : {},

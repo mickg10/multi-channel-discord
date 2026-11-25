@@ -86,10 +86,28 @@ export function darwinStartTime(info: Uint8Array): string | undefined {
 
 export type ProcessIdentity = { pid: number; exe: string; started: string }
 
+/** Darwin `proc_pidpath` and `proc_bsdinfo` start time. Tests inject `sys` and do not dlopen. */
+export function processIdentityFromDarwin(pid: number, sys: DarwinSys): ProcessIdentity | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined
+  const path = new Uint8Array(4096)
+  const n = sys.pidpath(pid, path)
+  if (n <= 0) return undefined
+  const linked = new TextDecoder().decode(path.subarray(0, n)).replace(/\0+$/, '')
+  let exe: string
+  try { exe = realpathSync(linked) } catch { return undefined }
+  const info = new Uint8Array(PROC_BSDINFO_SIZE)
+  if (sys.pidinfo(pid, PROC_PIDTBSDINFO, info) !== PROC_BSDINFO_SIZE) return undefined
+  const started = darwinStartTime(info)
+  if (!started) return undefined
+  return { pid, exe, started }
+}
+
 /** Live pid, exe realpath, and start time. A reused pid has a different start time. */
 export function processIdentity(pid: number): ProcessIdentity | undefined {
   if (!Number.isInteger(pid) || pid <= 0) return undefined
   try {
+    if (process.platform === 'darwin') return processIdentityFromDarwin(pid, darwinSys())
+    if (process.platform !== 'linux') return undefined
     const started = startTimeFromStat(readFileSync(`/proc/${pid}/stat`, 'utf8'))
     if (!started) return undefined
     return { pid, exe: realpathSync(readlinkSync(`/proc/${pid}/exe`)), started }

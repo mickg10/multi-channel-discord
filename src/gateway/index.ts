@@ -3,7 +3,7 @@ export { FakeAdapter } from './fake-adapter.js'
 export { Gateway, type GatewayOpts } from './gateway.js'
 export { verifyPipePeer, type PeerInfo, type PeerVerdict } from './peer.js'
 export {
-  darwinStartTime, disableCoreDumps, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, readPeer, startTimeFromStat,
+  darwinStartTime, disableCoreDumps, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, readPeer, startTimeFromStat,
   LOCAL_PEERCRED, LOCAL_PEERPID, SO_PEERCRED, SOL_LOCAL, SOL_SOCKET,
   type DarwinSys, type ProcessIdentity,
 } from './peer-cred.js'

@@ -15,15 +15,16 @@ export type PeerInfo = {
 export type PeerVerdict = { ok: true; agents: AgentRec[] } | { ok: false; error: string }
 
 export function verifyPipePeer(peer: PeerInfo, reg: Registry, pipePath?: string): PeerVerdict {
+  if (!pipePath) return { ok: false, error: 'peer is not agent-bus-pipe' }
   let resolved: string
-  try { resolved = realpathSync(peer.exe) } catch { return { ok: false, error: 'peer is not agent-bus-pipe' } }
-  if (pipePath) {
-    let expected: string
-    try { expected = realpathSync(pipePath) } catch { return { ok: false, error: 'peer is not agent-bus-pipe' } }
-    if (resolved !== expected) return { ok: false, error: 'peer is not agent-bus-pipe' }
-  } else if (resolved.split('/').pop() !== 'agent-bus-pipe') {
+  let expected: string
+  try {
+    resolved = realpathSync(peer.exe)
+    expected = realpathSync(pipePath)
+  } catch {
     return { ok: false, error: 'peer is not agent-bus-pipe' }
   }
+  if (resolved !== expected) return { ok: false, error: 'peer is not agent-bus-pipe' }
   const agents = reg.byPid(peer.ppid).filter(agent => agent.started === peer.parentStarted)
   if (agents.length === 0) return { ok: false, error: 'parent is not a registered agent' }
   return { ok: true, agents }
