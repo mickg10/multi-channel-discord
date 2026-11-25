@@ -763,12 +763,23 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
           ...(deps.nodes?.get(s.name) && { node: deps.nodes.get(s.name)!.node }),
           ...row(s.name),
         }))
-        const liveNames = new Set(live.map(s => s.name))
+        const native = []
+        const inboxes = deps.inboxes
+        if (inboxes) for (const name of inboxes.names()) {
+          const target = inboxes.target(name)
+          if (!target) continue
+          native.push({
+            name, projectPath: '', connectedAt: '', node: target.host,
+            state: nativeConnection(inboxes, target) ? 'live' : 'idle',
+            ...row(name),
+          })
+        }
+        const liveNames = new Set([...live, ...native].map(s => s.name))
         const asleep = (deps.nodes?.list() ?? []).filter(a => !liveNames.has(a.name)).map(a => ({
           name: a.name, projectPath: a.cwd ?? '', connectedAt: '', state: 'idle', node: a.node,
           ...row(a.name),
         }))
-        sendToolResult(ws, parsed.requestId, true, JSON.stringify([...live, ...asleep]))
+        sendToolResult(ws, parsed.requestId, true, JSON.stringify([...live, ...native, ...asleep]))
       }
       break
     case 'register':

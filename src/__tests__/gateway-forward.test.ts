@@ -76,7 +76,7 @@ function setup() {
       },
     }
     return {
-      frames, results,
+      frames, results, close: () => handlers.close(ws),
       send: (frame: object) => handlers.message(ws, JSON.stringify(frame)),
     }
   }
@@ -135,7 +135,7 @@ test.each([false, true])('A8 shares legacy handling for every operation (gateway
   expect(JSON.parse(fetched.data)).toMatchObject([{ id: 'message-id', content: 'test message' }])
   const sessions = await call('busSessions')
   expect(sessions.success).toBe(true)
-  expect(Array.isArray(JSON.parse(sessions.data))).toBe(true)
+  expect(JSON.parse(sessions.data)).toEqual(expect.arrayContaining([expect.objectContaining({ name: alias, state: 'live' })]))
 
   expect(JSON.parse((await call('claim', { task: 'already claimed' })).data)).toMatchObject({ won: false, claim: { owner: foreignAlias } })
   expect(JSON.parse((await call('claim', { task: 'mine' })).data)).toMatchObject({ won: true, claim: { owner: alias } })
@@ -209,4 +209,31 @@ test('A8 rejects unregistered, foreign, released, and unsupported gateway calls'
     expect(await response(ws, requestId)).toMatchObject({ success: false, data: 'invalid_as' })
   }
   expect(outbound).toEqual([])
+})
+
+test('both rosters expose gateway aliases once and track disconnect and release', async () => {
+  const { register, connect } = setup()
+  const gw = register(alias, true)
+  const observer = connect()
+  observer.send({ type: 'register', name: 'observer', projectPath: '/' })
+  const node = connect()
+  node.send({ type: 'registerNode', node: 'mac', nodeSecret, agents: [{ name: alias, kind: 'codex' }] })
+
+  gw.send({ type: 'gatewayOp', as: alias, op: 'busSessions', requestId: 'native-roster' })
+  observer.send({ type: 'listSessions', requestId: 'legacy-roster' })
+  const native = await response(gw, 'native-roster')
+  const legacy = await response(observer, 'legacy-roster')
+  expect(native.data).toBe(legacy.data)
+  const rows = (result: WsToolResult) => (JSON.parse(result.data) as { name: string }[]).filter(row => row.name === alias)
+  expect(rows(native)).toEqual([expect.objectContaining({ name: alias, node: 'mac', state: 'live', pending: 0 })])
+
+  gw.close()
+  observer.send({ type: 'listSessions', requestId: 'offline' })
+  expect(rows(await response(observer, 'offline'))).toEqual([expect.objectContaining({ state: 'idle' })])
+
+  const replacement = register(alias, true)
+  replacement.send({ type: 'releaseAgent', alias })
+  node.close()
+  observer.send({ type: 'listSessions', requestId: 'released' })
+  expect(rows(await response(observer, 'released'))).toEqual([])
 })
