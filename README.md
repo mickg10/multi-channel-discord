@@ -318,8 +318,10 @@ continue to own their native identities until explicitly released or rebound.
 An unchanged PID, start time, conversation, and transport keep the current
 generation. After a daemon restart, a fresh complete inventory can register
 the new generation even when the OS reuses the PID. Update an optional binding
-PID assertion when the daemon's numeric PID changes. Pipe credentials with the
-old parent start time cannot authenticate against the new generation.
+PID assertion when the daemon's numeric PID changes. Codex daemon discovery
+verifies the daemon's own kernel peer PID and UID, canonical executable, and
+start time. Pipe authentication still requires the parent PID and start time
+to match the current registration.
 
 Discovery publishes verified Codex control socket paths and OpenCode service
 descriptor paths by conversation for new and unchanged registrations. Unknown

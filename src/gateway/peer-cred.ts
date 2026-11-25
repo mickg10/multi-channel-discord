@@ -116,6 +116,28 @@ export function processIdentity(pid: number): ProcessIdentity | undefined {
   }
 }
 
+/** Authenticate the Darwin socket peer and identify the connecting process. */
+export function processPeerFromDarwin(fd: number, selfUid: number, sys: DarwinSys): ProcessIdentity | undefined {
+  const pidBuf = new Uint8Array(4)
+  const pidLen = new Uint32Array([pidBuf.length])
+  if (sys.getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, pidBuf, pidLen) !== 0 || pidLen[0] !== pidBuf.length) return undefined
+  const cred = new Uint8Array(XUCRED_SIZE)
+  const credLen = new Uint32Array([cred.length])
+  if (sys.getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, cred, credLen) !== 0 || credLen[0] < 8) return undefined
+  const uid = new DataView(cred.buffer).getUint32(4, true)
+  if (uid !== selfUid) return undefined
+  return processIdentityFromDarwin(new DataView(pidBuf.buffer).getInt32(0, true), sys)
+}
+
+function processPeerFromLinux(fd: number, selfUid: number): ProcessIdentity | undefined {
+  const buf = new Uint8Array(12)
+  const len = new Uint32Array([buf.length])
+  if (libc().symbols.getsockopt(fd, SOL_SOCKET, SO_PEERCRED, ptr(buf), ptr(len)) !== 0 || len[0] !== buf.length) return undefined
+  const view = new DataView(buf.buffer)
+  if (view.getUint32(4, true) !== selfUid) return undefined
+  return processIdentity(view.getInt32(0, true))
+}
+
 function linuxStarted(pid: number): string | undefined {
   try { return startTimeFromStat(readFileSync(`/proc/${pid}/stat`, 'utf8')) } catch { return undefined }
 }
@@ -207,6 +229,19 @@ function darwinSys(): DarwinSys {
 function socketFd(sock: Socket): number | undefined {
   const fd = (sock as unknown as { _handle?: { fd?: number } })._handle?.fd
   return typeof fd === 'number' && fd >= 0 ? fd : undefined
+}
+
+/** Same-UID socket peer identity for daemon discovery. */
+export function readProcessPeer(sock: Socket): ProcessIdentity | undefined {
+  const fd = socketFd(sock)
+  if (fd === undefined) return undefined
+  try {
+    if (process.platform === 'linux') return processPeerFromLinux(fd, currentUid())
+    if (process.platform === 'darwin') return processPeerFromDarwin(fd, currentUid(), darwinSys())
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** Peer identity for a gateway socket. Missing credentials fail closed (`undefined`). */

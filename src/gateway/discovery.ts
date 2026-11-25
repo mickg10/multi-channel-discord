@@ -6,7 +6,7 @@ import { connectCodexUnix, inspectSocket, sameSocket, supportedVersion } from '.
 import { openOpencodeListing, type OpencodeListingFetch } from './adapters/opencode.js'
 import type { Gateway } from './gateway.js'
 import { setCodexControlSocket, setOpencodeServicePath } from './host.js'
-import { processIdentity, readPeer, type ProcessIdentity } from './peer-cred.js'
+import { processIdentity, readProcessPeer, type ProcessIdentity } from './peer-cred.js'
 import type { AgentRec } from './registry.js'
 import { assertAlias, identityKey } from './types.js'
 
@@ -252,7 +252,7 @@ async function resolveCodexPeer(path: string, signal: AbortSignal): Promise<Proc
   try {
     const peer = await new Promise<ProcessIdentity | undefined>((resolve, reject) => {
       socket.once('connect', () => {
-        try { resolve(readPeer(socket)) } catch (error) { reject(error) }
+        try { resolve(readProcessPeer(socket)) } catch (error) { reject(error) }
       })
       socket.once('error', reject)
       socket.once('close', () => resolve(undefined))

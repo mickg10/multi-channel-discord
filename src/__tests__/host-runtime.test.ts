@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { FakeAdapter, Registry, adaptersFor, builtinAdapters, darwinStartTime, loadConfig, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, readNodeSecret, setOpencodeServicePath, startHost, startTimeFromStat, verifyPipePeer, type Adapter, type AdapterBinding, type DarwinSys, type GatewayToRouterMessage } from '../gateway/index.js'
+import { FakeAdapter, Registry, adaptersFor, builtinAdapters, darwinStartTime, loadConfig, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, processPeerFromDarwin, readNodeSecret, setOpencodeServicePath, startHost, startTimeFromStat, verifyPipePeer, type Adapter, type AdapterBinding, type DarwinSys, type GatewayToRouterMessage } from '../gateway/index.js'
 import { buildNudge, type Target } from '../types.js'
 import { LOCAL_PEERCRED, LOCAL_PEERPID, SOL_LOCAL } from '../gateway/peer-cred.js'
 
@@ -497,5 +497,72 @@ describe('peer credentials', () => {
     expect(identified).toEqual({ pid: 40, exe: realpathSync(pipeBin), started: 'darwin:10.4' })
     expect(processIdentityFromDarwin(0, sys())).toBeUndefined()
     expect(processIdentityFromDarwin(40, { ...sys(), pidpath: () => 0 })).toBeUndefined()
+  })
+
+  test('Darwin daemon discovery identifies a peer whose launchd parent cannot be inspected', async () => {
+    const dir = await tempDir()
+    try {
+      const exe = join(dir, 'codex')
+      const link = join(dir, 'codex-link')
+      writeFileSync(exe, '', { mode: 0o700 })
+      symlinkSync(exe, link)
+      const inspected: number[] = []
+      const sys: DarwinSys = {
+        getsockopt(fd, level, name, buf) {
+          expect(fd).toBe(3)
+          expect(level).toBe(SOL_LOCAL)
+          const view = new DataView(buf.buffer)
+          if (name === LOCAL_PEERPID) view.setInt32(0, 40, true)
+          else if (name === LOCAL_PEERCRED) view.setUint32(4, 7, true)
+          else return -1
+          return 0
+        },
+        pidpath(pid, buf) {
+          expect(pid).toBe(40)
+          const path = new TextEncoder().encode(link)
+          buf.set(path)
+          return path.length
+        },
+        pidinfo(pid, flavor, buf) {
+          expect(flavor).toBe(3)
+          inspected.push(pid)
+          if (pid !== 40) return 0
+          const view = new DataView(buf.buffer)
+          view.setUint32(16, 1, true)
+          view.setBigUint64(120, 10n, true)
+          view.setBigUint64(128, 4n, true)
+          return buf.length
+        },
+      }
+      expect(processPeerFromDarwin(3, 7, sys)).toEqual({ pid: 40, exe: realpathSync(exe), started: 'darwin:10.4' })
+      expect(inspected).toEqual([40])
+      expect(peerFromDarwin(3, 7, sys)).toBeUndefined()
+      expect(inspected).toEqual([40, 40, 1])
+
+      expect(processPeerFromDarwin(3, 8, sys)).toBeUndefined()
+      for (const option of [LOCAL_PEERPID, LOCAL_PEERCRED]) {
+        expect(processPeerFromDarwin(3, 7, {
+          ...sys,
+          getsockopt: (...args) => args[2] === option ? -1 : sys.getsockopt(...args),
+        })).toBeUndefined()
+        expect(processPeerFromDarwin(3, 7, {
+          ...sys,
+          getsockopt(...args) {
+            const result = sys.getsockopt(...args)
+            if (args[2] === option) args[4][0] = 0
+            return result
+          },
+        })).toBeUndefined()
+      }
+      expect(processPeerFromDarwin(3, 7, {
+        ...sys,
+        getsockopt: (...args) => args[2] === LOCAL_PEERPID ? 0 : sys.getsockopt(...args),
+      })).toBeUndefined()
+      expect(processPeerFromDarwin(3, 7, { ...sys, pidpath: () => 0 })).toBeUndefined()
+      expect(processPeerFromDarwin(3, 7, { ...sys, pidinfo: () => 120 })).toBeUndefined()
+      expect(inspected).toEqual([40, 40, 1])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
