@@ -14,6 +14,7 @@
     "plugin": "bun run src/plugin.ts",
     "check": "bun x tsc --noEmit",
     "test": "bun test",
+    "build:pipe": "bun build --compile bin/agent-bus-pipe.ts --outfile dist/agent-bus-pipe",
     "router": "bun install --no-summary 1>&2 && bun src/router.ts",
     "client": "bun src/plugin.ts"
   },

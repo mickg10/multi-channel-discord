@@ -1,4 +1,4 @@
-import { readFileSync, readlinkSync } from 'node:fs'
+import { readFileSync, readlinkSync, realpathSync } from 'node:fs'
 import type { Socket } from 'node:net'
 import { dlopen, FFIType, ptr } from 'bun:ffi'
 import type { PeerInfo } from './peer.js'
@@ -64,9 +64,42 @@ export function ppidFromStat(text: string): number | undefined {
   return Number.isInteger(ppid) && ppid > 0 ? ppid : undefined
 }
 
-function identity(pid: number, uid: number, selfUid: number, exe: string | undefined, ppid: number | undefined): PeerInfo | undefined {
-  if (pid <= 0 || uid !== selfUid || !exe || ppid === undefined || ppid <= 0) return undefined
-  return { pid, exe, ppid }
+/** Field 22 of `/proc/<pid>/stat` (index 19 after the command word). */
+export function startTimeFromStat(text: string): string | undefined {
+  const end = text.lastIndexOf(')')
+  if (end < 0) return undefined
+  const ticks = text.slice(end + 1).trim().split(/\s+/)[19]
+  if (!ticks || !/^\d+$/.test(ticks)) return undefined
+  return `linux:${ticks}`
+}
+
+const DARWIN_START_SEC = 120
+const DARWIN_START_USEC = 128
+
+export function darwinStartTime(info: Uint8Array): string | undefined {
+  if (info.byteLength < DARWIN_START_USEC + 8) return undefined
+  const view = new DataView(info.buffer, info.byteOffset, info.byteLength)
+  const sec = view.getBigUint64(DARWIN_START_SEC, true)
+  const usec = view.getBigUint64(DARWIN_START_USEC, true)
+  return `darwin:${sec}.${usec}`
+}
+
+export type ProcessIdentity = { pid: number; exe: string; started: string }
+
+/** Live pid, exe realpath, and start time. A reused pid has a different start time. */
+export function processIdentity(pid: number): ProcessIdentity | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined
+  try {
+    const started = startTimeFromStat(readFileSync(`/proc/${pid}/stat`, 'utf8'))
+    if (!started) return undefined
+    return { pid, exe: realpathSync(readlinkSync(`/proc/${pid}/exe`)), started }
+  } catch {
+    return undefined
+  }
+}
+
+function linuxStarted(pid: number): string | undefined {
+  try { return startTimeFromStat(readFileSync(`/proc/${pid}/stat`, 'utf8')) } catch { return undefined }
 }
 
 function currentUid(): number {
@@ -86,7 +119,10 @@ export function peerFromLinux(fd: number, selfUid = currentUid()): PeerInfo | un
   try { exe = readlinkSync(`/proc/${pid}/exe`) } catch { return undefined }
   let ppid: number | undefined
   try { ppid = ppidFromStat(readFileSync(`/proc/${pid}/stat`, 'utf8')) } catch { return undefined }
-  return identity(pid, uid, selfUid, exe, ppid)
+  const started = linuxStarted(pid)
+  const parentStarted = ppid !== undefined && ppid > 0 ? linuxStarted(ppid) : undefined
+  if (pid <= 0 || uid !== selfUid || !exe || ppid === undefined || ppid <= 0 || !started || !parentStarted) return undefined
+  return { pid, exe, ppid, started, parentStarted }
 }
 
 /**
@@ -108,8 +144,14 @@ export function peerFromDarwin(fd: number, selfUid: number, sys: DarwinSys): Pee
   const exe = new TextDecoder().decode(path.subarray(0, n)).replace(/\0+$/, '')
   const info = new Uint8Array(PROC_BSDINFO_SIZE)
   if (sys.pidinfo(pid, PROC_PIDTBSDINFO, info) !== PROC_BSDINFO_SIZE) return undefined
-  const ppid = new DataView(info.buffer, info.byteOffset, info.byteLength).getUint32(PPID_OFFSET, true)
-  return identity(pid, uid, selfUid, exe, ppid)
+  const view = new DataView(info.buffer, info.byteOffset, info.byteLength)
+  const ppid = view.getUint32(PPID_OFFSET, true)
+  const started = darwinStartTime(info)
+  const parentInfo = new Uint8Array(PROC_BSDINFO_SIZE)
+  if (sys.pidinfo(ppid, PROC_PIDTBSDINFO, parentInfo) !== PROC_BSDINFO_SIZE) return undefined
+  const parentStarted = darwinStartTime(parentInfo)
+  if (pid <= 0 || uid !== selfUid || !exe || ppid <= 0 || !started || !parentStarted) return undefined
+  return { pid, exe, ppid, started, parentStarted }
 }
 
 type DarwinLib = {

@@ -3,14 +3,14 @@ export { FakeAdapter } from './fake-adapter.js'
 export { Gateway, type GatewayOpts } from './gateway.js'
 export { verifyPipePeer, type PeerInfo, type PeerVerdict } from './peer.js'
 export {
-  disableCoreDumps, peerFromDarwin, peerFromLinux, ppidFromStat, readPeer,
+  darwinStartTime, disableCoreDumps, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, readPeer, startTimeFromStat,
   LOCAL_PEERCRED, LOCAL_PEERPID, SO_PEERCRED, SOL_LOCAL, SOL_SOCKET,
-  type DarwinSys,
+  type DarwinSys, type ProcessIdentity,
 } from './peer-cred.js'
 export { splicePipe } from './pipe.js'
 export {
-  adaptersByKind, gatewayMain, loadConfig, readNodeSecret, registerAdapter, startHost,
-  type GatewayConfig, type HostHandle,
+  adaptersFor, builtinAdapters, gatewayMain, loadConfig, readNodeSecret, registerAdapter, setCodexControlSocket, startHost,
+  type AdapterBinding, type DiscoveryControl, type GatewayConfig, type HostHandle,
 } from './host.js'
 export { Registry, type AgentRec } from './registry.js'
 export { RouterLink } from './router-link.js'

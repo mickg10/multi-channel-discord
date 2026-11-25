@@ -6,12 +6,12 @@ import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  FakeAdapter, Gateway, WakeStore, buildNudge, makeNudge, nudgeNumber, nudgeText, redactFrame,
+  FakeAdapter, Gateway, RouterLink, WakeStore, buildNudge, makeNudge, nudgeNumber, nudgeText, redactFrame,
   type GatewayToRouterMessage, type LeaseResult, type PeerInfo,
 } from '../gateway/index.js'
 
-const parent = { host: 'nas642', user: 'mickg', kind: 'codex' as const, conv: 'parent-conv', alias: 'codex@nas642:parent', pid: 10, cwd: '/work/src', transport: 'codex-queue' as const }
-const child = { host: 'nas642', user: 'mickg', kind: 'codex' as const, conv: 'child-conv', alias: 'codex@nas642:child', pid: 11, cwd: '/work/src', transport: 'codex-queue' as const }
+const parent = { host: 'nas642', user: 'mickg', kind: 'codex' as const, conv: 'parent-conv', alias: 'codex@nas642:parent', pid: 10, cwd: '/work/src', transport: 'codex-queue' as const, started: 'linux:1' }
+const child = { host: 'nas642', user: 'mickg', kind: 'codex' as const, conv: 'child-conv', alias: 'codex@nas642:child', pid: 11, cwd: '/work/src', transport: 'codex-queue' as const, started: 'linux:1' }
 
 const pipeRoot = join(tmpdir(), `agent-bus-pipe-bin-${process.pid}`)
 mkdirSync(pipeRoot, { recursive: true })
@@ -85,7 +85,7 @@ function rpc(sock: string, setPeer: (peer: PeerInfo | undefined) => void, who: P
   })
 }
 
-const pipe = (ppid: number): PeerInfo => ({ pid: 100 + ppid, exe: pipeBin, ppid })
+const pipe = (ppid: number): PeerInfo => ({ pid: 100 + ppid, exe: pipeBin, ppid, started: 'linux:2', parentStarted: 'linux:1' })
 
 describe('gateway skeleton', () => {
   test('registerGateway requires a node secret and does not log it', () => {
@@ -115,7 +115,7 @@ describe('gateway skeleton', () => {
       for (const [i, row] of cases.entries()) {
         row.gw.registerAgent({
           host: row.host, user: 'mickg', kind: row.kind, conv: `conv-${i}`,
-          alias: row.alias, pid: 200 + i, transport: row.kind === 'opencode' ? 'opencode-queue' : 'codex-queue',
+          alias: row.alias, pid: 200 + i, started: 'linux:1', transport: row.kind === 'opencode' ? 'opencode-queue' : 'codex-queue',
         })
         expect(row.gw.registry.byAlias(row.alias)?.conv).toBe(`conv-${i}`)
         expect(frames.some(frame =>
@@ -126,7 +126,7 @@ describe('gateway skeleton', () => {
       // A foreign-looking name is not parsed. The record's host is the gateway's.
       nas.registerAgent({
         host: 'nas642', user: 'mickg', kind: 'codex', conv: 'foreign-shape',
-        alias: 'codex@mac', pid: 299, transport: 'codex-queue',
+        alias: 'codex@mac', pid: 299, started: 'linux:1', transport: 'codex-queue',
       })
       expect(nas.registry.byAlias('codex@mac')?.host).toBe('nas642')
       expect(frames.some(frame =>
@@ -135,12 +135,12 @@ describe('gateway skeleton', () => {
       for (const alias of ['', 'codex@nas642:bad name', 'human', 'admin', 'user', 'me', 'all', 'all:synthesis', 'router', '@all', '@all:independent', 'Human']) {
         expect(() => nas.registerAgent({
           host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
-          alias, pid: 300, transport: 'codex-queue',
+          alias, pid: 300, started: 'linux:1', transport: 'codex-queue',
         })).toThrow('invalid alias')
       }
       expect(() => mac.registerAgent({
         host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
-        alias: 'codex@mac:infra', pid: 301, transport: 'codex-queue',
+        alias: 'codex@mac:infra', pid: 301, started: 'linux:1', transport: 'codex-queue',
       })).toThrow('host mismatch')
     } finally {
       await nas.close()
@@ -189,7 +189,7 @@ describe('gateway skeleton', () => {
       expect(stolen.ok).toBe(false)
       expect(g.frames.filter(frame => frame.type === 'ack').every(frame => frame.as === child.alias)).toBe(true)
 
-      const stranger = await rpc(g.sock, g.setPeer, { pid: 9, exe: '/bin/bash', ppid: child.pid }, { op: 'check_inbox', conv: child.conv })
+      const stranger = await rpc(g.sock, g.setPeer, { pid: 9, exe: '/bin/bash', ppid: child.pid, started: 'linux:2', parentStarted: 'linux:1' }, { op: 'check_inbox', conv: child.conv })
       expect(stranger.ok).toBe(false)
       expect(JSON.stringify(stranger)).not.toContain('SECRET')
       const mode = (await stat(g.sock)).mode & 0o777
@@ -197,9 +197,11 @@ describe('gateway skeleton', () => {
       expect((await stat(g.dir)).mode & 0o777).toBe(0o700)
       const link = join(g.dir, 'agent-bus-pipe')
       symlinkSync('/bin/bash', link)
-      const viaLink = await rpc(g.sock, g.setPeer, { pid: 8, exe: link, ppid: child.pid }, { op: 'check_inbox', conv: child.conv })
+      const viaLink = await rpc(g.sock, g.setPeer, { pid: 8, exe: link, ppid: child.pid, started: 'linux:2', parentStarted: 'linux:1' }, { op: 'check_inbox', conv: child.conv })
       expect(viaLink).toMatchObject({ ok: false, error: 'peer is not agent-bus-pipe' })
-      const missingExe = await rpc(g.sock, g.setPeer, { pid: 7, exe: join(g.dir, 'missing-agent-bus-pipe'), ppid: child.pid }, { op: 'check_inbox', conv: child.conv })
+      const missingExe = await rpc(g.sock, g.setPeer, { pid: 7, exe: join(g.dir, 'missing-agent-bus-pipe'), ppid: child.pid, started: 'linux:2', parentStarted: 'linux:1' }, { op: 'check_inbox', conv: child.conv })
+      const reused = await rpc(g.sock, g.setPeer, { ...pipe(child.pid), parentStarted: 'linux:999' }, { op: 'check_inbox', conv: child.conv })
+      expect(reused).toMatchObject({ ok: false, error: 'parent is not a registered agent' })
       expect(missingExe).toMatchObject({ ok: false, error: 'peer is not agent-bus-pipe' })
       expect(g.frames.some(frame => frame.type === 'registerGateway' && frame.proto === 1 && frame.secret === 'node-secret')).toBe(true)
       expect(JSON.stringify(g.audit)).not.toContain('node-secret')
@@ -473,6 +475,33 @@ describe('gateway skeleton', () => {
       await closed
       expect(g.frames.some(frame => frame.type === 'lease')).toBe(false)
     } finally { await g.gw.close() }
+  })
+
+  test('a dropped router link rejects an outstanding lease', async () => {
+    const link = new RouterLink('node-secret', () => {})
+    const pending = link.lease('codex@nas642:parent')
+    link.failPending(new Error('router link down'))
+    await expect(pending).rejects.toThrow('router link down')
+  })
+
+  test('a verified pipe reports the connection before any line is read', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'gw-hook-'))
+    const seen: string[] = []
+    const gw = new Gateway({
+      host: 'nas642', user: 'mickg', secret: 'node-secret', storePath: join(dir, 'wakes.json'),
+      send: () => {}, readPeer: () => pipe(parent.pid),
+      onVerifiedConnection: (_sock, agents) => { seen.push(agents.map(agent => agent.alias).join(',')) },
+    })
+    gw.registerAgent(parent)
+    const sock = join(dir, 'gw.sock')
+    await gw.listen(sock)
+    try {
+      const socket = connect(sock)
+      await new Promise<void>((resolve, reject) => { socket.once('connect', () => resolve()); socket.once('error', reject) })
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(seen).toEqual([parent.alias])
+      socket.end()
+    } finally { await gw.close() }
   })
 
   test('a bad wake store is left untouched', async () => {
