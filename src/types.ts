@@ -373,6 +373,7 @@ export interface LeasedMessage {
 export interface LeaseResult {
   readonly messages: readonly LeasedMessage[]
   readonly receipt?: string
+  readonly receipt_status?: 'stale'
   readonly unread: number
 }
 
@@ -384,6 +385,7 @@ export interface PublishResult {
 export type GatewayToRouterMessage =
   | { type: 'registerGateway'; host: string; user: string; proto: 1; secret: string; requestId?: string }
   | { type: 'registerAgent'; kind: Kind; conv: string; alias: string; host?: string; requestId?: string }
+  | { type: 'releaseAgent'; alias: string; requestId?: string }
   | { type: 'agentStatus'; as: string; requestId: string }
   | { type: 'lease'; as: string; requestId: string; receipt?: string }
   | { type: 'ack'; as: string; requestId: string; leaseId: string; id: string; receipt: string }
@@ -394,5 +396,7 @@ export type GatewayToRouterMessage =
 export type RouterToGatewayMessage =
   | { type: 'gatewayRegistered'; host: string; user: string; proto: 1 }
   | { type: 'agentRegistered'; as: string; target: Target }
-  | { type: 'wake'; as: string; nudge: Nudge; reconcile?: true }
+  | { type: 'agentReleased'; alias: string }
+  | { type: 'replaced'; name: string }
+  | { type: 'wake'; as: string; msgId: string; n: number; reconcile?: true }
   | WsToolResult | WsError
