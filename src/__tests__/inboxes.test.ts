@@ -1,18 +1,19 @@
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { INBOX_MAX, Inboxes, LEASE_MS } from '../inboxes.js'
+import { INBOX_MAX, Inboxes, LEASE_MS, PUBLISH_TTL_MS } from '../inboxes.js'
 import { NodeRegistry } from '../nodes.js'
 import { ProjectHistory, SessionManager } from '../sessions.js'
-import { nudgeText, type LeaseResult } from '../types.js'
+import { buildNudge, type Kind, type LeaseResult } from '../types.js'
 import { Conversations, WakeBudget } from '../wake.js'
 import { createWsHandlers, deliver, resetBusRateLimit, type WsDeps, type WsLike } from '../ws.js'
 
 const dirs: string[] = []
 const alias = 'codex@mac:one'
 const other = 'codex@mac:two'
+const tick = () => new Promise(resolve => setTimeout(resolve, 0))
 const secret = 'test-node-secret'
 const digest = createHash('sha256').update(secret).digest('hex')
 type Frame = { type: string; requestId?: string; success?: boolean; data?: string; [key: string]: unknown }
@@ -33,21 +34,22 @@ function router(dir: string, extra: Partial<WsDeps> = {}) {
     sessions: new SessionManager(), history: new ProjectHistory(dir), inboxes: Inboxes.inStateDir(dir),
     nodes: new NodeRegistry(), conversations: new Conversations(), busChannelId: 'bus',
     client: { channels: { fetch: async () => null } } as unknown as WsDeps['client'],
-    nodeSecrets: () => ({ hashes: { mac: digest, nas: digest }, require: false }),
+    nodeSecrets: () => ({ hashes: { mac: digest, nas: digest, nas642: digest }, require: false }),
     chatId: () => null, chunkLimit: 2000, chunkMode: 'length', replyToMode: 'first', ...extra,
   }
   const handlers = createWsHandlers(deps)
   function connect() {
     const frames: Frame[] = []
     let fail: ((frame: Frame) => boolean) | undefined
-    const ws: WsLike = { data: { sessionName: null, sendCallback: null }, send: parse }
+    const closed = spyOn({ close: () => {} }, 'close')
+    const ws: WsLike = { data: { sessionName: null, sendCallback: null }, send: parse, close: closed }
     function parse(raw: string) {
       const frame = JSON.parse(raw) as Frame
       if (fail?.(frame)) throw new Error('socket closed')
       frames.push(frame)
     }
     return {
-      frames, failWhen: (predicate: (frame: Frame) => boolean) => { fail = predicate },
+      frames, closed, failWhen: (predicate: (frame: Frame) => boolean) => { fail = predicate },
       close: () => handlers.close({ ...ws }),
       send: (frame: object) => handlers.message({ ...ws }, JSON.stringify(frame)),
       result: (requestId: string) => frames.findLast(frame => frame.requestId === requestId),
@@ -61,11 +63,11 @@ function gateway(ws: Connection, host = 'mac') {
   ws.send({ type: 'registerGateway', host, user: 'mick', proto: 1, secret })
   expect(ws.frames.at(-1)?.type).toBe('gatewayRegistered')
 }
-function agent(ws: Connection, name: string, conv: string) {
-  ws.send({ type: 'registerAgent', kind: 'codex', conv, alias: name })
+function agent(ws: Connection, name: string, conv: string, kind: Kind = 'codex') {
+  ws.send({ type: 'registerAgent', kind, conv, alias: name })
 }
-function legacy(ws: Connection, name: string, mode = 'push') {
-  ws.send({ type: 'register', name, mode, projectPath: '/project' })
+function legacy(ws: Connection, name: string, mode = 'push', conversationId?: string) {
+  ws.send({ type: 'register', name, mode, projectPath: '/project', conversationId })
 }
 function lease(ws: Connection, name: string, receipt?: string): LeaseResult {
   ws.send({ type: 'lease', as: name, requestId: 'lease', ...(receipt && { receipt }) })
@@ -96,7 +98,8 @@ test('a lost publish reply deduplicates every target across restart and Discord 
   const retry = b.connect()
   legacy(retry, 'sender')
   retry.send(post)
-  expect(JSON.parse(retry.result('publish')!.data!)).toEqual({ publish_id: 'client-token', committed: [alias, other] })
+  await tick()
+  expect(JSON.parse(retry.result('publish')!.data!)).toEqual({ publish_id: 'client-token', committed: [alias, other], mirror: 'failed' })
   expect([alias, other].map(name => b.inboxes.list(b.inboxes.key(name)).map(entry => entry.id))).toEqual(firstIds.map(id => [id]))
 })
 
@@ -128,13 +131,16 @@ test('a lost lease survives restart and only the current receipt acknowledges th
   const realNow = Date.now
   Date.now = () => pending.lease!.until + 1
   try {
-    const next = lease(reconnect, alias)
+    const next = lease(reconnect, alias, pending.lease!.receipt)
+    expect(next.receipt_status).toBe('stale')
     expect(next.messages).toMatchObject([{ id: pending.id, from: 'original', from_human: true, body: 'hello' }])
     expect(next.receipt).not.toBe(pending.lease!.receipt)
     reconnect.send({ type: 'lease', as: alias, receipt: pending.lease!.receipt, requestId: 'stale' })
-    expect(reconnect.result('stale')?.data).toBe('invalid_receipt')
+    expect(JSON.parse(reconnect.result('stale')!.data!)).toMatchObject({ messages: [], receipt_status: 'stale' })
     expect(lease(reconnect, alias, next.receipt).messages).toEqual([])
     expect(b.inboxes.count(alias)).toBe(0)
+    reconnect.send({ type: 'lease', as: other, receipt: next.receipt, requestId: 'consumed-foreign' })
+    expect(reconnect.result('consumed-foreign')?.data).toBe('invalid_receipt')
   } finally { Date.now = realNow }
 })
 
@@ -197,6 +203,8 @@ test('gateway host authentication and ownership apply across socket wrappers and
   expect(old.frames.at(-1)?.type).toBe('replaced')
   const replacement = a.connect()
   gateway(replacement)
+  expect(gw.frames.at(-1)).toEqual({ type: 'replaced', name: 'mac' })
+  expect(gw.closed).toHaveBeenCalledTimes(1)
   agent(replacement, alias, 'A')
   gw.send({ type: 'lease', as: alias, requestId: 'stale' })
   expect(gw.result('stale')?.data).toBe('gateway_not_registered')
@@ -214,10 +222,8 @@ test('restart reconciles one durable wake and held remains final', () => {
   deliver(a.deps, alias, 'second', {})
   const sent = gw.frames.filter(frame => frame.type === 'wake')
   expect(sent).toHaveLength(1)
-  const { msgId, text, clientId } = sent[0]!.nudge as { msgId: string; text: string; clientId: string }
-  const hash = createHash('sha256').update('A:' + msgId).digest('hex')
-  expect(text).toBe(nudgeText(parseInt(hash.slice(0, 13), 16)))
-  expect(clientId).toBe('bus-' + hash.slice(0, 32))
+  const msgId = sent[0]!.msgId as string
+  expect(sent[0]).toEqual({ type: 'wake', as: alias, msgId, n: 1 })
   expect(a.inboxes.get(msgId)?.state).toBe('uncertain')
 
   const b = router(dir)
@@ -229,7 +235,15 @@ test('restart reconciles one durable wake and held remains final', () => {
   expect(next.result('held')?.success).toBe(true)
   next.send({ type: 'mark', as: alias, id: msgId, state: 'uncertain', requestId: 'retry' })
   expect(next.result('retry')?.data).toBe('invalid_wake_transition')
-  expect(lease(next, alias).messages.map(message => message.state)).toEqual(['held', 'committed'])
+  const pending = lease(next, alias)
+  expect(pending.messages.map(message => message.state)).toEqual(['held', 'committed'])
+  lease(next, alias, pending.receipt)
+  const c = router(dir)
+  const third = c.connect()
+  gateway(third)
+  agent(third, alias, 'A')
+  deliver(c.deps, alias, 'new message', {})
+  expect(third.frames.find(frame => frame.type === 'wake')).toMatchObject({ n: 2 })
 })
 
 test('startup migrates legacy mail and ignores an incomplete final append', () => {
@@ -253,4 +267,259 @@ test('startup migrates legacy mail and ignores an incomplete final append', () =
   const b = router(dir).inboxes
   const key = b.key(alias)
   expect(b.lease(key, undefined, Date.now() + LEASE_MS + 1).messages[0]?.id).toBe(first.messages[0]?.id)
+})
+
+test.each([
+  ['claude', '252c7b9aaa481d9789fcd8fe9b6af065'],
+  ['codex', 'bus-252c7b9aaa481d9789fcd8fe9b6af065'],
+  ['opencode', 'msg_bus252c7b9aaa481d9789fcd8fe'],
+  ['grok', '252c7b9aaa481d9789fcd8fe9b6af065'],
+  ['agy', '252c7b9aaa481d9789fcd8fe9b6af065'],
+] satisfies [Kind, string][])('buildNudge matches the fixed %s vector', (kind, clientId) => {
+  expect(buildNudge(kind, 'conversation-42', 'bus-message-7', 12)).toEqual({
+    msgId: 'bus-message-7', clientId, text: '[agent-bus] mail waiting (id 12) — call check_inbox',
+  })
+  expect(() => buildNudge(kind, 'conversation-42', '', 12)).toThrow('Invalid bus message id')
+  expect(() => buildNudge(kind, 'conversation-42', 'bus-message-7', -1)).toThrow('Invalid nudge id')
+})
+
+test('unknown receipts leave current leases alone and do not block other mail', () => {
+  const inboxes = new Inboxes()
+  inboxes.push('recipient', 'first', {})
+  const old = inboxes.lease('recipient')
+  inboxes.push('recipient', 'second', {})
+  const next = inboxes.lease('recipient', 'unknown')
+  expect(next.receipt_status).toBe('stale')
+  expect(next.messages.map(message => message.body)).toEqual(['second'])
+  inboxes.lease('recipient', old.receipt)
+  expect(inboxes.count('recipient')).toBe(1)
+})
+
+test.each([{ records: 3, bytes: Infinity }, { records: Infinity, bytes: 1 }])(
+  'online compaction preserves live leases and removes expired publish dedup records',
+  limits => {
+    const dir = directory()
+    const path = join(dir, 'inboxes.jsonl')
+    const inboxes = Inboxes.inStateDir(dir, limits)
+    const now = Date.now()
+    inboxes.commit([{ name: 'recipient', content: 'pending', meta: {} }], {
+      key: 'expired', at: now - PUBLISH_TTL_MS, result: { publish_id: 'expired', committed: ['recipient'] },
+    })
+    const old = inboxes.lease('recipient')
+    inboxes.commit([], { key: 'fresh', at: now, result: { publish_id: 'fresh', committed: [] } })
+    expect(readFileSync(path, 'utf8')).not.toContain('"publish_id":"expired"')
+    const restarted = Inboxes.inStateDir(dir)
+    expect(restarted.publish('fresh')?.result.publish_id).toBe('fresh')
+    expect(restarted.lease('recipient', old.receipt).messages).toEqual([])
+    expect(restarted.count('recipient')).toBe(0)
+  },
+)
+
+test('startup reports the path and line of corrupt records and saves an intact copy', () => {
+  const dir = directory()
+  const path = join(dir, 'inboxes.jsonl')
+  const source = '{"op":"commit","entries":[]}\n{"private":"corrupt"\n{"op":"commit","entries":[]}\n'
+  writeFileSync(path, source, { mode: 0o600 })
+  const output = spyOn(process.stderr, 'write').mockImplementation(() => true)
+  try {
+    expect(() => Inboxes.inStateDir(dir)).toThrow('line 2')
+    const copy = readdirSync(dir).find(name => name.startsWith('inboxes.jsonl.corrupt-'))
+    expect(copy).toBeDefined()
+    expect(readFileSync(join(dir, copy!), 'utf8')).toBe(source)
+    expect(readFileSync(path, 'utf8')).toBe(source)
+    const logged = output.mock.calls.map(call => String(call[0])).join('')
+    expect(logged).toContain(path + ' line 2')
+    expect(logged).not.toContain('"private"')
+  } finally { output.mockRestore() }
+})
+
+test('a changed legacy conversation receives ordinary mail and only its own approvals', () => {
+  const dir = directory()
+  const a = router(dir)
+  const before = a.connect()
+  legacy(before, 'legacy', 'pull', 'old')
+  deliver(a.deps, 'legacy', 'ordinary', {})
+  deliver(a.deps, 'legacy', 'old approval', { from_human: 'true', question_id: 'q1' })
+  const b = router(dir)
+  const after = b.connect()
+  legacy(after, 'legacy', 'pull', 'new')
+  after.send({ type: 'inboxPull', requestId: 'pull' })
+  expect(JSON.parse(after.result('pull')!.data!).map((entry: { content: string }) => entry.content)).toEqual(['ordinary'])
+  expect(b.inboxes.count('legacy')).toBe(1)
+})
+
+test('native registration preserves each existing alias verbatim and rekeys its queued mail', () => {
+  const a = router(directory())
+  const mac = a.connect(), nas = a.connect()
+  gateway(mac)
+  gateway(nas, 'nas642')
+  const fixtures = [
+    [nas, 'codex@nas642', 'codex'],
+    [mac, 'codex@mac', 'codex'],
+    [nas, 'codex-photos@nas642', 'codex'],
+    [nas, 'opencode_nas642_glm53_abli', 'opencode'],
+  ] satisfies [Connection, string, Kind][]
+  for (const [gw, name, kind] of fixtures) {
+    a.inboxes.push(name, 'queued for ' + name, { from: 'original' })
+    agent(gw, name, name, kind)
+    expect(gw.frames.findLast(frame => frame.type === 'agentRegistered')?.as).toBe(name)
+    expect(lease(gw, name).messages).toMatchObject([{ body: 'queued for ' + name, from: 'original' }])
+  }
+})
+
+test('only the gateway owner can release an alias and old identity mail survives a rollback', () => {
+  const dir = directory()
+  const a = router(dir)
+  const gw = a.connect(), foreign = a.connect()
+  gateway(gw)
+  gateway(foreign, 'nas')
+  agent(gw, alias, 'A')
+  deliver(a.deps, alias, 'old native mail', {})
+  foreign.send({ type: 'releaseAgent', alias, requestId: 'foreign-release' })
+  expect(foreign.result('foreign-release')?.data).toBe('invalid_as')
+  const old = a.connect()
+  legacy(old, alias)
+  expect(old.frames.at(-1)?.type).toBe('replaced')
+  gw.send({ type: 'releaseAgent', alias, requestId: 'release' })
+  expect(gw.result('release')?.success).toBe(true)
+
+  const b = router(dir)
+  const rollback = b.connect()
+  legacy(rollback, alias)
+  expect(rollback.frames.at(-1)?.type).toBe('registered')
+  const restarted = b.connect()
+  gateway(restarted)
+  agent(restarted, alias, 'B')
+  expect(lease(restarted, alias).messages).toEqual([])
+  agent(restarted, alias, 'A')
+  expect(lease(restarted, alias).messages).toMatchObject([{ body: 'old native mail' }])
+})
+
+function discord(send: (content: string) => { id: string } | Promise<{ id: string }>): WsDeps['client'] {
+  return { channels: { fetch: async () => ({
+    isTextBased: () => true, send: async (message: { content: string }) => send(message.content),
+  }) } } as unknown as WsDeps['client']
+}
+
+test('human-only Discord failure is retryable without reporting an empty success', async () => {
+  const dir = directory()
+  const a = router(dir)
+  const sender = a.connect()
+  legacy(sender, 'sender')
+  const post = { type: 'busPost', to: 'human', text: 'hello human', publish_id: 'opaque', requestId: 'post' }
+  sender.send(post)
+  await tick()
+  expect(sender.result('post')).toMatchObject({ success: false, data: 'discord_unavailable' })
+  const sent: string[] = []
+  const b = router(dir, { client: discord(content => { sent.push(content); return { id: 'discord-id' } }) })
+  const retry = b.connect()
+  legacy(retry, 'sender')
+  retry.send(post)
+  await tick()
+  expect(retry.result('post')?.success).toBe(true)
+  expect(sent).toEqual(['**[sender → human]** hello human'])
+  retry.send(post)
+  await tick()
+  expect(sent).toHaveLength(1)
+})
+
+test('retrying a mixed publish repairs its mirror without committing or waking again', async () => {
+  const dir = directory()
+  const a = router(dir)
+  legacy(a.connect(), 'recipient', 'pull')
+  const sender = a.connect()
+  legacy(sender, 'sender')
+  const post = { type: 'busPost', to: 'recipient', text: 'mixed', publish_id: 'opaque', requestId: 'post' }
+  sender.send(post)
+  await tick()
+  expect(JSON.parse(sender.result('post')!.data!)).toEqual({ publish_id: 'opaque', committed: ['recipient'], mirror: 'failed' })
+  const id = a.inboxes.list('recipient')[0]?.id
+
+  const sent: string[] = []
+  const b = router(dir, { client: discord(content => { sent.push(content); return { id: 'discord-id' } }) })
+  const retry = b.connect()
+  legacy(retry, 'sender')
+  retry.send(post)
+  await tick()
+  expect(JSON.parse(retry.result('post')!.data!)).toEqual({ publish_id: 'opaque', committed: ['recipient'] })
+  expect(b.inboxes.list('recipient').map(entry => entry.id)).toEqual([id])
+  retry.send(post)
+  await tick()
+  expect(sent).toEqual(['**[sender → recipient]** mixed'])
+})
+
+test('a directed bus post logs its committed id and path without the body', async () => {
+  const a = router(directory())
+  legacy(a.connect(), 'recipient', 'pull')
+  const sender = a.connect()
+  legacy(sender, 'sender')
+  const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true)
+  const stdout = spyOn(process.stdout, 'write').mockImplementation(() => true)
+  try {
+    const body = 'private-body-marker'
+    sender.send({ type: 'busPost', to: 'recipient', text: body, requestId: 'post' })
+    await tick()
+    expect(JSON.parse(sender.result('post')!.data!).publish_id).toMatch(/^pub_\d+_[\da-f-]{36}$/)
+    const id = a.inboxes.list('recipient')[0]!.id
+    const output = stderr.mock.calls.map(call => String(call[0])).join('')
+    expect(output).toBe(`deliver ${id} sender -> recipient state=committed path=inbox\n`)
+    expect(output + stdout.mock.calls.map(call => String(call[0])).join('')).not.toContain(body)
+  } finally { stderr.mockRestore(); stdout.mockRestore() }
+})
+
+test('a later directed message wakes a cold inbox after its budget refills', () => {
+  const a = router(directory(), { budget: new WakeBudget({ cheap: 1, standard: 1, premium: 1 }, 50) })
+  const node = a.connect()
+  node.send({ type: 'registerNode', node: 'nas', nodeSecret: secret, agents: [{ name: 'cold', kind: 'codex' }] })
+  const realNow = Date.now
+  const now = realNow()
+  Date.now = () => now
+  try {
+    deliver(a.deps, 'cold', 'uses the budget', {})
+    deliver(a.deps, 'cold', 'waits for a wake', {})
+    expect(node.frames.filter(frame => frame.type === 'wake')).toHaveLength(1)
+    Date.now = () => now + 51
+    deliver(a.deps, 'cold', 'wakes the backlog', {})
+    expect(node.frames.filter(frame => frame.type === 'wake').at(-1)).toMatchObject({ pending: 3 })
+    expect(a.inboxes.count('cold')).toBe(3)
+  } finally { Date.now = realNow }
+})
+
+test.each(['woken', 'uncertain'] as const)('a first read of an %s wake reopens the latch without acknowledging mail', async state => {
+  const dir = directory()
+  const a = router(dir)
+  const gw = a.connect()
+  gateway(gw)
+  agent(gw, alias, 'A')
+  const sender = a.connect()
+  legacy(sender, 'sender')
+  sender.send({ type: 'busPost', to: alias, text: 'A', requestId: 'a' })
+  await tick()
+  const first = gw.frames.find(frame => frame.type === 'wake')!
+  if (state === 'woken') gw.send({
+    type: 'wakeResult', as: alias, id: first.msgId, result: { s: 'woken', nativeId: 'native-A' }, requestId: 'wake-a',
+  })
+  const leased = lease(gw, alias, 'unknown-previous-receipt')
+  expect(leased.receipt_status).toBe('stale')
+  expect(leased.messages).toMatchObject([{ id: first.msgId, state: 'leased' }])
+  expect(a.inboxes.count(alias)).toBe(1)
+
+  const b = router(dir)
+  const next = b.connect()
+  gateway(next)
+  agent(next, alias, 'A')
+  expect(next.frames.some(frame => frame.type === 'wake')).toBe(false)
+  if (state === 'uncertain') next.send({
+    type: 'wakeResult', as: alias, id: first.msgId, result: { s: 'woken', nativeId: 'native-A' }, requestId: 'late-wake-a',
+  })
+  const posting = b.connect()
+  legacy(posting, 'sender')
+  posting.send({ type: 'busPost', to: alias, text: 'B', requestId: 'b' })
+  await tick()
+  const second = next.frames.find(frame => frame.type === 'wake')
+  expect(second).toMatchObject({ n: 2 })
+  expect(second?.msgId).not.toBe(first.msgId)
+  expect(b.inboxes.count(alias)).toBe(2)
+  expect(lease(next, alias, leased.receipt).messages).toMatchObject([{ id: second!.msgId, body: 'B' }])
+  expect(b.inboxes.count(alias)).toBe(1)
 })
