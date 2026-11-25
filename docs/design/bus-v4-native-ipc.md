@@ -32,7 +32,7 @@ Invariant **N3 (exact identity)**: delivery target = native conversation id, nev
 | **Codex 0.170+** | MCP `tools/call` carries `_meta.threadId`+`sessionId` (codex-rs mcp_tool_call.rs) | app-server control socket `~/.codex/app-server-control/*.sock`: `turn/start` only when `thread/read` says idle; `turn/steer` forbidden (N2) | `thread/status/changed`, `turn/completed` | codex_nas (0.172 TUI daemon, read-only), codex_mac (0.132 schema). **Unproven:** TUI renders an external turn; human-typing race. Until proven: queue + tmux nudge for TUI-owned threads. |
 | **opencode 2.3** | session id `ses_…` | `opencode serve --service` HTTP (TUI attaches), post message to session | session status API | process tree on Mac. **Owes R3**: endpoint, auth, who spawns MCP. |
 | **grok 1.0.92** | ACP session id | `grok agent serve` (WS 127.0.0.1, `--secret`) / `agent stdio`; live TUI not on leader → tmux | ACP events | grok docs 15-agent-mode.md |
-| **agy 1.5** | conversation id | `agy acp` / stream-json only for gateway-owned sessions; live TUI → tmux | `ConversationService.runState` | agy_mac |
+| **agy 1.5.17** | conversation UUID (`$ANTIGRAVITY_CONVERSATION_ID`) | Gateway-owned: `agy acp` (`session/resume`/`session/prompt`, with inline per-session `mcpServers`) or stream-json stdin (omit `-p`). Live TUI: **no inject**, so tmux nudge, gated on runState | Live TUI: a SessionStart hook gives LS address and CSRF token, and `ConversationService/GetConversation` returns `runState` IDLE/RUNNING. Gateway-owned: turn framing | agy_nas verified live on nas642 (docs: headless.md, hooks.md) |
 
 ### Claude registration (no setting change, no per-agent process)
 A `SessionStart` hook (user settings, all sessions) runs `agent-bus register` once. It inherits
@@ -78,3 +78,4 @@ Q3 nas642 node moves from root system unit to `systemd --user` (lingering) — O
 2. [v] A child thread spawned a second MCP client with the same alias and retired the parent → **accepted**: bind on transport + `_meta.threadId`; parent/child plus same-cwd tests.
 3. [v] Enqueue lost on exit, removed before receipt → **accepted**: committed/woken/accepted states, stable id.
 4. Standby controller with fencing → **rejected**, with the scope argument in §5. "Don't borrow recipient credentials to turn a hold into acceptance" → **escalated to Mick (Q1)**, stated plainly. Mitigation: the token is used only for the body-less N1 nudge.
+- **agy_nas (native-ipc: agy row, outside rota):** verified as above. **Disposition:** adopted. The agy SessionStart hook registers conversationId, LS address and CSRF token, so the gateway gates tmux nudges on `runState` with no pane scraping. Prefer `agy acp` for gateway-owned agy, since it injects MCP per session with no config edits (solves agy tool identity).
