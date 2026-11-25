@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtemp, stat } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -10,8 +10,16 @@ import {
   type GatewayToRouterMessage, type LeaseResult, type PeerInfo,
 } from '../gateway/index.js'
 
-const parent = { host: 'nas642', user: 'mickg', kind: 'codex' as const, conv: 'parent-conv', alias: 'codex@nas642:parent', pid: 10, cwd: '/work/src', transport: 'native' as const }
-const child = { host: 'nas642', user: 'mickg', kind: 'codex' as const, conv: 'child-conv', alias: 'codex@nas642:child', pid: 11, cwd: '/work/src', transport: 'native' as const }
+const parent = { host: 'nas642', user: 'mickg', kind: 'codex' as const, conv: 'parent-conv', alias: 'codex@nas642:parent', pid: 10, cwd: '/work/src', transport: 'codex-queue' as const }
+const child = { host: 'nas642', user: 'mickg', kind: 'codex' as const, conv: 'child-conv', alias: 'codex@nas642:child', pid: 11, cwd: '/work/src', transport: 'codex-queue' as const }
+
+const pipeRoot = join(tmpdir(), `agent-bus-pipe-bin-${process.pid}`)
+mkdirSync(pipeRoot, { recursive: true })
+const pipeBin = join(pipeRoot, 'agent-bus-pipe')
+if (!existsSync(pipeBin)) {
+  writeFileSync(pipeBin, '')
+  chmodSync(pipeBin, 0o755)
+}
 
 function leased(body: string, id: string, extra: Partial<LeaseResult> = {}): LeaseResult {
   return {
@@ -53,7 +61,8 @@ async function gateway(agents: Array<typeof parent> = [parent, child]) {
   })
   for (const agent of agents) gw.registerAgent(agent)
   const sock = join(dir, 'gw.sock')
-  await gw.listen(sock)
+  const previousUmask = process.umask(0)
+  try { await gw.listen(sock) } finally { process.umask(previousUmask) }
   return {
     gw, dir, sock, frames, audit, mail,
     setPeer: (next: PeerInfo | undefined) => { peer = next },
@@ -76,7 +85,7 @@ function rpc(sock: string, setPeer: (peer: PeerInfo | undefined) => void, who: P
   })
 }
 
-const pipe = (ppid: number): PeerInfo => ({ pid: 100 + ppid, exe: '/usr/lib/agent-bus-pipe', ppid })
+const pipe = (ppid: number): PeerInfo => ({ pid: 100 + ppid, exe: pipeBin, ppid })
 
 describe('gateway skeleton', () => {
   test('registerGateway requires a node secret and does not log it', () => {
@@ -106,7 +115,7 @@ describe('gateway skeleton', () => {
       for (const [i, row] of cases.entries()) {
         row.gw.registerAgent({
           host: row.host, user: 'mickg', kind: row.kind, conv: `conv-${i}`,
-          alias: row.alias, pid: 200 + i, transport: 'native',
+          alias: row.alias, pid: 200 + i, transport: row.kind === 'opencode' ? 'opencode-queue' : 'codex-queue',
         })
         expect(row.gw.registry.byAlias(row.alias)?.conv).toBe(`conv-${i}`)
         expect(frames.some(frame =>
@@ -117,7 +126,7 @@ describe('gateway skeleton', () => {
       // A foreign-looking name is not parsed. The record's host is the gateway's.
       nas.registerAgent({
         host: 'nas642', user: 'mickg', kind: 'codex', conv: 'foreign-shape',
-        alias: 'codex@mac', pid: 299, transport: 'native',
+        alias: 'codex@mac', pid: 299, transport: 'codex-queue',
       })
       expect(nas.registry.byAlias('codex@mac')?.host).toBe('nas642')
       expect(frames.some(frame =>
@@ -126,12 +135,12 @@ describe('gateway skeleton', () => {
       for (const alias of ['', 'codex@nas642:bad name', 'human', 'admin', 'user', 'me', 'all', 'all:synthesis', 'router', '@all', '@all:independent', 'Human']) {
         expect(() => nas.registerAgent({
           host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
-          alias, pid: 300, transport: 'native',
+          alias, pid: 300, transport: 'codex-queue',
         })).toThrow('invalid alias')
       }
       expect(() => mac.registerAgent({
         host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
-        alias: 'codex@mac:infra', pid: 301, transport: 'native',
+        alias: 'codex@mac:infra', pid: 301, transport: 'codex-queue',
       })).toThrow('host mismatch')
     } finally {
       await nas.close()
@@ -185,6 +194,13 @@ describe('gateway skeleton', () => {
       expect(JSON.stringify(stranger)).not.toContain('SECRET')
       const mode = (await stat(g.sock)).mode & 0o777
       expect(mode).toBe(0o600)
+      expect((await stat(g.dir)).mode & 0o777).toBe(0o700)
+      const link = join(g.dir, 'agent-bus-pipe')
+      symlinkSync('/bin/bash', link)
+      const viaLink = await rpc(g.sock, g.setPeer, { pid: 8, exe: link, ppid: child.pid }, { op: 'check_inbox', conv: child.conv })
+      expect(viaLink).toMatchObject({ ok: false, error: 'peer is not agent-bus-pipe' })
+      const missingExe = await rpc(g.sock, g.setPeer, { pid: 7, exe: join(g.dir, 'missing-agent-bus-pipe'), ppid: child.pid }, { op: 'check_inbox', conv: child.conv })
+      expect(missingExe).toMatchObject({ ok: false, error: 'peer is not agent-bus-pipe' })
       expect(g.frames.some(frame => frame.type === 'registerGateway' && frame.proto === 1 && frame.secret === 'node-secret')).toBe(true)
       expect(JSON.stringify(g.audit)).not.toContain('node-secret')
     } finally { await g.gw.close() }
@@ -219,7 +235,7 @@ describe('gateway skeleton', () => {
         const primary = new FakeAdapter('codex', { s })
         const fallback = new FakeAdapter('agy')
         g.gw.setAdapters([primary, fallback])
-        const result = await g.gw.deliver(target, id, makeNudge(target.kind, target.conv, id))
+        const result = await g.gw.deliver(target, id, nudgeNumber(target.conv, id))
         expect(result).toEqual({ s })
         expect(primary.wakeCalls).toBe(1)
         expect(primary.turns).toBe(0)
@@ -232,15 +248,29 @@ describe('gateway skeleton', () => {
         const wake = g.frames[resultAt]
         if (wake?.type === 'wakeResult') expect(wake.result).toEqual({ s })
       }
-      const primary = new FakeAdapter('codex', { s: 'unavailable' })
-      const fallback = new FakeAdapter('codex', { s: 'woken', nativeId: 'q' })
-      g.gw.setAdapters([primary, fallback])
+      const native = new FakeAdapter('codex', { s: 'unavailable' })
+      const tmux = new FakeAdapter('codex', { s: 'woken', nativeId: 'q' }, 'tmux')
+      g.gw.setAdapters([native, tmux])
       const fall = { ...parent, conv: 'fall-conv', alias: 'codex@nas642:fall' }
-      const woken = await g.gw.deliver(fall, '13', makeNudge(fall.kind, fall.conv, '13'))
-      expect(woken).toEqual({ s: 'woken', nativeId: 'q' })
-      expect(primary.wakeCalls).toBe(1)
-      expect(primary.turns).toBe(0)
-      expect(fallback.turns).toBe(1)
+      const blocked = await g.gw.deliver(fall, '13', nudgeNumber(fall.conv, '13'))
+      expect(blocked).toEqual({ s: 'unavailable' })
+      expect(native.wakeCalls).toBe(1)
+      expect(native.turns).toBe(0)
+      expect(tmux.wakeCalls).toBe(0)
+      expect(tmux.turns).toBe(0)
+      const again = await g.gw.deliver(fall, '13', nudgeNumber(fall.conv, '13'))
+      expect(again).toEqual({ s: 'unavailable' })
+      expect(native.wakeCalls).toBe(1)
+      expect(tmux.wakeCalls).toBe(0)
+      const dupA = new FakeAdapter('codex', { s: 'woken', nativeId: 'a' })
+      const dupB = new FakeAdapter('codex', { s: 'woken', nativeId: 'b' })
+      g.gw.setAdapters([dupA, dupB])
+      const dup = { ...parent, conv: 'dup-conv', alias: 'codex@nas642:dup' }
+      const ambiguous = await g.gw.deliver(dup, '14', nudgeNumber(dup.conv, '14'))
+      expect(ambiguous).toEqual({ s: 'unavailable' })
+      expect(dupA.wakeCalls).toBe(0)
+      expect(dupB.wakeCalls).toBe(0)
+      expect(g.gw.store.get('14')).toBeUndefined()
       const mode = (await stat(join(g.dir, 'wakes.json'))).mode & 0o777
       expect(mode).toBe(0o600)
     } finally { await g.gw.close() }
@@ -250,7 +280,7 @@ describe('gateway skeleton', () => {
     const g = await gateway()
     try {
       g.gw.setAdapters([])
-      const result = await g.gw.deliver(parent, '99', makeNudge(parent.kind, parent.conv, '99'))
+      const result = await g.gw.deliver(parent, '99', nudgeNumber(parent.conv, '99'))
       expect(result).toEqual({ s: 'unavailable' })
       expect(g.frames.some(frame => frame.type === 'mark' || frame.type === 'wakeResult')).toBe(false)
       expect(existsSync(join(g.dir, 'wakes.json'))).toBe(false)
@@ -265,14 +295,18 @@ describe('gateway skeleton', () => {
         throw new Error('crash before wakeResult')
       })
       g.gw.setAdapters([fake])
-      await expect(g.gw.deliver(parent, '21', makeNudge(parent.kind, parent.conv, '21'))).rejects.toThrow('crash')
+      const n = nudgeNumber(parent.conv, '21')
+      await expect(g.gw.deliver(parent, '21', n)).rejects.toThrow('crash')
       expect(fake.wakeCalls).toBe(1)
       expect(fake.turns).toBe(0)
-      const again = await g.gw.deliver(parent, '21', makeNudge(parent.kind, parent.conv, '21'))
+      expect(g.gw.store.get('21')?.n).toBe(n)
+      expect(g.gw.store.get('21')).not.toHaveProperty('text')
+      const again = await g.gw.deliver(parent, '21', n)
       expect(again).toEqual({ s: 'woken', nativeId: 'reconciled' })
       expect(fake.wakeCalls).toBe(1)
       expect(fake.reconcileCalls).toBe(1)
       expect(fake.seen[0]).toEqual(makeNudge('codex', parent.conv, '21'))
+      expect(fake.seen[1]).toEqual(makeNudge('codex', parent.conv, '21'))
     } finally { await g.gw.close() }
   })
 
@@ -281,8 +315,8 @@ describe('gateway skeleton', () => {
     try {
       const fake = new FakeAdapter('codex')
       g.gw.setAdapters([fake])
-      await g.gw.deliver(parent, '31', makeNudge(parent.kind, parent.conv, '31'))
-      const second = await g.gw.deliver(parent, '32', makeNudge(parent.kind, parent.conv, '32'))
+      await g.gw.deliver(parent, '31', nudgeNumber(parent.conv, '31'))
+      const second = await g.gw.deliver(parent, '32', nudgeNumber(parent.conv, '32'))
       expect(second).toEqual({ s: 'queued' })
       expect(fake.wakeCalls).toBe(1)
       expect(g.frames.filter(frame => frame.type === 'mark' && frame.id === '32')).toHaveLength(0)
@@ -303,6 +337,7 @@ describe('gateway skeleton', () => {
       await g.gw.idle()
       expect(fake.wakeCalls).toBe(1)
       expect(fake.reconcileCalls).toBe(1)
+      expect(fake.seen[1]).toEqual(buildNudge('codex', parent.conv, '78', nudgeNumber(parent.conv, '78')))
       expect(g.frames.some(frame => frame.type === 'wakeResult' && frame.id === '78' && frame.result.s === 'woken')).toBe(true)
       expect(g.frames.some(frame => frame.type === 'mark' && frame.id === '78')).toBe(false)
     } finally { await g.gw.close() }
@@ -313,13 +348,13 @@ describe('gateway skeleton', () => {
     try {
       const fake = new FakeAdapter('codex')
       g.gw.setAdapters([fake])
-      await g.gw.deliver(parent, '31', makeNudge(parent.kind, parent.conv, '31'))
+      await g.gw.deliver(parent, '31', nudgeNumber(parent.conv, '31'))
       g.mail.set(parent.alias, { messages: [], unread: 0, receipt_status: 'stale' })
       const looked = await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv, receipt: 'old' })
       expect(looked.ok).toBe(true)
       expect(g.gw.store.get('31')).toBeUndefined()
       expect(WakeStore.load(join(g.dir, 'wakes.json')).get('31')).toBeUndefined()
-      await g.gw.deliver(parent, '32', makeNudge(parent.kind, parent.conv, '32'))
+      await g.gw.deliver(parent, '32', nudgeNumber(parent.conv, '32'))
       expect(fake.seen.map(nudge => nudge.msgId)).toEqual(['31', '32'])
     } finally { await g.gw.close() }
   })
@@ -330,15 +365,15 @@ describe('gateway skeleton', () => {
       const codex = new FakeAdapter('codex', { s: 'refused' })
       const opencode = new FakeAdapter('opencode', { s: 'woken', nativeId: 'oc' })
       g.gw.setAdapters([codex, opencode])
-      const target = { ...parent, kind: 'opencode' as const, conv: 'oc-conv', alias: 'opencode@nas642:shared' }
-      const woken = await g.gw.deliver(target, '41', makeNudge(target.kind, target.conv, '41'))
+      const target = { ...parent, kind: 'opencode' as const, transport: 'opencode-queue' as const, conv: 'oc-conv', alias: 'opencode@nas642:shared' }
+      const woken = await g.gw.deliver(target, '41', nudgeNumber(target.conv, '41'))
       expect(woken).toEqual({ s: 'woken', nativeId: 'oc' })
       expect(codex.wakeCalls).toBe(0)
       expect(opencode.wakeCalls).toBe(1)
-      g.gw.registerAgent({ ...target, pid: 70, cwd: '/work/src', transport: 'native' })
+      g.gw.registerAgent({ ...target, pid: 70, cwd: '/work/src' })
       g.gw.setAdapters([codex])
-      const claude = { ...parent, kind: 'claude' as const, conv: 'claude-conv', alias: 'claude@nas642:one' }
-      const onlyCodex = await g.gw.deliver(claude, '55', makeNudge('claude', claude.conv, '55'))
+      const claude = { ...parent, kind: 'claude' as const, transport: 'claude-inbox' as const, conv: 'claude-conv', alias: 'claude@nas642:one' }
+      const onlyCodex = await g.gw.deliver(claude, '55', nudgeNumber(claude.conv, '55'))
       expect(onlyCodex).toEqual({ s: 'unavailable' })
       expect(codex.wakeCalls).toBe(0)
       g.gw.router.receive({ type: 'wake', as: target.alias, msgId: '88', n: 1, reconcile: true })
@@ -377,7 +412,7 @@ describe('gateway skeleton', () => {
     first.setAdapters([fake])
     first.registerAgent(parent)
     try {
-      await first.deliver(parent, '31', makeNudge(parent.kind, parent.conv, '31'))
+      await first.deliver(parent, '31', nudgeNumber(parent.conv, '31'))
       expect(fake.wakeCalls).toBe(1)
       expect(first.store.get('31')?.state).toBe('woken')
       expect(first.store.get('31')?.reported).toBeUndefined()
@@ -426,6 +461,20 @@ describe('gateway skeleton', () => {
     } finally { await g.gw.close() }
   })
 
+  test('a line over 1 MiB closes the socket and does not lease', async () => {
+    const g = await gateway()
+    try {
+      g.setPeer(pipe(parent.pid))
+      const socket = connect(g.sock)
+      socket.on('error', () => {})
+      await new Promise<void>((resolve, reject) => { socket.once('connect', () => resolve()); socket.once('error', reject) })
+      const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
+      socket.write(Buffer.alloc(1024 * 1024 + 1, 0x61))
+      await closed
+      expect(g.frames.some(frame => frame.type === 'lease')).toBe(false)
+    } finally { await g.gw.close() }
+  })
+
   test('a bad wake store is left untouched', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'gw-store-'))
     const missing = join(dir, 'missing.json')
@@ -439,6 +488,10 @@ describe('gateway skeleton', () => {
     writeFileSync(path, '[{}]')
     expect(() => WakeStore.load(path)).toThrow('wake store malformed')
     expect(readFileSync(path, 'utf8')).toBe('[{}]')
+    const legacy = JSON.stringify([{ msgId: '1', conv: 'c', kind: 'codex', host: 'h', user: 'u', alias: 'a', clientId: 'c', text: 'old', state: 'woken' }])
+    writeFileSync(path, legacy)
+    expect(() => WakeStore.load(path)).toThrow('wake store malformed')
+    expect(readFileSync(path, 'utf8')).toBe(legacy)
     expect(() => WakeStore.load(dir)).toThrow()
   })
 })

@@ -1,6 +1,6 @@
 import { chmodSync, closeSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { Kind, WakeResult } from './types.js'
+import type { Kind, Transport, WakeResult } from './types.js'
 
 export type AttemptState = 'pending' | 'uncertain' | 'woken' | 'held' | 'refused' | 'unavailable'
 
@@ -11,8 +11,9 @@ export type Attempt = {
   host: string
   user: string
   alias: string
-  clientId: string
-  text: string
+  /** Router wake `n`. The nudge text is rebuilt from this, never stored. */
+  n: number
+  transport: Transport
   state: AttemptState
   nativeId?: string
   /** Set only after the router acks wakeResult. Unset means the result must be sent again. */
@@ -22,14 +23,15 @@ export type Attempt = {
 const OPEN: ReadonlySet<AttemptState> = new Set(['pending', 'uncertain', 'woken', 'held', 'refused'])
 const STATES: ReadonlySet<string> = new Set(['pending', 'uncertain', 'woken', 'held', 'refused', 'unavailable'])
 const KINDS: ReadonlySet<string> = new Set(['claude', 'codex', 'opencode', 'grok', 'agy'])
+const TRANSPORTS: ReadonlySet<string> = new Set(['codex-queue', 'opencode-queue', 'claude-inbox', 'claude-channel', 'tmux'])
 
 function isAttempt(v: unknown): v is Attempt {
   if (!v || typeof v !== 'object') return false
   const row = v as Attempt
   return typeof row.msgId === 'string' && row.msgId.length > 0
     && typeof row.conv === 'string' && typeof row.host === 'string' && typeof row.user === 'string'
-    && typeof row.alias === 'string' && typeof row.clientId === 'string' && typeof row.text === 'string'
-    && KINDS.has(row.kind) && STATES.has(row.state)
+    && typeof row.alias === 'string' && typeof row.n === 'number' && Number.isSafeInteger(row.n) && row.n >= 0
+    && KINDS.has(row.kind) && TRANSPORTS.has(row.transport) && STATES.has(row.state)
     && (row.nativeId === undefined || typeof row.nativeId === 'string')
     && (row.reported === undefined || typeof row.reported === 'boolean')
 }

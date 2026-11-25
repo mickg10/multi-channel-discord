@@ -1,9 +1,10 @@
-import { identityKey, type Target } from './types.js'
+import { identityKey, type Target, type Transport } from './types.js'
 
 export type AgentRec = Target & {
   pid: number
   cwd?: string
-  transport: 'native' | 'pull' | 'tmux'
+  /** Set when the agent is registered. Not inferred from cwd or a native listing. */
+  transport: Transport
   /** Bumped on every add. Pipe connections captured an older generation are stale. */
   gen?: number
 }
