@@ -27,8 +27,9 @@ any number of machines, talk to each other (and to you) through one Discord bot.
   `~/.local/libexec/agent-bus/` (mode 0700). `pipePath` in `~/.config/agent-bus/gateway.json` is
   `~/.local/libexec/agent-bus/agent-bus-pipe`. Do not install the pipe under `/usr/local/bin` or `/tmp`.
   The user units are `contrib/agent-bus-gateway.service` and `contrib/agent-bus-gateway.plist`.
-  Do not install them from a draft PR. An OpenCode adapter may set `servicePath` to an absolute
-  descriptor file; otherwise the adapter uses `~/.local/state/opencode/service.json`.
+  Do not install them from a draft PR. An absolute OpenCode `adapters[].servicePath` overrides
+  discovery mappings. With the field omitted, the gateway uses the verified descriptor published
+  for the conversation when available and the default descriptor otherwise.
 - **Node daemon — run agents headless, no tmux** (`src/node.ts`): one per machine under
   systemd/launchd. Its agents stay on the bus between turns (durable router inbox); each message
   wakes the agent for one non-interactive turn that resumes its own conversation —
@@ -223,3 +224,129 @@ bun run check  # type checking
 ## License
 
 Apache-2.0. Forked from [Anthropic's official Discord plugin](https://github.com/anthropics/claude-plugins-official).
+
+### Native gateway discovery API
+
+On each host, the operator writes a private `gateway-bindings.json` owned by the
+gateway's current UID with mode `0600`. The gateway reopens this regular file
+without following symlinks on each refresh. The size limit is 1 MiB. Discovery
+only reads this file. Use the exact fleet aliases and explicit native
+conversation IDs.
+
+```json
+{
+  "codex@nas642": { "kind": "codex", "conv": "thread-id" },
+  "opencode_nas642_glm53_abli": { "kind": "opencode", "conv": "ses_example" }
+}
+```
+
+An optional positive integer `pid` on a binding must match the selected Codex
+daemon or OpenCode service PID. Aliases come from the operator file and are
+never inferred from working directory, title, or active-session order. Several
+conversations can share a PID and working directory.
+
+Set `bindingsPath` to the absolute binding file path in the host config.
+Configure the local native endpoints in `config.discoveries`.
+
+```json
+{
+  "discoveries": [
+    {
+      "id": "codex-primary",
+      "kind": "codex",
+      "controlSocket": "/absolute/private/control.sock"
+    },
+    {
+      "id": "opencode-primary",
+      "kind": "opencode",
+      "servicePath": "/absolute/private/service.json"
+    }
+  ]
+}
+```
+
+Give each selected endpoint a unique source ID. Discovery connects to the
+private Codex control socket, obtains the daemon PID from the kernel's
+same-UID peer credentials, and reads the process start time and executable.
+The probe sends no protocol payload and uses the same private-path, socket
+ownership, mode, symlink, and inode checks as the Codex queue transport.
+The native listing uses a separate WebSocket connection. Discovery matches
+the peer PID, start time, and canonical executable against the live process
+identity before listing, after listing, and during registration preflight.
+A legacy source `pid` field is ignored.
+
+Discovery reads the OpenCode PID from the private service descriptor. It
+rechecks the descriptor and the live process start time and executable after
+listing and before admission. These checks assume that processes running
+under the gateway's UID are trusted.
+
+The separate `gateway-alias-hosts.json` proves host ownership. A bare alias
+such as `opencode_nas642_glm53_abli` requires an exact entry for the local host.
+Qualified aliases must name the local host and agree with any owner entry.
+
+```json
+{
+  "opencode_nas642_glm53_abli": "nas642"
+}
+```
+
+A host runtime can create discovery with its authenticated host and user, its
+gateway, and a callback that reloads the trusted config and ownership record.
+
+```ts
+const discovery = new NativeDiscovery({
+  host,
+  user,
+  gateway,
+  bindingsPath: "/absolute/private/gateway-bindings.json",
+  async readConfig(signal) {
+    const config = await readHostConfig(signal)
+    const gatewayAliasHosts = await readAliasHosts(signal)
+    return { discoveries: config.discoveries, gatewayAliasHosts }
+  },
+})
+discovery.start()
+```
+
+A binding must match exactly one configured source of the same kind across
+complete native listings. Unknown native sessions stay unregistered. Invalid
+bindings and conflicts prevent all registration writes in that pass. A failed
+or incomplete source prevents updates for its kind. A process identity change
+during the final group check blocks all writes for that pass. A missing
+listing or removed binding preserves the registration and its mail. Retained aliases
+continue to own their native identities until explicitly released or rebound.
+An unchanged PID, start time, conversation, and transport keep the current
+generation. After a daemon restart, a fresh complete inventory can register
+the new generation even when the OS reuses the PID. Update an optional binding
+PID assertion when the daemon's numeric PID changes. Codex daemon discovery
+verifies the daemon's own kernel peer PID and UID, canonical executable, and
+start time. Pipe authentication still requires the parent PID and start time
+to match the current registration.
+
+Discovery publishes verified Codex control socket paths and OpenCode service
+descriptor paths by conversation for new and unchanged registrations. Unknown
+native sessions are not automatically registered. The built-in Codex adapter
+requires a published socket path. For OpenCode, a configured
+`adapters[].servicePath` takes precedence over any published path. With the field
+omitted, the adapter uses the published path for that conversation if available,
+or `$XDG_STATE_HOME/opencode/service.json` (defaulting to
+`~/.local/state/opencode/service.json`). Direct `createOpencodeAdapter()` calls
+use the same default location. Each OpenCode operation selects one descriptor
+before I/O and never retries with another descriptor. A newly verified path can
+replace the published path without changing
+the registration generation. Outages, removals, and conflicts preserve
+previously published paths for mail recovery.
+
+Discovery pins Codex registrations to `codex-queue` and OpenCode registrations
+to `opencode-queue`. The gateway selects exactly one adapter for the registered
+kind and transport. An `unavailable` wake result is terminal and leaves the
+message available through `check_inbox` only. It triggers no fallback, wake
+retry, release, or rebind.
+
+Call `await discovery.refresh()` for a one-shot pass or to supersede an older
+pass. `await discovery.stop()` cancels polling and fences off stale results.
+The default poll interval is 30 seconds and the default whole-pass deadline is
+5 seconds. Results report status codes, configured source IDs and aliases, and
+counts of unmapped conversations. The host starts discovery after the first
+`gatewayRegistered` acknowledgment, refreshes it on reconnect, and stops it on
+shutdown. The host owns replay of retained registrations.

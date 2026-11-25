@@ -4,7 +4,7 @@ import { computeBackoff } from '../reconnect.js'
 import { Gateway } from './gateway.js'
 import { disableCoreDumps, readPeer } from './peer-cred.js'
 import { createCodexAdapter } from './adapters/codex.js'
-import { createOpencodeAdapter } from './adapters/opencode.js'
+import { createOpencodeAdapter, defaultOpencodeServicePath } from './adapters/opencode.js'
 import { assertNodeSecret, type Adapter, type GatewayToRouterMessage, type Kind, type RouterToGatewayMessage, type Transport } from './types.js'
 
 const KINDS: readonly Kind[] = ['claude', 'codex', 'opencode', 'grok', 'agy']
@@ -46,6 +46,7 @@ export function registerAdapter(kind: Kind, transport: Transport, factory: () =>
 }
 
 const codexSockets = new Map<string, string>()
+const opencodeServicePaths = new Map<string, string>()
 
 /** PR5b publishes the live Codex control socket here. The pid still comes from that socket's peer. */
 export function setCodexControlSocket(conv: string, path: string | undefined): void {
@@ -53,13 +54,23 @@ export function setCodexControlSocket(conv: string, path: string | undefined): v
   else codexSockets.delete(conv)
 }
 
+export function setOpencodeServicePath(conv: string, path: string | undefined): void {
+  if (path) opencodeServicePaths.set(conv, path)
+  else opencodeServicePaths.delete(conv)
+}
+
 /** Codecs the CLI can construct. Other transports stay unregistered until their adapter PR lands. */
 export function builtinAdapters(bindings: readonly AdapterBinding[]): Adapter[] {
-  const opencode = bindings.find(binding => binding.kind === 'opencode' && binding.transport === 'opencode-queue')
+  const servicePath = bindings.find(binding =>
+    binding.kind === 'opencode' && binding.transport === 'opencode-queue')?.servicePath
   registerAdapter('codex', 'codex-queue', () => createCodexAdapter({
     resolveControlSocket: target => codexSockets.get(target.conv),
   }))
-  registerAdapter('opencode', 'opencode-queue', () => createOpencodeAdapter(opencode?.servicePath))
+  registerAdapter('opencode', 'opencode-queue', () => {
+    if (servicePath !== undefined) return createOpencodeAdapter(servicePath)
+    const defaultPath = defaultOpencodeServicePath()
+    return createOpencodeAdapter(target => opencodeServicePaths.get(target.conv) ?? defaultPath)
+  })
   return adaptersFor(bindings)
 }
 

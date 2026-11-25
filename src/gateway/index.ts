@@ -3,13 +3,14 @@ export { FakeAdapter } from './fake-adapter.js'
 export { Gateway, type GatewayOpts } from './gateway.js'
 export { verifyPipePeer, type PeerInfo, type PeerVerdict } from './peer.js'
 export {
-  darwinStartTime, disableCoreDumps, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, readPeer, startTimeFromStat,
+  darwinStartTime, disableCoreDumps, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin,
+  processPeerFromDarwin, readPeer, readProcessPeer, startTimeFromStat,
   LOCAL_PEERCRED, LOCAL_PEERPID, SO_PEERCRED, SOL_LOCAL, SOL_SOCKET,
   type DarwinSys, type ProcessIdentity,
 } from './peer-cred.js'
 export { splicePipe } from './pipe.js'
 export {
-  adaptersFor, builtinAdapters, gatewayMain, loadConfig, readNodeSecret, registerAdapter, setCodexControlSocket, startHost,
+  adaptersFor, builtinAdapters, gatewayMain, loadConfig, readNodeSecret, registerAdapter, setCodexControlSocket, setOpencodeServicePath, startHost,
   type AdapterBinding, type DiscoveryControl, type GatewayConfig, type HostHandle,
 } from './host.js'
 export { Registry, type AgentRec } from './registry.js'
@@ -20,3 +21,7 @@ export {
   type Adapter, type DeliveryResult, type GatewayToRouterMessage, type Kind, type LeaseResult, type Nudge,
   type RouterToGatewayMessage, type Target, type Transport, type WakeResult,
 } from './types.js'
+export {
+  NativeDiscovery, type DiscoveryBinding, type DiscoveryConfig, type DiscoveryOptions,
+  type DiscoveryResult, type DiscoverySource,
+} from './discovery.js'
