@@ -1,0 +1,222 @@
+{
+  "scope": "Disposable local fake-provider thread. Queue, turn and item pages are sampled. thread/read is projected to the matching turn and userMessage. Paths and other turns are omitted. Native cursors have been replaced with opaque sample labels. No production conversation data.",
+  "enqueue": {
+    "method": "thread/queue/add",
+    "params": {
+      "threadId": "01a21383-ceb4-7b63-b886-e915ba08c55a",
+      "clientUserMessageId": "fixture-pending-1",
+      "input": [
+        {
+          "type": "text",
+          "text": "FIXTURE_PENDING_1"
+        }
+      ]
+    },
+    "result": {
+      "queuedSubmission": {
+        "id": "01a21392-ec63-7ec3-bda2-e3e65add53bf",
+        "input": [
+          {
+            "type": "text",
+            "text": "FIXTURE_PENDING_1",
+            "text_elements": []
+          }
+        ],
+        "clientUserMessageId": "fixture-pending-1",
+        "responsesapiClientMetadata": null
+      }
+    }
+  },
+  "queue_page_1": {
+    "method": "thread/queue/list",
+    "params": {
+      "threadId": "01a21383-ceb4-7b63-b886-e915ba08c55a",
+      "limit": 1
+    },
+    "result": {
+      "data": [
+        {
+          "id": "01a21392-ec63-7ec3-bda2-e3e65add53bf",
+          "input": [
+            {
+              "type": "text",
+              "text": "FIXTURE_PENDING_1",
+              "text_elements": []
+            }
+          ],
+          "clientUserMessageId": "fixture-pending-1",
+          "responsesapiClientMetadata": null
+        }
+      ],
+      "nextCursor": "opaque-queue-page-2"
+    }
+  },
+  "queue_page_2": {
+    "method": "thread/queue/list",
+    "params": {
+      "threadId": "01a21383-ceb4-7b63-b886-e915ba08c55a",
+      "limit": 1,
+      "cursor": "opaque-queue-page-2"
+    },
+    "result": {
+      "data": [
+        {
+          "id": "01a21392-ec6d-7953-a404-300bc4571416",
+          "input": [
+            {
+              "type": "text",
+              "text": "FIXTURE_PENDING_2",
+              "text_elements": []
+            }
+          ],
+          "clientUserMessageId": "fixture-pending-2",
+          "responsesapiClientMetadata": null
+        }
+      ],
+      "nextCursor": null
+    }
+  },
+  "cold_history_match": {
+    "method": "thread/read",
+    "params": {
+      "threadId": "01a21383-ceb4-7b63-b886-e915ba08c55a",
+      "includeTurns": true
+    },
+    "result": {
+      "thread": {
+        "id": "01a21383-ceb4-7b63-b886-e915ba08c55a",
+        "turns": [
+          {
+            "id": "01a21387-d761-7f03-bb7b-728a1e381225",
+            "status": "completed",
+            "itemsView": "full",
+            "items": [
+              {
+                "type": "userMessage",
+                "id": "01a21387-d774-74e0-9db9-0cc2d15fcb1e",
+                "clientId": "d8395088-d96c-4e43-82d7-a006177d80c1",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "QUEUED_TOKEN-from-client-B",
+                    "text_elements": []
+                  }
+                ],
+                "startedAtMs": 1795623999349,
+                "completedAtMs": 1795623999349
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "turns_summary": {
+    "method": "thread/turns/list",
+    "params": {
+      "threadId": "01a21383-ceb4-7b63-b886-e915ba08c55a",
+      "limit": 1,
+      "itemsView": "summary"
+    },
+    "result": {
+      "data": [
+        {
+          "id": "01a21387-d761-7f03-bb7b-728a1e381225",
+          "items": [
+            {
+              "type": "userMessage",
+              "id": "01a21387-d774-74e0-9db9-0cc2d15fcb1e",
+              "clientId": "d8395088-d96c-4e43-82d7-a006177d80c1",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "QUEUED_TOKEN-from-client-B",
+                  "text_elements": []
+                }
+              ],
+              "startedAtMs": 1795623999349,
+              "completedAtMs": 1795623999349
+            }
+          ],
+          "itemsView": "summary",
+          "status": "completed"
+        }
+      ],
+      "nextCursor": "opaque-turns_summary-nextCursor",
+      "backwardsCursor": "opaque-turns_summary-backwardsCursor"
+    }
+  },
+  "turns_full": {
+    "method": "thread/turns/list",
+    "params": {
+      "threadId": "01a21383-ceb4-7b63-b886-e915ba08c55a",
+      "limit": 1,
+      "itemsView": "full"
+    },
+    "result": {
+      "data": [
+        {
+          "id": "01a21387-d761-7f03-bb7b-728a1e381225",
+          "items": [
+            {
+              "type": "userMessage",
+              "id": "01a21387-d774-74e0-9db9-0cc2d15fcb1e",
+              "clientId": "d8395088-d96c-4e43-82d7-a006177d80c1",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "QUEUED_TOKEN-from-client-B",
+                  "text_elements": []
+                }
+              ],
+              "startedAtMs": 1795623999349,
+              "completedAtMs": 1795623999349
+            }
+          ],
+          "itemsView": "full",
+          "status": "completed"
+        }
+      ],
+      "nextCursor": "opaque-turns_full-nextCursor",
+      "backwardsCursor": "opaque-turns_full-backwardsCursor"
+    }
+  },
+  "items": {
+    "method": "thread/items/list",
+    "params": {
+      "threadId": "01a21383-ceb4-7b63-b886-e915ba08c55a",
+      "limit": 1,
+      "turnId": "01a21387-d761-7f03-bb7b-728a1e381225",
+      "sortDirection": "asc"
+    },
+    "result": {
+      "data": [
+        {
+          "turnId": "01a21387-d761-7f03-bb7b-728a1e381225",
+          "item": {
+            "type": "userMessage",
+            "id": "01a21387-d774-74e0-9db9-0cc2d15fcb1e",
+            "clientId": "d8395088-d96c-4e43-82d7-a006177d80c1",
+            "content": [
+              {
+                "type": "text",
+                "text": "QUEUED_TOKEN-from-client-B",
+                "text_elements": []
+              }
+            ],
+            "startedAtMs": 1795623999349,
+            "completedAtMs": 1795623999349
+          },
+          "startedAtMs": 1795623999349,
+          "completedAtMs": 1795623999349
+        }
+      ],
+      "nextCursor": "opaque-items-nextCursor",
+      "backwardsCursor": "opaque-items-backwardsCursor"
+    }
+  },
+  "versions": {
+    "historyOriginallyWrittenBy": "0.170.0",
+    "queueAndColdReadServer": "0.172.0"
+  }
+}
