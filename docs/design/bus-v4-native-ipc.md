@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.6** (after R6), entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v4.7** (after R7), entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -71,6 +71,15 @@ The gateway is the never-down controller (KeepAlive/systemd --user). It (a) rest
 with their own conversation id, (b) never restarts itself or the shared Codex daemon to fix its own state,
 (c) applies upgrades by draining, then exec. Migration operator (an agent): ops-upgrader, restarts last.
 
+### 4a. Router changes for M0 (R7, claude_setup, verified against 8697214)
+- `deliver()` has four exits that never commit (push = bare ws.send, over-budget = unread.bump, offline non-node = drop, approval without a conversation = drop). New order: **admit (known identity only, else sender error) → commit → the budget gates the *wake* only → transport.** PR #9 semantics are kept: passive traffic is a count; from_human and rules are exempt.
+- Inboxes storage: **append-only JSONL** of commit, lease and ack records, compacted on start. It replaces the whole-map JSON on a 200 ms timer, where an fsync per message would be O(total).
+- Drain becomes a **lease** (10 min) acked after the gateway writes the tool result; it redelivers with the same id. `agentStatus` (L393) is observational; the backlog flush happens only on register.
+- Inbox **key = identity (host/user/kind/conv)**, which folds in Conversations and the bound-approval hold. M0 does a one-time re-key of name-queued mail when an alias binds.
+- Gateway protocol: `registerGateway{host,user,proto}` with the node secret **required** (timing-safe compare, replacing today's `!==`); `registerAgent{kind,conv,alias}` bound to ws.data.nodeName, with a host match. Every op carries `as`, which must be in that gateway's set; ops without it are rejected.
+- Coexistence: a gateway-bound alias rejects a legacy `register` with `replaced`, because the PR #11 takeover would otherwise steal it.
+- **Migration unit = config scope** (a CODEX_HOME, an opencode service, a Claude settings scope), not a single agent.
+
 ## 5b. Codex RPC contract (pinned, R5#2)
 `initialize{capabilities.experimentalApi:true}` → version and capability allowlist (≥0.170; `thread/queue/add` present) → `thread/queue/add{threadId, input:[fixed nudge], clientUserMessageId}` and **nothing else**. Reconcile with `thread/queue/list` plus `thread/read{includeTurns:true, itemsView:"full"}`, paged to `nextCursor:null`, matching `clientUserMessageId` / `userMessage.clientId`. `clientUserMessageId` = hash(recipient threadId, bus msg id), immutable. The control socket must be owned by the user (stat check), mode 0600.
 
@@ -139,3 +148,6 @@ GLM may still post R3 critique; it will be appended.
 3. [v] runState+tmux on human agy panes = check-then-send; LS creds lost on restart → **accepted**: human agy TUIs are pull-only; per-turn hook re-registers.
 4. [v] ACP stdio severed by a gateway restart → **accepted**: per-worker stdio↔socket bridge in tmux-0.
 5. agy per-session mcpServers under `session/resume` → **M4 gate** (2-session probe).
+
+### R7 claude_setup (8e4fc70)
+1–9 [v/opinion] all **accepted** into §4a: admit → commit → budget gates the wake → transport; append-only JSONL; known-identity admission; lease and ack; observational status; identity-keyed inbox plus re-key; registerGateway/registerAgent/`as` with a required node secret and timing-safe compare; legacy register can't steal gateway aliases; migrate per config scope.
