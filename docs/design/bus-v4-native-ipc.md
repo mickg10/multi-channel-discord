@@ -217,3 +217,7 @@ Corrections adopted: recipient-echoed receipt ack; wake attempt persisted before
 | Evidence / acceptance tests | codex@nas642 | review only |
 | Migration operator (tmux-0 restarts, last) | claude@mac:ops-upgrader | — |
 | Never-down controller | the per-host gateway (launchd KeepAlive / systemd --user) | not an LLM |
+
+## Amendments (leader-approved, post-freeze)
+**A1 (2026-11-25, sender identity vs Q1).** §4b's "external sender identity preserved" and N4 apply to **retries and fallbacks**: a held/refused message is never resent under another identity or transport. Q1 is the separate question of which transport a Claude session gets **up front**. If Mick approves Q1, that is the token post (the session's own hook-delegated credential). If Mick declines, it is a true external sender (subject to the hold) or the session's configured channel. Either way the choice is made at registration, never after a hold. The §2 Claude row and §7 Q1 stand as the two options for Mick. M1 acceptance (codex_nas) tests whichever option Mick picks, plus: held/refused never retries through a different identity, and the unread item stays available.
+**A2 (2026-11-25, tool approvals).** Every agent config written by the migration must explicitly auto-approve the read-only bus tools (`check_inbox`, `claim`, `release_claim`, `list_claims`, `mcp_list`, `mcp_describe`, …). Codex config approval gaps silently cancelled `claim` (found by ops-upgrader). Write-capable tools stay gated.
