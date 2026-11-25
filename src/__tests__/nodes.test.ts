@@ -410,3 +410,17 @@ describe('node: nvm PATH + local conversation guard', () => {
     expect(conversationHeldLocally('S-dead', () => '', sd)).toBeUndefined()
   })
 })
+
+describe('explicit-name takeover retires the stale holder', () => {
+  test('newer client with takeover gets the exact name; old one is told "replaced"', () => {
+    const h = createWsHandlers(deps())
+    const stale = makeWs(); h.message(stale as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'old-thread' }))
+    const live = makeWs(); h.message(live as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'new-thread', takeover: true }))
+    expect(msgs(stale).some(m => m.type === 'replaced' && m.name === 'codex@mac')).toBe(true)
+    expect(msgs(live).find(m => m.type === 'registered').name).toBe('codex@mac')
+    expect(sessions.getSessions().map(s => s.name)).toEqual(['codex@mac'])
+    deliver(deps(), 'codex@mac', 'for the live thread', {})
+    expect(msgs(live).some(m => m.type === 'message' && m.content === 'for the live thread')).toBe(true)
+    expect(msgs(stale).some(m => m.type === 'message' && m.content === 'for the live thread')).toBe(false)
+  })
+})

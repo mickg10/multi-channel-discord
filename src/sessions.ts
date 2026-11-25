@@ -140,6 +140,15 @@ export class SessionManager {
     return true
   }
 
+  /** Send a raw protocol message (not a channel message) to every connection of a session. */
+  notifySession(name: string, json: string): boolean {
+    const slot = this.sessions.get(name)
+    if (!slot) return false
+    try { slot.send(json) } catch {}
+    for (const extra of slot.extraSends) { try { extra(json) } catch {} }
+    return true
+  }
+
   /** Send a message to a specific session by name. */
   routeToSession(name: string, text: string, meta: ChannelMeta): boolean {
     const slot = this.sessions.get(name)

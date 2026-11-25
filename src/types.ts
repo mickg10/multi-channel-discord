@@ -275,7 +275,14 @@ export interface WsPermissionVerdict {
 }
 
 /** Union of all messages the router can send to a plugin */
+/** Router → plugin: another connection took over this session name; retire. */
+export interface WsReplaced {
+  readonly type: 'replaced'
+  readonly name: string
+}
+
 export type RouterToPluginMessage =
+  | WsReplaced
   | WsMessage
   | WsRegistered
   | WsRenamed

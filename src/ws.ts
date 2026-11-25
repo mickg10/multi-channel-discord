@@ -491,6 +491,9 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         const p = parsed as { mode?: string; takeover?: boolean; instanceId?: string }
         const stale = deps.sessions.getSessions().find(s => s.name === parsed.name)
         if (stale && (p.takeover || p.mode === 'pull')) {
+          // Tell the old holder it lost the name so it retires instead of lingering (a stale
+          // Codex-daemon thread kept the name and swallowed the live thread's mail and nudges).
+          deps.sessions.notifySession(parsed.name, JSON.stringify({ type: 'replaced', name: parsed.name }))
           try { deps.sessions.deregisterSession(parsed.name) } catch {}
         }
       }
