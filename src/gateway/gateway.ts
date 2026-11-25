@@ -24,6 +24,10 @@ export type GatewayOpts = {
   audit?: (frame: GatewayToRouterMessage) => void
   readPeer?: (sock: Socket) => PeerInfo | undefined
   verify?: typeof verifyPipePeer
+  /** Compiled agent-bus-pipe. When set, the peer exe must realpath to this file. */
+  pipePath?: string
+  /** PR5c attaches MCP here. This gateway keeps the pipe byte protocol. */
+  onVerifiedConnection?: (sock: Socket, agents: AgentRec[]) => void
 }
 
 export class Gateway {
@@ -91,10 +95,24 @@ export class Gateway {
     return result
   }
 
+  /** Load the wake file. Does not talk to the router. */
+  loadFromDisk(): void {
+    this.store = WakeStore.load(this.opts.storePath)
+  }
+
+  /** Replay finished results for one alias, or every alias, after that alias is registered. */
+  replayUnreported(alias?: string): void {
+    for (const row of this.store.unreported()) {
+      if (alias !== undefined && row.alias !== alias) continue
+      if (!this.registry.byAlias(row.alias)) continue
+      this.router.wakeResult(row.alias, row.msgId, toWake(row))
+    }
+  }
+
   /** Restart path. Pending rows are already uncertain. Finished results the router never acked are sent again. */
   resumeFromDisk(): void {
-    this.store = WakeStore.load(this.opts.storePath)
-    for (const row of this.store.unreported()) this.router.wakeResult(row.alias, row.msgId, toWake(row))
+    this.loadFromDisk()
+    this.replayUnreported()
   }
 
   /** Resolves when router-driven wakes started so far have settled. */
@@ -153,13 +171,14 @@ export class Gateway {
     this.conns.add(sock)
     sock.on('close', () => this.conns.delete(sock))
     const peer = this.opts.readPeer?.(sock)
-    const verdict = peer ? this.verify(peer, this.registry) : { ok: false as const, error: 'no peer credentials' }
+    const verdict = peer ? this.verify(peer, this.registry, this.opts.pipePath) : { ok: false as const, error: 'no peer credentials' }
     if (!verdict.ok) {
       sock.write(JSON.stringify({ ok: false, error: verdict.error }) + '\n')
       sock.end()
       return
     }
     const agents = verdict.agents
+    this.opts.onVerifiedConnection?.(sock, agents)
     let buf = ''
     sock.on('data', chunk => {
       buf += chunk.toString()
@@ -238,11 +257,11 @@ function toWake(row: Attempt): WakeResult {
   return { s: 'uncertain' }
 }
 
-/** Create the socket directory at 0700 when this process owns it. Never chmod a directory owned by someone else. */
+/** Create the socket directory at 0700. A directory owned by another user refuses startup and is not chmod'd. */
 function privateDir(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 })
-  if (process.getuid === undefined) return
-  if (statSync(path).uid !== process.getuid()) return
+  if (process.getuid === undefined) throw new Error('no uid')
+  if (statSync(path).uid !== process.getuid()) throw new Error('directory is owned by another user')
   chmodSync(path, 0o700)
 }
 

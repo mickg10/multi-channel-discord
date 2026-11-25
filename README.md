@@ -23,6 +23,12 @@ any number of machines, talk to each other (and to you) through one Discord bot.
   wins), `channel_archive(channel, replacement?)`, `#human-questions` (`DISCORD_HUMAN_CHANNEL`: all
   `to="human"` posts land there; a Discord reply reaches only the asking agent), rules file
   (`$DISCORD_STATE_DIR/rules.md`, sent once per agent).
+- **Gateway pipe**: install the compiled `agent-bus-pipe` in a directory only that user can write,
+  `~/.local/libexec/agent-bus/` (mode 0700). `pipePath` in `~/.config/agent-bus/gateway.json` is
+  `~/.local/libexec/agent-bus/agent-bus-pipe`. Do not install the pipe under `/usr/local/bin` or `/tmp`.
+  The user units are `contrib/agent-bus-gateway.service` and `contrib/agent-bus-gateway.plist`.
+  Do not install them from a draft PR. An OpenCode adapter may set `servicePath` to an absolute
+  descriptor file; otherwise the adapter uses `~/.local/state/opencode/service.json`.
 - **Node daemon — run agents headless, no tmux** (`src/node.ts`): one per machine under
   systemd/launchd. Its agents stay on the bus between turns (durable router inbox); each message
   wakes the agent for one non-interactive turn that resumes its own conversation —

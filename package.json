@@ -5,13 +5,16 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "multi-channel-discord": "./bin/multi-channel-discord.js"
+    "multi-channel-discord": "./bin/multi-channel-discord.js",
+    "agent-bus-gateway": "./bin/agent-bus-gateway.ts",
+    "agent-bus-pipe": "./bin/agent-bus-pipe.ts"
   },
   "scripts": {
     "start": "bun install --no-summary 1>&2 && bun src/supervisor.ts",
     "plugin": "bun run src/plugin.ts",
     "check": "bun x tsc --noEmit",
     "test": "bun test",
+    "build:pipe": "bun build --compile bin/agent-bus-pipe.ts --outfile dist/agent-bus-pipe",
     "router": "bun install --no-summary 1>&2 && bun src/router.ts",
     "client": "bun src/plugin.ts"
   },

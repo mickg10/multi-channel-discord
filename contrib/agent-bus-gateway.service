@@ -1,0 +1,18 @@
+# User unit. Install as the login user (systemd --user). Do not install from a draft PR.
+# LimitCORE=0 is ulimit -c 0. There is no User= line: a user manager already runs as that user.
+# Install the compiled pipe at ~/.local/libexec/agent-bus/agent-bus-pipe. That directory is
+# mode 0700 and owned by the user. pipePath in gateway.json points at that file. Do not put
+# the pipe in a directory other users can write, such as /tmp or /usr/local/bin.
+[Unit]
+Description=Agent bus gateway
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agent-bus-gateway --config %h/.config/agent-bus/gateway.json
+Restart=always
+RestartSec=1
+LimitCORE=0
+
+[Install]
+WantedBy=default.target

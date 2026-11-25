@@ -1,0 +1,10 @@
+{
+  "host": "nas642",
+  "user": "mickg",
+  "routerUrl": "wss://router.example/bus",
+  "secretFile": "/home/mickg/.config/agent-bus/node-secret",
+  "socketPath": "/run/user/1000/agent-bus-gateway.sock",
+  "wakeStore": "/home/mickg/.local/state/agent-bus/wakes.json",
+  "pipePath": "/home/mickg/.local/libexec/agent-bus/agent-bus-pipe",
+  "adapters": []
+}

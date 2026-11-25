@@ -5,6 +5,8 @@ export type AgentRec = Target & {
   cwd?: string
   /** Set when the agent is registered. Not inferred from cwd or a native listing. */
   transport: Transport
+  /** Process start time captured at registration. `linux:<ticks>` or `darwin:<sec>.<usec>`. */
+  started: string
   /** Bumped on every add. Pipe connections captured an older generation are stale. */
   gen?: number
 }
