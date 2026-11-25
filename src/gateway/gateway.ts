@@ -1,14 +1,17 @@
-import { chmodSync, unlinkSync } from 'node:fs'
+import { chmodSync, mkdirSync, statSync, unlinkSync } from 'node:fs'
 import { createServer, type Server, type Socket } from 'node:net'
-import { stepDelivery } from './deliver.js'
+import { dirname } from 'node:path'
+import { selectAdapter, stepDelivery, type DeliverTarget } from './deliver.js'
 import { verifyPipePeer, type PeerInfo } from './peer.js'
 import { type AgentRec, Registry } from './registry.js'
 import { RouterLink } from './router-link.js'
 import { WakeStore, type Attempt, type AttemptState } from './store.js'
 import {
   assertAlias, buildNudge,
-  type Adapter, type DeliveryResult, type GatewayToRouterMessage, type LeaseResult, type Nudge, type Target, type WakeResult,
+  type Adapter, type DeliveryResult, type GatewayToRouterMessage, type LeaseResult, type WakeResult,
 } from './types.js'
+
+const MAX_LINE = 1024 * 1024
 
 type Line = { op?: string; conv?: string; cwd?: string; receipt?: string; leaseId?: string; id?: string }
 
@@ -62,20 +65,21 @@ export class Gateway {
   }
 
   /**
-   * Wake at most once. `unavailable` tries the next adapter. held, refused, woken and uncertain do not.
-   * The wake row is fsynced, then the router is marked uncertain, then the adapter runs.
+   * Wake at most once. Exactly one adapter matches `(kind, transport)`.
+   * `unavailable` from that adapter is terminal: the session stays pull-only and no other adapter runs.
+   * The wake row stores `n`, then the router is marked uncertain, then the adapter runs.
    * wakeResult is sent only after that I/O returns. No row means nothing was begun, so nothing is finished.
    */
-  async deliver(target: Target, msgId: string, nudge: Nudge, opts?: { reconcile?: boolean }): Promise<DeliveryResult> {
+  async deliver(target: DeliverTarget, msgId: string, n: number, opts?: { reconcile?: boolean }): Promise<DeliveryResult> {
     const before = this.store.get(msgId)
     if (before && isTerminal(before.state)) {
       const result = toWake(before)
       this.router.wakeResult(before.alias, msgId, result)
       return result
     }
-    if (opts?.reconcile && !before) return this.reconcileMissing(target, nudge)
+    if (opts?.reconcile && !before) return this.reconcileMissing(target, msgId, n)
     const result = await stepDelivery({
-      store: this.store, adapters: this.adapters, target, msgId, nudge,
+      store: this.store, adapters: this.adapters, target, msgId, n,
       onPending: () => this.router.mark(target.alias, msgId),
     })
     if (result.s === 'queued') return result
@@ -99,15 +103,28 @@ export class Gateway {
   }
 
   async listen(sockPath: string): Promise<void> {
+    privateDir(dirname(sockPath))
     try { unlinkSync(sockPath) } catch { /* absent */ }
     this.server = createServer(sock => this.onConn(sock))
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once('error', reject)
-      this.server!.listen(sockPath, () => {
-        chmodSync(sockPath, 0o600)
-        resolve()
+    const previous = process.umask(0o077)
+    let restored = false
+    const restore = () => {
+      if (restored) return
+      restored = true
+      process.umask(previous)
+    }
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.server!.once('error', err => { restore(); reject(err) })
+        this.server!.listen(sockPath, () => {
+          try { chmodSync(sockPath, 0o600) } finally { restore() }
+          resolve()
+        })
       })
-    })
+    } catch (err) {
+      restore()
+      throw err
+    }
     this.router.registerGateway(this.opts.host, this.opts.user)
   }
 
@@ -119,17 +136,16 @@ export class Gateway {
   private onRouterWake(frame: { as: string; msgId: string; n: number; reconcile?: true }): Promise<DeliveryResult> {
     const rec = this.registry.byAlias(frame.as)
     if (!rec) return Promise.resolve({ s: 'unavailable' })
-    const nudge = buildNudge(rec.kind, rec.conv, frame.msgId, frame.n)
-    const run = this.deliver(rec, frame.msgId, nudge, { reconcile: frame.reconcile === true })
+    const run = this.deliver(rec, frame.msgId, frame.n, { reconcile: frame.reconcile === true })
     this.tail = this.tail.then(() => run.then(() => undefined, () => undefined))
     return run
   }
 
-  private async reconcileMissing(target: Target, nudge: Nudge): Promise<WakeResult> {
-    const adapter = this.adapters.find(item => item.kind === target.kind)
+  private async reconcileMissing(target: DeliverTarget, msgId: string, n: number): Promise<WakeResult> {
+    const adapter = selectAdapter(this.adapters, target.kind, target.transport)
     if (!adapter) return { s: 'uncertain' }
-    const result = await adapter.reconcile(target, nudge)
-    if (result.s !== 'unavailable') this.router.wakeResult(target.alias, nudge.msgId, result)
+    const result = await adapter.reconcile(target, buildNudge(target.kind, target.conv, msgId, n))
+    if (result.s !== 'unavailable') this.router.wakeResult(target.alias, msgId, result)
     return result
   }
 
@@ -147,6 +163,11 @@ export class Gateway {
     let buf = ''
     sock.on('data', chunk => {
       buf += chunk.toString()
+      if (buf.length > MAX_LINE) {
+        buf = ''
+        sock.destroy()
+        return
+      }
       let nl = buf.indexOf('\n')
       while (nl >= 0) {
         const line = buf.slice(0, nl)
@@ -217,9 +238,18 @@ function toWake(row: Attempt): WakeResult {
   return { s: 'uncertain' }
 }
 
+/** Create the socket directory at 0700 when this process owns it. Never chmod a directory owned by someone else. */
+function privateDir(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 })
+  if (process.getuid === undefined) return
+  if (statSync(path).uid !== process.getuid()) return
+  chmodSync(path, 0o700)
+}
+
 /**
  * cwd in the payload is ignored. The verified parent may host several conversations,
  * so the runner names the conv on each call. One registered conv may be omitted.
+ * That parent is one trust domain for every conv it registered.
  */
 function pickAgent(agents: readonly AgentRec[], conv: string | undefined): { ok: true; agent: AgentRec } | { ok: false; error: string } {
   if (typeof conv === 'string' && conv.length > 0) {

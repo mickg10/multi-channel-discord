@@ -8,5 +8,5 @@ export { WakeStore, type Attempt, type AttemptState } from './store.js'
 export {
   assertAlias, assertNodeSecret, buildNudge, identityKey, makeNudge, nudgeNumber, nudgeText, redactFrame,
   type Adapter, type DeliveryResult, type GatewayToRouterMessage, type Kind, type LeaseResult, type Nudge,
-  type RouterToGatewayMessage, type Target, type WakeResult,
+  type RouterToGatewayMessage, type Target, type Transport, type WakeResult,
 } from './types.js'

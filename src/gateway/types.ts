@@ -10,12 +10,13 @@ import {
   type Nudge,
   type RouterToGatewayMessage,
   type Target,
+  type Transport,
   type WakeResult,
 } from '../types.js'
 
 export { buildNudge, identityKey, nudgeText }
 export type {
-  Adapter, GatewayToRouterMessage, Kind, LeaseResult, Nudge, RouterToGatewayMessage, Target, WakeResult,
+  Adapter, GatewayToRouterMessage, Kind, LeaseResult, Nudge, RouterToGatewayMessage, Target, Transport, WakeResult,
 }
 
 /** Local only. A second message waits. It is not a router state and not a fallback. */
