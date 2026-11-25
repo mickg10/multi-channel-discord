@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { once } from 'node:events'
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtemp, stat } from 'node:fs/promises'
 import { connect } from 'node:net'
@@ -467,7 +468,7 @@ describe('gateway skeleton', () => {
     } finally { await first.close() }
   })
 
-  test('a pipe captured before rebind cannot address the new conversation', async () => {
+  test('a verified pipe resolves a rebound conversation on its next call', async () => {
     const g = await gateway()
     try {
       g.setPeer(pipe(parent.pid))
@@ -492,21 +493,39 @@ describe('gateway skeleton', () => {
       socket.write(JSON.stringify(mcpCall({ op: 'check_inbox', conv: parent.conv })) + '\n')
       expect(await read()).toMatchObject({ ok: false, error: 'Conversation identity is missing, mismatched, or stale' })
       expect(g.frames.filter(frame => frame.type === 'lease')).toHaveLength(before)
+      socket.write(JSON.stringify(mcpCall({ op: 'check_inbox', conv: 'moved' })) + '\n')
+      expect((await read()).ok).toBe(true)
+      expect(g.frames.filter(frame => frame.type === 'lease')).toHaveLength(before + 1)
       socket.end()
     } finally { await g.gw.close() }
   })
 
-  test('a line over 1 MiB closes the socket and does not lease', async () => {
+  test('MCP permits multiple frames and disconnects on an oversized partial frame', async () => {
     const g = await gateway()
     try {
       g.setPeer(pipe(parent.pid))
       const socket = connect(g.sock)
-      socket.on('error', () => {})
-      await new Promise<void>((resolve, reject) => { socket.once('connect', () => resolve()); socket.once('error', reject) })
-      const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
-      socket.write(Buffer.alloc(1024 * 1024 + 1, 0x61))
+      await once(socket, 'connect')
+      const request = JSON.stringify(mcpCall({ op: 'check_inbox', conv: parent.conv }))
+      const frames = new Promise<void>(resolve => {
+        let replies = ''
+        socket.on('data', chunk => {
+          replies += chunk.toString()
+          if (replies.split('\n').length >= 3) resolve()
+        })
+      })
+      const padding = ' '.repeat(600 * 1024)
+      socket.write(request + padding + '\n' + request + padding + '\n')
+      await frames
+      const before = g.frames.length
+      const closed = new Promise<void>(resolve => { socket.once('close', () => resolve()) })
+      socket.on('error', (error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ECONNRESET') throw error
+      })
+      socket.write(padding)
+      socket.write(padding)
       await closed
-      expect(g.frames.some(frame => frame.type === 'lease')).toBe(false)
+      expect(g.frames).toHaveLength(before)
     } finally { await g.gw.close() }
   })
 

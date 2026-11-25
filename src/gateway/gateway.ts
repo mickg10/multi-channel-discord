@@ -166,6 +166,7 @@ export class Gateway {
   private onConn(sock: Socket): void {
     this.conns.add(sock)
     sock.on('close', () => this.conns.delete(sock))
+    sock.on('error', () => sock.destroy())
     const peer = this.opts.readPeer?.(sock)
     const verdict = peer ? this.verify(peer, this.registry, this.opts.pipePath) : { ok: false as const, error: 'no peer credentials' }
     if (!verdict.ok) {
@@ -174,11 +175,11 @@ export class Gateway {
       return
     }
     if (this.opts.onVerifiedConnection) this.opts.onVerifiedConnection(sock, verdict.agents)
-    else this.onVerifiedConnection(sock, verdict.agents)
+    else if (peer) this.onVerifiedConnection(sock, peer.ppid)
   }
 
-  private onVerifiedConnection(sock: Socket, agents: readonly AgentRec[]): void {
-    void serveGatewayMcp(sock, sock, agents, agent => this.registry.matches(agent), async (agent, op, args) => {
+  private onVerifiedConnection(sock: Socket, parentPid: number): void {
+    void serveGatewayMcp(sock, sock, () => this.registry.byPid(parentPid), agent => this.registry.matches(agent), async (agent, op, args) => {
       if (op !== 'lease') return this.router.tool(agent.alias, op, args)
       const leased = await this.router.lease(agent.alias, args.receipt as string | undefined)
       this.store.clearOpen(agent.conv)

@@ -1,7 +1,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import type { Readable, Writable } from 'node:stream'
+import { Transform, type Readable, type Writable } from 'node:stream'
 import type { AgentRec } from './registry.js'
 
 const string = { type: 'string' }
@@ -22,6 +22,7 @@ const tools = {
 
 const wireKeys: Record<string, string> = { chat_id: 'chatId', reply_to: 'replyTo' }
 const readOnly = new Set(['fetch_messages', 'bus_sessions', 'list_claims', 'mcp_list', 'mcp_describe'])
+const maxFrameBytes = 1024 * 1024
 
 export function resolveMcpAgent(agents: readonly AgentRec[], meta: Record<string, unknown> | undefined): AgentRec | undefined {
   const candidates = agents.filter(agent => {
@@ -36,7 +37,7 @@ export function resolveMcpAgent(agents: readonly AgentRec[], meta: Record<string
 export function serveGatewayMcp(
   input: Readable,
   output: Writable,
-  agents: readonly AgentRec[],
+  agentsForCall: () => readonly AgentRec[],
   matches: (agent: AgentRec) => boolean,
   invoke: (agent: AgentRec, op: string, args: Record<string, unknown>) => Promise<string>,
 ): Promise<void> {
@@ -48,7 +49,7 @@ export function serveGatewayMcp(
     })),
   }))
   mcp.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
-    const agent = resolveMcpAgent(agents, params._meta)
+    const agent = resolveMcpAgent(agentsForCall(), params._meta)
     const error = (text: string) => ({ isError: true, content: [{ type: 'text' as const, text }] })
     if (!agent || !matches(agent)) return error('Conversation identity is missing, mismatched, or stale')
     if (!Object.hasOwn(tools, params.name)) return error('Unknown gateway tool')
@@ -69,6 +70,26 @@ export function serveGatewayMcp(
       return error(err instanceof Error ? err.message : 'Router request failed')
     }
   })
-  output.once('close', () => { void mcp.close() })
-  return mcp.connect(new StdioServerTransport(input, output))
+  let frameBytes = 0
+  const bounded = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      let offset = 0
+      while (offset < chunk.length) {
+        const newline = chunk.indexOf(10, offset)
+        const end = newline < 0 ? chunk.length : newline
+        frameBytes += end - offset
+        if (frameBytes > maxFrameBytes) {
+          callback(new Error('MCP frame too large'))
+          return
+        }
+        if (newline < 0) break
+        frameBytes = 0
+        offset = newline + 1
+      }
+      callback(null, chunk)
+    },
+  })
+  bounded.once('error', () => { input.destroy(); output.destroy() })
+  output.once('close', () => { bounded.destroy(); void mcp.close() })
+  return mcp.connect(new StdioServerTransport(bounded, output)).then(() => { input.pipe(bounded) })
 }
