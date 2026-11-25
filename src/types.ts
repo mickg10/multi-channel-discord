@@ -321,7 +321,10 @@ export interface ProjectHistoryEntry {
 
 // Native gateway protocol (v1).
 export type Kind = 'claude' | 'codex' | 'opencode' | 'grok' | 'agy'
-export const NUDGE_CONST = 'Check your agent bus inbox.' as const
+export function nudgeText(n: number): string {
+  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError('Invalid nudge id')
+  return `[agent-bus] mail waiting (id ${n}) — call check_inbox`
+}
 
 export interface Target {
   readonly host: string
@@ -331,7 +334,7 @@ export interface Target {
   readonly alias: string
 }
 
-export type Nudge = { msgId: string; text: typeof NUDGE_CONST; clientId: string }
+export type Nudge = { msgId: string; text: string; clientId: string }
 export type WakeResult =
   | { s: 'woken'; nativeId: string }
   | { s: 'held' | 'refused' | 'uncertain' | 'unavailable' }
@@ -370,7 +373,7 @@ export type GatewayToRouterMessage =
   | { type: 'registerGateway'; host: string; user: string; proto: 1; secret: string; requestId?: string }
   | { type: 'registerAgent'; kind: Kind; conv: string; alias: string; host?: string; requestId?: string }
   | { type: 'lease'; as: string; requestId: string; receipt?: string }
-  | { type: 'ack'; as: string; requestId: string; leaseId: string; id: string }
+  | { type: 'ack'; as: string; requestId: string; leaseId: string; id: string; receipt: string }
   | { type: 'mark'; as: string; requestId: string; id: string; state: 'uncertain' }
   | { type: 'wakeResult'; as: string; requestId: string; id: string; result: WakeResult }
   | (WsBusPost & { as: string; requestId: string })
