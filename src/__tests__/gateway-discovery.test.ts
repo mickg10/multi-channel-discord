@@ -41,6 +41,7 @@ async function setup(overrides: Partial<DiscoveryOptions> = {}, host = 'nas642')
     processIdentity: identity,
     resolveCodexPeer: path => identity(path === '/fixture/other.sock' ? 456 : 123),
     publishCodexSocket: () => {},
+    publishOpencodeServicePath: () => {},
     ...overrides,
   })
   cleanups.push(() => discovery.stop())
@@ -364,6 +365,55 @@ test('OpenCode sends only authenticated GETs and follows cursor.next after the l
   ] })
   expect(gateway.registry.matches(restarted)).toBe(true)
   expect(frames).toHaveLength(4)
+})
+
+test('OpenCode only publishes verified descriptor paths and can update one without registering again', async () => {
+  let sources: DiscoveryConfig['discoveries'] = []
+  let stale = false
+  const publications: Array<[string, string | undefined]> = []
+  const conv = 'ses_exampleA'
+  const { dir, discovery, gateway, frames, writeBindings } = await setup({
+    readConfig: () => ({ discoveries: sources, gatewayAliasHosts: { [bare]: 'nas642' } }),
+    processIdentity: pid => identity(pid, stale ? 'linux:2' : 'linux:1'),
+    fetchOpencode: async input => {
+      if (new URL(input).searchParams.has('cursor')) {
+        if (sources[0]?.id === 'stale') stale = true
+        return Response.json({ data: [], cursor: { previous: null, next: null } })
+      }
+      return Response.json({ data: [{ id: conv }, { id: 'ses_unmapped' }], cursor: { previous: null, next: 'end' } })
+    },
+    publishOpencodeServicePath: (session, path) => publications.push([session, path]),
+  })
+  const oldPath = join(dir, 'old.json')
+  const newPath = join(dir, 'new.json')
+  const oldSource = { id: 'old', kind: 'opencode', servicePath: oldPath } as const
+  const newSource = { id: 'new', kind: 'opencode', servicePath: newPath } as const
+  for (const path of [oldPath, newPath]) {
+    await writeFile(path, JSON.stringify({ pid: 100, url: 'http://127.0.0.1:12345', password: 'fixture' }), { mode: 0o600 })
+  }
+  await writeBindings({ [bare]: { kind: 'opencode', conv } })
+  sources = [oldSource]
+  expect(await discovery.refresh()).toMatchObject({ bindings: [{ status: 'registered' }] })
+  const registration = gateway.registry.byAlias(bare)!
+  expect(await discovery.refresh()).toMatchObject({ bindings: [{ status: 'unchanged' }] })
+  expect(publications).toEqual([[conv, oldPath], [conv, oldPath]])
+
+  sources = [oldSource, newSource]
+  expect(await discovery.refresh()).toMatchObject({ bindings: [{ status: 'conflict' }] })
+  sources = [{ ...newSource, servicePath: join(dir, 'missing.json') }]
+  expect(await discovery.refresh()).toMatchObject({ bindings: [{ status: 'incomplete' }] })
+  sources = [{ ...newSource, id: 'stale' }]
+  expect(await discovery.refresh()).toMatchObject({ bindings: [{ status: 'incomplete' }] })
+  sources = []
+  expect(await discovery.refresh()).toMatchObject({ bindings: [{ status: 'not_listed' }] })
+  expect(publications).toEqual([[conv, oldPath], [conv, oldPath]])
+
+  stale = false
+  sources = [newSource]
+  expect(await discovery.refresh()).toMatchObject({ bindings: [{ status: 'unchanged' }] })
+  expect(publications).toEqual([[conv, oldPath], [conv, oldPath], [conv, newPath]])
+  expect(gateway.registry.matches(registration)).toBe(true)
+  expect(frames).toHaveLength(1)
 })
 
 test('OpenCode refuses malformed cursor objects, IDs, loops and oversized responses without registering', async () => {

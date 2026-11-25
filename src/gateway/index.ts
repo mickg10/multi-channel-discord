@@ -9,7 +9,7 @@ export {
 } from './peer-cred.js'
 export { splicePipe } from './pipe.js'
 export {
-  adaptersFor, builtinAdapters, gatewayMain, loadConfig, readNodeSecret, registerAdapter, setCodexControlSocket, startHost,
+  adaptersFor, builtinAdapters, gatewayMain, loadConfig, readNodeSecret, registerAdapter, setCodexControlSocket, setOpencodeServicePath, startHost,
   type AdapterBinding, type DiscoveryControl, type GatewayConfig, type HostHandle,
 } from './host.js'
 export { Registry, type AgentRec } from './registry.js'

@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import { chmodSync, mkdirSync, readFileSync, readlinkSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { FakeAdapter, Registry, adaptersFor, builtinAdapters, darwinStartTime, loadConfig, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, readNodeSecret, startHost, startTimeFromStat, verifyPipePeer, type AdapterBinding, type DarwinSys, type GatewayToRouterMessage } from '../gateway/index.js'
+import { FakeAdapter, Registry, adaptersFor, builtinAdapters, darwinStartTime, loadConfig, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, readNodeSecret, setOpencodeServicePath, startHost, startTimeFromStat, verifyPipePeer, type AdapterBinding, type DarwinSys, type GatewayToRouterMessage } from '../gateway/index.js'
+import { buildNudge, type Target } from '../types.js'
 import { LOCAL_PEERCRED, LOCAL_PEERPID, SOL_LOCAL } from '../gateway/peer-cred.js'
 
 const root = join(import.meta.dir, '../..')
@@ -97,6 +98,70 @@ test('the cli builds the codex and opencode adapters from their transports', () 
     'codex/codex-queue',
     'opencode/opencode-queue',
   ])
+})
+
+test('the built-in OpenCode adapter resolves published descriptors on each operation', async () => {
+  const dir = await tempDir()
+  const originalFetch = globalThis.fetch
+  const originalStateHome = process.env.XDG_STATE_HOME
+  const targets = ['ses_publishedA', 'ses_publishedB'].map((conv): Target =>
+    ({ host: 'nas642', user: 'fixture', kind: 'opencode', conv, alias: conv }))
+  const unknown: Target = { ...targets[0], conv: 'ses_unpublished' }
+  const requests: Array<{ url: string; authorization: string | null }> = []
+  try {
+    process.env.XDG_STATE_HOME = dir
+    mkdirSync(join(dir, 'opencode'))
+    writeFileSync(join(dir, 'opencode', 'service.json'),
+      JSON.stringify({ url: 'http://127.0.0.1:43200', password: 'fake-default' }), { mode: 0o600 })
+    globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const request = new Request(input, init)
+      requests.push({ url: request.url, authorization: request.headers.get('authorization') })
+      const path = new URL(request.url).pathname
+      if (path === '/api/session/active') return Response.json({ data: {} })
+      const [, , , conv, action] = path.split('/')
+      const nudge = buildNudge('opencode', conv, 'fixture-message', 1)
+      const queued = { id: nudge.clientId, sessionID: conv, delivery: 'queue', payload: { text: nudge.text } }
+      return Response.json({ data: action === 'prompt' ? queued : action === 'inbox' ? [queued] : { id: conv } })
+    }, { preconnect: originalFetch.preconnect })
+    const [adapter] = builtinAdapters([{ kind: 'opencode', transport: 'opencode-queue' }])
+
+    async function expectUnavailable(target: Target) {
+      const nudge = buildNudge('opencode', target.conv, 'fixture-message', 1)
+      expect(await adapter.probe(target)).toEqual({ ok: false })
+      expect(await adapter.wake(target, nudge)).toEqual({ s: 'unavailable' })
+      expect(await adapter.reconcile(target, nudge)).toEqual({ s: 'unavailable' })
+    }
+    await expectUnavailable(targets[0])
+    expect(requests).toEqual([])
+
+    const services = targets.map((target, index) => {
+      const origin = 'http://127.0.0.1:' + (43201 + index)
+      const password = 'fixture-' + index
+      const descriptor = join(dir, target.conv + '.json')
+      writeFileSync(descriptor, JSON.stringify({ url: origin, password }), { mode: 0o600 })
+      setOpencodeServicePath(target.conv, descriptor)
+      return { target, origin, password }
+    })
+    for (const { target, origin, password } of services) {
+      const nudge = buildNudge('opencode', target.conv, 'fixture-message', 1)
+      const woken = { s: 'woken', nativeId: nudge.clientId } as const
+      expect(await adapter.probe(target)).toEqual({ ok: true })
+      expect(await adapter.wake(target, nudge)).toEqual(woken)
+      expect(await adapter.reconcile(target, nudge)).toEqual(woken)
+      const session = '/api/session/' + target.conv
+      expect(requests.splice(0)).toEqual(['/api/session/active', session, session + '/prompt', session + '/inbox'].map(path => ({
+        url: origin + path, authorization: 'Basic ' + Buffer.from('opencode:' + password).toString('base64'),
+      })))
+    }
+    await expectUnavailable(unknown)
+    expect(requests).toEqual([])
+  } finally {
+    globalThis.fetch = originalFetch
+    if (originalStateHome === undefined) delete process.env.XDG_STATE_HOME
+    else process.env.XDG_STATE_HOME = originalStateHome
+    for (const target of targets) setOpencodeServicePath(target.conv, undefined)
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('a group-readable node secret is refused', async () => {

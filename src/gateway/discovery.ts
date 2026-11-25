@@ -5,7 +5,7 @@ import { isAbsolute } from 'node:path'
 import { connectCodexUnix, inspectSocket, sameSocket, supportedVersion } from './adapters/codex.js'
 import { openOpencodeListing, type OpencodeListingFetch } from './adapters/opencode.js'
 import type { Gateway } from './gateway.js'
-import { setCodexControlSocket } from './host.js'
+import { setCodexControlSocket, setOpencodeServicePath } from './host.js'
 import { processIdentity, readPeer, type ProcessIdentity } from './peer-cred.js'
 import type { AgentRec } from './registry.js'
 import { assertAlias, identityKey } from './types.js'
@@ -42,6 +42,7 @@ export interface DiscoveryOptions {
   processIdentity?: typeof processIdentity
   resolveCodexPeer?(path: string, signal: AbortSignal): ProcessIdentity | undefined | Promise<ProcessIdentity | undefined>
   publishCodexSocket?: typeof setCodexControlSocket
+  publishOpencodeServicePath?: typeof setOpencodeServicePath
   fetchOpencode?: OpencodeListingFetch
   intervalMs?: number
   deadlineMs?: number
@@ -406,7 +407,7 @@ export class NativeDiscovery {
     // owns its identity even if its binding or source disappeared.
     const existing = new Map(gateway.registry.list().map(rec => [identityKey(rec), rec]))
     const plan = configuredBindings.map(({ alias, kind, conv, pid: explicitPid }): {
-      outcome: BindingResult; target?: AgentRec; controlSocket?: string
+      outcome: BindingResult; target?: AgentRec; source?: DiscoverySource
     } => {
       const outcome = (status: BindingResult['status']) => ({ outcome: { alias, status } })
       const match = inventories.get(kind)?.get(conv)
@@ -424,15 +425,14 @@ export class NativeDiscovery {
       const transport = kind === 'codex' ? 'codex-queue' : 'opencode-queue'
       const { pid, started } = match.process
       const target: AgentRec = { alias, conv, kind, host, user, pid, started, transport }
-      const controlSocket = match.source.kind === 'codex' ? match.source.controlSocket : undefined
       if (current && identityKey(current) === identity && current.pid === pid &&
           current.started === started && current.transport === transport) {
-        return { ...outcome('unchanged'), target, controlSocket }
+        return { ...outcome('unchanged'), target, source: match.source }
       }
       return {
         ...outcome('blocked'),
         target,
-        controlSocket,
+        source: match.source,
       }
     })
     check()
@@ -448,8 +448,9 @@ export class NativeDiscovery {
     }
     check()
     const conflict = plan.some(({ outcome }) => outcome.status === 'conflict')
-    const publish = this.options.publishCodexSocket ?? setCodexControlSocket
-    const bindings = plan.map(({ outcome, target, controlSocket }): BindingResult => {
+    const publishCodex = this.options.publishCodexSocket ?? setCodexControlSocket
+    const publishOpencode = this.options.publishOpencodeServicePath ?? setOpencodeServicePath
+    const bindings = plan.map(({ outcome, target, source }): BindingResult => {
       if (!target) return outcome
       if (staleKinds.has(target.kind)) return { alias: outcome.alias, status: 'incomplete' }
       if (conflict || staleKinds.size > 0) return outcome
@@ -462,9 +463,10 @@ export class NativeDiscovery {
         }
       }
       const current = gateway.registry.byAlias(outcome.alias)
-      if (controlSocket && current && identityKey(current) === identityKey(target) &&
+      if (source && current && identityKey(current) === identityKey(target) &&
           current.pid === target.pid && current.started === target.started && current.transport === target.transport) {
-        publish(target.conv, controlSocket)
+        if (source.kind === 'codex') publishCodex(target.conv, source.controlSocket)
+        else publishOpencode(target.conv, source.servicePath)
       }
       return outcome
     })

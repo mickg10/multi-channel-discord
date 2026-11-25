@@ -319,9 +319,12 @@ the new generation even when the OS reuses the PID. Update an optional binding
 PID assertion when the daemon's numeric PID changes. Pipe credentials with the
 old parent start time cannot authenticate against the new generation.
 
-Discovery publishes verified Codex control paths to the host's built-in Codex
-adapter for new and unchanged registrations. Conflicts block publication.
-Outages preserve previously published paths for mail recovery.
+Discovery publishes verified Codex control socket paths and OpenCode service
+descriptor paths by conversation for new and unchanged registrations. The
+built-in adapters require a published path and have no default endpoint
+fallback. A newly verified path can replace the published path without changing
+the registration generation. Outages, removals, and conflicts preserve
+previously published paths for mail recovery.
 
 Discovery pins Codex registrations to `codex-queue` and OpenCode registrations
 to `opencode-queue`. The gateway selects exactly one adapter for the registered

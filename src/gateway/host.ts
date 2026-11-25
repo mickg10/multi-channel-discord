@@ -46,6 +46,7 @@ export function registerAdapter(kind: Kind, transport: Transport, factory: () =>
 }
 
 const codexSockets = new Map<string, string>()
+const opencodeServicePaths = new Map<string, string>()
 
 /** PR5b publishes the live Codex control socket here. The pid still comes from that socket's peer. */
 export function setCodexControlSocket(conv: string, path: string | undefined): void {
@@ -53,12 +54,17 @@ export function setCodexControlSocket(conv: string, path: string | undefined): v
   else codexSockets.delete(conv)
 }
 
+export function setOpencodeServicePath(conv: string, path: string | undefined): void {
+  if (path) opencodeServicePaths.set(conv, path)
+  else opencodeServicePaths.delete(conv)
+}
+
 /** Codecs the CLI can construct. Other transports stay unregistered until their adapter PR lands. */
 export function builtinAdapters(bindings: readonly AdapterBinding[]): Adapter[] {
   registerAdapter('codex', 'codex-queue', () => createCodexAdapter({
     resolveControlSocket: target => codexSockets.get(target.conv),
   }))
-  registerAdapter('opencode', 'opencode-queue', () => createOpencodeAdapter())
+  registerAdapter('opencode', 'opencode-queue', () => createOpencodeAdapter(target => opencodeServicePaths.get(target.conv)))
   return adaptersFor(bindings)
 }
 

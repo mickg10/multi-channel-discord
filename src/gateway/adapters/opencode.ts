@@ -103,15 +103,21 @@ function matchesQueued(value: unknown, target: Target, nudge: Nudge): boolean {
 }
 
 export function createOpencodeAdapter(
-  servicePath = join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'opencode', 'service.json'),
+  servicePath: string | ((target: Target) => string | undefined) =
+    join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'opencode', 'service.json'),
   fetchRequest: typeof globalThis.fetch = globalThis.fetch,
 ): Adapter {
+  function requestFor(target: Target) {
+    const path = typeof servicePath === 'function' ? servicePath(target) : servicePath
+    if (path !== undefined) return serviceRequest(path, fetchRequest)
+  }
+
   return {
     kind: 'opencode',
     transport: 'opencode-queue',
     async probe(target) {
       const endpoint = sessionPath(target)
-      const request = endpoint && await serviceRequest(servicePath, fetchRequest)
+      const request = endpoint && await requestFor(target)
       if (!request) return { ok: false }
       try {
         const active = await request('/api/session/active')
@@ -125,7 +131,7 @@ export function createOpencodeAdapter(
     async wake(target, nudge) {
       if (!validNudge(nudge)) return { s: 'refused' }
       const endpoint = sessionPath(target)
-      const request = endpoint && await serviceRequest(servicePath, fetchRequest)
+      const request = endpoint && await requestFor(target)
       if (!request) return { s: 'unavailable' }
       try {
         const response = await request(endpoint + '/prompt', { text: nudge.text, id: nudge.clientId, delivery: 'queue' })
@@ -144,7 +150,7 @@ export function createOpencodeAdapter(
     async reconcile(target, nudge) {
       if (!validNudge(nudge)) return { s: 'refused' }
       const endpoint = sessionPath(target)
-      const request = endpoint && await serviceRequest(servicePath, fetchRequest)
+      const request = endpoint && await requestFor(target)
       if (!request) return { s: 'unavailable' }
       try {
         const inbox = await request(endpoint + '/inbox')
