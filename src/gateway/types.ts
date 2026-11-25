@@ -4,7 +4,7 @@ import {
   buildNudge,
   nudgeText,
   type Adapter,
-  type GatewayToRouterMessage,
+  type GatewayToRouterMessage as CoreGatewayToRouterMessage,
   type Kind,
   type LeaseResult,
   type Nudge,
@@ -16,7 +16,14 @@ import {
 
 export { buildNudge, identityKey, nudgeText }
 export type {
-  Adapter, GatewayToRouterMessage, Kind, LeaseResult, Nudge, RouterToGatewayMessage, Target, Transport, WakeResult,
+  Adapter, Kind, LeaseResult, Nudge, RouterToGatewayMessage, Target, Transport, WakeResult,
+}
+
+export type GatewayToRouterMessage = CoreGatewayToRouterMessage | {
+  type: 'gatewayOp'
+  as: string
+  requestId: string
+  op: string
 }
 
 /** Local only. A second message waits. It is not a router state and not a fallback. */

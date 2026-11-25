@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, statSync, unlinkSync } from 'node:fs'
 import { createServer, type Server, type Socket } from 'node:net'
 import { dirname } from 'node:path'
 import { selectAdapter, stepDelivery, type DeliverTarget } from './deliver.js'
+import { serveGatewayMcp } from './mcp.js'
 import { verifyPipePeer, type PeerInfo } from './peer.js'
 import { type AgentRec, Registry } from './registry.js'
 import { RouterLink } from './router-link.js'
@@ -10,10 +11,6 @@ import {
   assertAlias, buildNudge,
   type Adapter, type DeliveryResult, type GatewayToRouterMessage, type LeaseResult, type WakeResult,
 } from './types.js'
-
-const MAX_LINE = 1024 * 1024
-
-type Line = { op?: string; conv?: string; cwd?: string; receipt?: string; leaseId?: string; id?: string }
 
 export type GatewayOpts = {
   host: string
@@ -37,7 +34,6 @@ export class Gateway {
   private adapters: Adapter[] = []
   private server?: Server
   private conns = new Set<Socket>()
-  private queue = new WeakMap<Socket, Promise<void>>()
   private tail: Promise<unknown> = Promise.resolve()
   private verify: typeof verifyPipePeer
 
@@ -177,73 +173,17 @@ export class Gateway {
       sock.end()
       return
     }
-    const agents = verdict.agents
-    this.opts.onVerifiedConnection?.(sock, agents)
-    let buf = ''
-    sock.on('data', chunk => {
-      buf += chunk.toString()
-      if (buf.length > MAX_LINE) {
-        buf = ''
-        sock.destroy()
-        return
-      }
-      let nl = buf.indexOf('\n')
-      while (nl >= 0) {
-        const line = buf.slice(0, nl)
-        buf = buf.slice(nl + 1)
-        this.enqueue(sock, agents, line)
-        nl = buf.indexOf('\n')
-      }
-    })
+    if (this.opts.onVerifiedConnection) this.opts.onVerifiedConnection(sock, verdict.agents)
+    else this.onVerifiedConnection(sock, verdict.agents)
   }
 
-  private enqueue(sock: Socket, agents: readonly AgentRec[], line: string): void {
-    const prev = this.queue.get(sock) ?? Promise.resolve()
-    const next = prev.then(() => this.handleLine(sock, agents, line)).catch(err => {
-      sock.write(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'error' }) + '\n')
-    })
-    this.queue.set(sock, next)
-  }
-
-  private async handleLine(sock: Socket, agents: readonly AgentRec[], line: string): Promise<void> {
-    let msg: Line
-    try { msg = JSON.parse(line) as Line } catch {
-      sock.write(JSON.stringify({ ok: false, error: 'bad json' }) + '\n')
-      return
-    }
-    const picked = pickAgent(agents, msg.conv)
-    if (picked.ok && !this.registry.matches(picked.agent)) {
-      sock.write(JSON.stringify({ ok: false, error: 'alias rebound' }) + '\n')
-      return
-    }
-    if (msg.op === 'check_inbox') {
-      if (!picked.ok) { sock.write(JSON.stringify({ ok: false, error: picked.error }) + '\n'); return }
-      try {
-        const echoed = typeof msg.receipt === 'string' ? msg.receipt : undefined
-        const leased = await this.router.lease(picked.agent.alias, echoed)
-        this.store.clearOpen(picked.agent.conv)
-        sock.write(JSON.stringify({ ok: true, ...leased }) + '\n')
-      } catch (err) {
-        sock.write(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'lease failed' }) + '\n')
-      }
-      return
-    }
-    if (msg.op === 'ack') {
-      if (!picked.ok) { sock.write(JSON.stringify({ ok: false, error: picked.error }) + '\n'); return }
-      if (typeof msg.receipt !== 'string' || typeof msg.leaseId !== 'string' || typeof msg.id !== 'string') {
-        sock.write(JSON.stringify({ ok: false, error: 'invalid_receipt' }) + '\n')
-        return
-      }
-      try {
-        await this.router.ack(picked.agent.alias, msg.leaseId, msg.id, msg.receipt)
-        this.store.ack(msg.id)
-        sock.write(JSON.stringify({ ok: true }) + '\n')
-      } catch (err) {
-        sock.write(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'invalid_receipt' }) + '\n')
-      }
-      return
-    }
-    sock.write(JSON.stringify({ ok: false, error: 'unknown op' }) + '\n')
+  private onVerifiedConnection(sock: Socket, agents: readonly AgentRec[]): void {
+    void serveGatewayMcp(sock, sock, agents, agent => this.registry.matches(agent), async (agent, op, args) => {
+      if (op !== 'lease') return this.router.tool(agent.alias, op, args)
+      const leased = await this.router.lease(agent.alias, args.receipt as string | undefined)
+      this.store.clearOpen(agent.conv)
+      return JSON.stringify(leased)
+    }).catch(() => sock.destroy())
   }
 }
 
@@ -264,19 +204,4 @@ function privateDir(path: string): void {
   if (statSync(path).uid !== process.getuid()) throw new Error('directory is owned by another user')
   chmodSync(path, 0o700)
 }
-
-/**
- * cwd in the payload is ignored. The verified parent may host several conversations,
- * so the runner names the conv on each call. One registered conv may be omitted.
- * That parent is one trust domain for every conv it registered.
- */
-function pickAgent(agents: readonly AgentRec[], conv: string | undefined): { ok: true; agent: AgentRec } | { ok: false; error: string } {
-  if (typeof conv === 'string' && conv.length > 0) {
-    const agent = agents.find(item => item.conv === conv)
-    return agent ? { ok: true, agent } : { ok: false, error: 'conv not registered' }
-  }
-  if (agents.length === 1) return { ok: true, agent: agents[0]! }
-  return { ok: false, error: 'conv required' }
-}
-
 export type { LeaseResult, WakeResult }
