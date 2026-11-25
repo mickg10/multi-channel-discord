@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.8** (after R8), entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v4.9** (after R9), entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -59,7 +59,7 @@ Gateway stamps `(host,user,kind,conv-id)` on every call to the router; router re
 
 ## 4. Durability (fixes live router bugs found by codex_nas)
 **Every admitted directed message is committed to Inboxes *before* any transport, live-push or wake-budget decision.** Today's live-push and over-budget paths skip the inbox entirely (R6#2, verified on 8697214). If commit fails, the sender gets an explicit error.
-Per message, one stable msg id across reconnects: **committed** (router fsync, synchronous) → **woken** (a native ack such as Codex queue/add or opencode prompt means the *adapter's nudge was admitted*, not that mail was read) → **accepted** (the recipient's `check_inbox` returned it and acked). Terminal side-states: **held / refused / uncertain**, operator-visible, mail still readable, no fallback (N4). Implementation is a **focused Inboxes and protocol refactor**, not a router rewrite (R5#3). It needs a synchronous atomic commit, entries with id, state and lease, a lease/ACK on drain, wake attempt and ACK records, restart recovery, and overflow surfaced to the sender instead of dropping at 501.
+Per message, one stable msg id across reconnects: **committed** (router fsync, synchronous) → **woken** (a native ack such as Codex queue/add or opencode prompt means the *adapter's nudge was admitted*, not that mail was read) → **accepted** (the gateway finished writing the recipient's `check_inbox` tool result for that lease; no new tool). Terminal side-states: **held / refused / uncertain**, operator-visible, mail still readable, no fallback (N4). Implementation is a **focused Inboxes and protocol refactor**, not a router rewrite (R5#3). It needs a synchronous atomic commit, entries with id, state and lease, a lease/ACK on drain, wake attempt and ACK records, restart recovery, and overflow surfaced to the sender instead of dropping at 501.
 Commit-before-ack on enqueue; lease by msg id on drain; ack only after recipient accepted; overflow is an
 error to the sender, never silent oldest-drop; uncertain inject → "unresolved", reconciled, never replayed blindly.
 
@@ -88,6 +88,23 @@ Baseline: a same-user process is **not** a boundary. The goal is to limit what a
 - **Secrets:** the inbox-socket auth line, opencode password and agy CSRF are redacted in the serializer and raw frames are never logged. The opencode password goes in a header, never in the URL or argv. The gateway runs with `ulimit -c 0`.
 - **opencode allowlist** (replaces the denylist): GET `/api/session`, `/api/session/active`, `/api/session/{id}/inbox`, `/api/event`, `/api/session/{id}/message/*`, and POST `/api/session/{id}/prompt` with `delivery:"queue"` only.
 - Verified OK: the router sets `from_human` only for `allowFrom` authors (router.ts:355), and dispatcher re-delivery uses only the saved humanMail (ws.ts:1196).
+
+### 4c. Pinned interfaces (R9, grok_nas)
+```ts
+type Kind = 'claude'|'codex'|'opencode'|'grok'|'agy'
+type Nudge = { msgId: string; text: NUDGE_CONST; clientId: string }
+type WakeResult = {s:'woken', nativeId:string} | {s:'held'} | {s:'refused'} | {s:'uncertain'} | {s:'unavailable'}
+interface Adapter { kind: Kind; probe(t: Target): Promise<{ok:boolean}>; wake(t: Target, n: Nudge): Promise<WakeResult>; reconcile(t: Target, n: Nudge): Promise<WakeResult> }
+// Only 'unavailable' may fall through to another transport (N4).
+// Router ops (identity = `as`): admit, commit, lease(as)->[{id,leaseId,body,from,from_human}], ack(as,leaseId,id), mark(as,id,state)
+// Frames: registerGateway{host,user,proto:1,secret} registerAgent{kind,conv,alias} lease ack wakeResult
+```
+- **One state machine, on the router.** The gateway reports a `wakeResult`, and the router `mark`s `woken` only after the adapter returns `woken` (after reconcile when retried). A lease of an id already in `woken` or `uncertain` must **not** call wake again.
+- **Ids:** `h = sha256(recipientConvId + ":" + busMsgId)`. Codex `clientUserMessageId = "bus-" + hex(h)[0:32]`. opencode prompt `id = "msg_bus" + hex(h)[0:24]` (must match `^msg_`).
+- **Overflow:** per-identity cap of 5000 committed-unaccepted. Over the cap, the sender gets the error `inbox_full`; nothing is dropped.
+- **Coexistence:** M0 leases mail only for aliases that called `registerAgent`. Mail for legacy plugin aliases keeps the old drain path. JSON `check_inbox` is a per-scope flag that flips together with the scope.
+- **Canary scope:** "one real agent" means a dedicated canary scope (its own CODEX_HOME or opencode service, with one agent) before the fleet scope flips.
+- **PR split:** PR1 router (JSONL inbox, admit→commit→lease/ack, observational status). PR2 gateway skeleton (frames, registry, Adapter type, no native I/O). PR3 Codex adapter. PR4 opencode adapter. PR3 and PR4 depend only on PR2 and land in parallel.
 
 ## 5b. Codex RPC contract (pinned, R5#2)
 `initialize{capabilities.experimentalApi:true}` → version and capability allowlist (≥0.170; `thread/queue/add` present) → `thread/queue/add{threadId, input:[fixed nudge], clientUserMessageId}` and **nothing else**. Reconcile with `thread/queue/list` plus `thread/read{includeTurns:true, itemsView:"full"}`, paged to `nextCursor:null`, matching `clientUserMessageId` / `userMessage.clientId`. `clientUserMessageId` = hash(recipient threadId, bus msg id), immutable. The control socket must be owned by the user (stat check), mode 0600.
@@ -169,3 +186,10 @@ GLM may still post R3 critique; it will be appended.
 5. Token leaks → **accepted** (redaction, header, no core dumps).
 6. opencode allowlist → **accepted**.
 7. [v] from_human path → no hole.
+
+### R9 grok_nas (implementer view, 3f8ef97)
+1–2. PR split and pinned types → **accepted**, §4c.
+3. Don't lease mail a legacy plugin drains → **accepted**.
+4. The definition of "accepted" contradicted itself → **fixed**: the gateway's write of the check_inbox result is the ack.
+5. Single router state machine, no re-wake of woken/uncertain → **accepted**.
+6. Guessed values pinned: id hashes, overflow `inbox_full` at 5000, canary scope.
