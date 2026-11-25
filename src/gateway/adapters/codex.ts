@@ -1,7 +1,5 @@
 import { lstat, readlink, realpath } from "node:fs/promises";
-import { createConnection } from "node:net";
 import { dirname, isAbsolute, normalize, resolve } from "node:path";
-import WebSocket from "ws";
 import type { Adapter, Target, Nudge, WakeResult } from "../../types.js";
 
 // The gateway/router owns durable single-flight and attempt persistence.
@@ -34,6 +32,7 @@ class ProtocolError extends Error {}
 
 const DEADLINE_MS = 5_000;
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+const MAX_SESSION_BYTES = 4 * MAX_MESSAGE_BYTES;
 const MAX_PAGES = 128;
 const PAGE_SIZE = 50;
 
@@ -95,7 +94,19 @@ async function inspectSocket(registeredPath: string) {
   return { path, identities: [registrationParent, entry, socketParent, socket] };
 }
 
+export function supportsCodexUnixWebSocket(version: string | undefined): boolean {
+  const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(version ?? "");
+  if (!match || match[0] !== version) return false;
+  const [major, minor, patch] = match.slice(1).map(Number);
+  return [major, minor, patch].every(Number.isSafeInteger) &&
+    (major > 1 || (major === 1 && (minor > 3 || (minor === 3 && patch >= 13))));
+}
+
 const connectUnix: Connect = async (registeredPath, signal) => {
+  // The control endpoint uses WebSocket-over-Unix, which requires Bun >=1.3.13.
+  if (!supportsCodexUnixWebSocket(process.versions.bun) || typeof WebSocket !== "function") {
+    throw new Unavailable();
+  }
   let before;
   try {
     before = await inspectSocket(registeredPath);
@@ -105,26 +116,53 @@ const connectUnix: Connect = async (registeredPath, signal) => {
   }
   signal.throwIfAborted();
   const { path } = before;
-  const socket = createConnection({ path });
-  let ws: WebSocket | undefined;
+  // Restrict the resolved address to path characters Bun can use verbatim in the URL.
+  if (/[^a-zA-Z0-9/._~-]/.test(path)) throw new Unavailable();
+  let ws: WebSocket;
+  try {
+    ws = new WebSocket(`ws+unix://${path}`);
+  } catch {
+    throw new Unavailable();
+  }
+  const opened = Promise.withResolvers<void>();
+  let connected = false;
   let terminal: Error | undefined;
   let nextId = 0;
+  let inputBytes = 0;
   let pending: { id: number; resolve(value: unknown): void; reject(error: unknown): void } | undefined;
 
   function close(error = new Error("Codex connection closed")) {
     if (terminal) return;
     terminal = error;
+    opened.reject(error);
     pending?.reject(error);
     pending = undefined;
     signal.removeEventListener("abort", abort);
-    ws?.terminate();
-    socket.destroy();
+    if ("terminate" in ws && typeof ws.terminate === "function") ws.terminate();
+    else ws.close();
   }
 
   const abort = () => close();
   signal.addEventListener("abort", abort, { once: true });
-  socket.on("error", close);
-  socket.once("close", () => close());
+  ws.addEventListener("open", () => {
+    connected = true;
+    opened.resolve();
+  }, { once: true });
+  const disconnected = () => close(connected ? undefined : new Unavailable());
+  ws.addEventListener("error", disconnected);
+  ws.addEventListener("close", disconnected, { once: true });
+  ws.addEventListener("message", ({ data }) => {
+    if (terminal) return;
+    try {
+      if (typeof data !== "string") throw new ProtocolError();
+      const bytes = Buffer.byteLength(data);
+      inputBytes += bytes;
+      if (bytes > MAX_MESSAGE_BYTES || inputBytes > MAX_SESSION_BYTES) throw new ProtocolError();
+      receive(data);
+    } catch {
+      close(new ProtocolError());
+    }
+  });
 
   function receive(line: string) {
     const message = record(JSON.parse(line));
@@ -154,10 +192,7 @@ const connectUnix: Connect = async (registeredPath, signal) => {
   }
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      socket.once("connect", resolve);
-      socket.once("close", () => reject(terminal));
-    });
+    await opened.promise;
     const after = await inspectSocket(registeredPath);
     if (after.path !== path || after.identities.some((info, index) => {
       const previous = before.identities[index];
@@ -166,27 +201,6 @@ const connectUnix: Connect = async (registeredPath, signal) => {
     signal.throwIfAborted();
     if (terminal) throw terminal;
 
-    const connection = new WebSocket("ws://localhost", {
-      createConnection: () => socket,
-      socketPath: path,
-      maxPayload: MAX_MESSAGE_BYTES,
-      perMessageDeflate: false,
-    });
-    ws = connection;
-    connection.on("error", close);
-    connection.once("close", () => close());
-    connection.on("message", (data, isBinary) => {
-      try {
-        if (isBinary || !Buffer.isBuffer(data)) throw new ProtocolError();
-        receive(data.toString("utf8"));
-      } catch {
-        close(new ProtocolError());
-      }
-    });
-    await new Promise<void>((resolve, reject) => {
-      connection.once("open", resolve);
-      connection.once("close", () => reject(terminal));
-    });
   } catch (error) {
     close();
     if (["ENOENT", "ENOTDIR", "ECONNREFUSED"].includes(String(errorCode(error)))) {
@@ -198,10 +212,10 @@ const connectUnix: Connect = async (registeredPath, signal) => {
   function write(message: object) {
     signal.throwIfAborted();
     if (terminal) throw terminal;
-    if (!ws || ws.readyState !== WebSocket.OPEN) throw new ProtocolError();
+    if (ws.readyState !== WebSocket.OPEN) throw new ProtocolError();
     const frame = JSON.stringify(message);
     if (Buffer.byteLength(frame) > MAX_MESSAGE_BYTES) throw new ProtocolError();
-    ws.send(frame, error => { if (error) close(error); });
+    ws.send(frame);
   }
 
   return {

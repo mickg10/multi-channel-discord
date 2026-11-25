@@ -1,10 +1,9 @@
 import { expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { WebSocketServer } from "ws";
 import { buildNudge, type Target } from "../types.js";
 import { join } from "node:path";
-import { createCodexAdapter, CodexRpcError, type CodexRpc } from "../gateway/adapters/codex";
+import { createCodexAdapter, CodexRpcError, supportsCodexUnixWebSocket, type CodexRpc } from "../gateway/adapters/codex";
 import fixtures from "./fixtures/codex-reconciliation.json";
 
 const target: Target = { conv: fixtures.enqueue.params.threadId, host: "fixture", user: "fixture", kind: "codex", alias: "shared" };
@@ -57,6 +56,15 @@ test("gateway notice and client ID pass through unchanged, with only allowlisted
     expect(await adapter.wake(target, { ...nudge, clientId })).toEqual({ s: "refused" });
   }
   expect(calls).toHaveLength(4);
+});
+
+test("native Unix WebSocket requires a known Bun release at or above 1.3.13", () => {
+  for (const version of [undefined, "", "unknown", "0.9.99", "1.2.99", "1.3.12", "1.3.13-canary.1", "1.3.13\n"]) {
+    expect(supportsCodexUnixWebSocket(version)).toBe(false);
+  }
+  for (const version of ["1.3.13", "1.3.14", "1.4.5", "2.0.0"]) {
+    expect(supportsCodexUnixWebSocket(version)).toBe(true);
+  }
 });
 
 test("version and experimental queue capability gate", async () => {
@@ -304,33 +312,41 @@ test.skipIf(!(await canListenOnUnix()))("disposable WebSocket supports managed l
   const registration = join(dir, "registration");
   const seen: string[] = [];
   let mode = "success";
-  const server = createServer();
-  const wsServer = new WebSocketServer({ server });
-  wsServer.on("connection", ws => {
-    ws.on("message", data => {
-      const frame = JSON.parse(data.toString());
-      seen.push(frame.method ?? "<unexpected server-request response>");
-      const reply = (result: unknown) => ws.send(JSON.stringify({ id: frame.id, result }));
-      switch (frame.method) {
-        case "initialize":
-          reply({ userAgent: nativeBanner });
-          break;
-        case "thread/queue/list":
-          reply(empty);
-          break;
-        case "thread/queue/add":
-          if (mode === "approval") {
-            ws.send('{"id":"owner-approval","method":"item/commandExecution/requestApproval"}');
-          } else if (mode === "malformed") {
-            ws.send(JSON.stringify({ id: frame.id, result: {}, error: { code: -32603, message: "bad envelope" } }));
-          } else {
-            reply({ queuedSubmission: { id: "queued", clientUserMessageId: frame.params.clientUserMessageId } });
-          }
-      }
-    });
+  const server = Bun.serve({
+    unix: path,
+    fetch(request, server) {
+      if (mode !== "reject-upgrade" && server.upgrade(request)) return;
+      return new Response(null, { status: 400 });
+    },
+    websocket: {
+      message(ws, data) {
+        const frame = JSON.parse(data.toString());
+        seen.push(frame.method ?? "<unexpected server-request response>");
+        const reply = (result: unknown) => ws.send(JSON.stringify({ id: frame.id, result }));
+        switch (frame.method) {
+          case "initialize":
+            reply({ userAgent: nativeBanner });
+            break;
+          case "thread/queue/list":
+            reply(empty);
+            break;
+          case "thread/queue/add":
+            if (mode === "approval") {
+              ws.send('{"id":"owner-approval","method":"item/commandExecution/requestApproval"}');
+            } else if (mode === "malformed") {
+              ws.send(JSON.stringify({ id: frame.id, result: {}, error: { code: -32603, message: "bad envelope" } }));
+            } else if (mode === "rpc-error") {
+              ws.send(JSON.stringify({ id: frame.id, error: { code: -32603, message: "fixture error" } }));
+            } else if (mode === "disconnect") {
+              ws.terminate();
+            } else {
+              reply({ queuedSubmission: { id: "queued", clientUserMessageId: frame.params.clientUserMessageId } });
+            }
+        }
+      },
+    },
   });
   try {
-    await new Promise<void>((resolve, reject) => server.once("error", reject).listen(path, resolve));
     const adapter = createCodexAdapter({ resolveControlSocket: () => path });
     await chmod(path, 0o660);
     expect(await adapter.wake(target, nudge)).toEqual({ s: "unavailable" });
@@ -350,18 +366,24 @@ test.skipIf(!(await canListenOnUnix()))("disposable WebSocket supports managed l
     expect(await linkAdapter.probe(target)).toEqual({ ok: false });
     expect(seen).toEqual([]);
     await chmod(dir, 0o700);
+    mode = "reject-upgrade";
+    expect(await adapter.wake(target, nudge)).toEqual({ s: "unavailable" });
+    expect(seen).toEqual([]);
+    mode = "success";
     expect(await linkAdapter.wake(target, nudge)).toEqual({ s: "woken", nativeId: "queued" });
     expect(await adapter.wake(target, nudge)).toEqual({ s: "woken", nativeId: "queued" });
     mode = "malformed";
     expect(await adapter.wake(target, nudge)).toEqual({ s: "uncertain" });
     mode = "approval";
     expect(await adapter.wake(target, nudge)).toEqual({ s: "uncertain" });
+    mode = "rpc-error";
+    expect(await adapter.wake(target, nudge)).toEqual({ s: "uncertain" });
+    mode = "disconnect";
+    expect(await adapter.wake(target, nudge)).toEqual({ s: "uncertain" });
     const exchange = ["initialize", "initialized", "thread/queue/list", "thread/queue/add"];
-    expect(seen).toEqual([...exchange, ...exchange, ...exchange, ...exchange]);
+    expect(seen).toEqual([...exchange, ...exchange, ...exchange, ...exchange, ...exchange, ...exchange]);
   } finally {
-    for (const ws of wsServer.clients) ws.terminate();
-    wsServer.close();
-    await new Promise<void>(resolve => server.close(() => resolve()));
+    await server.stop(true);
     await rm(dir, { recursive: true, force: true });
   }
 });
