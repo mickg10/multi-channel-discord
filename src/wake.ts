@@ -83,7 +83,7 @@ export interface WakeLatch {
  * An empty drain emits nothing. If the client never acks, the latch opens again after
  * `maxInFlightMs` so a dropped turn cannot swallow later mail.
  */
-export function createWakeLatch(emit: () => void, opts: { coalesceMs?: number; maxInFlightMs?: number } = {}): WakeLatch {
+export function createWakeLatch(emit: () => void, opts: { coalesceMs?: number; maxInFlightMs?: number; pending?: () => number } = {}): WakeLatch {
   const coalesceMs = opts.coalesceMs ?? 2000
   const maxInFlightMs = opts.maxInFlightMs ?? 15 * 60_000
   let inFlight = false
@@ -96,7 +96,12 @@ export function createWakeLatch(emit: () => void, opts: { coalesceMs?: number; m
       if (inFlight) return
       inFlight = true
       if (flight) clearTimeout(flight)
-      flight = setTimeout(() => { inFlight = false; flight = null }, maxInFlightMs)
+      // If check_inbox never runs, open the latch and nudge again only while mail is still queued.
+      flight = setTimeout(() => {
+        inFlight = false
+        flight = null
+        if ((opts.pending?.() ?? 0) > 0) schedule()
+      }, maxInFlightMs)
       emit()
     }, coalesceMs)
   }

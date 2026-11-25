@@ -293,7 +293,7 @@ export async function startPlugin(): Promise<void> {
     })
     void run(['send-keys', '-t', wakePane, '-l', wakeText]).then(() => new Promise(r => setTimeout(r, 300)))
       .then(() => run(['send-keys', '-t', wakePane, 'Enter']))
-  })
+  }, { pending: () => inbox.length })
   function wake(): void {
     if (wakeMode !== 'tmux' || !wakePane) return
     wakeLatch.arrive()

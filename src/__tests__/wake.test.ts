@@ -36,6 +36,19 @@ describe('wake latch', () => {
     await flush()
     expect(n).toBe(2)
   })
+  test('a missed ack does not stick while mail is still queued', async () => {
+    let n = 0
+    let queued = 1
+    const latch = createWakeLatch(() => { n++ }, { coalesceMs: 0, maxInFlightMs: 30, pending: () => queued })
+    latch.arrive()
+    await flush()
+    expect(n).toBe(1)
+    await new Promise(r => setTimeout(r, 25))
+    expect(n).toBe(2)
+    queued = 0
+    await new Promise(r => setTimeout(r, 40))
+    expect(n).toBe(2)
+  })
   test('an empty ack does not nudge', async () => {
     let n = 0
     const latch = createWakeLatch(() => { n++ }, { coalesceMs: 0 })

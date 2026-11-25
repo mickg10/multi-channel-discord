@@ -3,6 +3,7 @@ import { createWsHandlers, deliver } from '../ws.js'
 import type { WsData, WsDeps } from '../ws.js'
 import { SessionManager, ProjectHistory } from '../sessions.js'
 import { Inboxes, NodeRegistry } from '../nodes.js'
+import { PassiveLog } from '../wake.js'
 import { Subscriptions } from '../subscriptions.js'
 import { buildCommand, parseTurnOutput, bootstrapPrompt } from '../node.js'
 import { mkdtemp } from 'node:fs/promises'
@@ -100,6 +101,22 @@ describe('node agents', () => {
     const reloaded = new Inboxes(file)
     expect(reloaded.count('codex@n:z')).toBe(1)
     expect(reloaded.drain('codex@n:z').map(q => q.content)).toEqual(['only you'])
+  })
+
+  test('inboxPull stays an array an old client can parse; digest is last and not durable', () => {
+    const passive = new PassiveLog()
+    passive.add({ channelId: 'bus1', from: 'agy', text: 'chatter' })
+    const h = createWsHandlers(deps({ passive, busChannelId: 'bus1' }))
+    regNode(h, 'n', ['agy@n:x'])
+    deliver(deps(), 'agy@n:x', 'directed', { from: 'human' })
+    const s = reg(h, 'agy@n:x', 'pull')
+    h.message(s as any, JSON.stringify({ type: 'inboxPull', requestId: 'p1' }))
+    const data = msgs(s).find(m => m.requestId === 'p1').data
+    const parsed = JSON.parse(data)
+    expect(Array.isArray(parsed)).toBe(true)
+    expect(parsed[0].content).toBe('directed')
+    expect(parsed.at(-1).content).toContain('passive, not a wake')
+    expect(inboxes.count('agy@n:x')).toBe(0)
   })
 })
 
