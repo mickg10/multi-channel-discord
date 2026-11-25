@@ -111,13 +111,15 @@ export interface ConnectToRouterOptions {
   readonly onMessage?: (content: string, meta: ChannelMeta) => void
   readonly pendingRequests?: Map<string, PendingRequest>
   readonly onPermissionVerdict?: (requestId: string, behavior: 'allow' | 'deny') => void
+  /** The router gave our name to a newer connection: retire (no reconnect, no wake). */
+  readonly onReplaced?: (name: string) => void
   /** Stable conversation id. A later session that reuses the display name does not inherit held approvals. */
   readonly conversationId?: string
 }
 
 /** Connect to the router via WebSocket and register. */
 export async function connectToRouter(opts: ConnectToRouterOptions): Promise<ConnectResult> {
-  const { wsPort, name, projectPath, onMessage, pendingRequests, onPermissionVerdict, conversationId } = opts
+  const { wsPort, name, projectPath, onMessage, pendingRequests, onPermissionVerdict, conversationId, onReplaced } = opts
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(process.env.DISCORD_ROUTER_URL || `ws://localhost:${wsPort}`)
     const timeout = setTimeout(() => {
@@ -137,9 +139,12 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
         || (agentKind === 'claude' ? parent : `${parent}-${process.pid}`)
       const secret = process.env.DISCORD_ROUTER_SECRET || undefined
       const mode = process.env.DISCORD_MODE === 'pull' ? 'pull' : 'push'
+      // An explicitly configured name belongs to the newest client that claims it (a resumed
+      // thread), not to a stale one still connected from an abandoned thread.
+      const takeover = !!process.env.DISCORD_SESSION_NAME
       const costClass = process.env.DISCORD_COST_CLASS
       const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
-      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
+      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(takeover && { takeover }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
     }
 
     ws.onmessage = (event) => {
@@ -160,6 +165,8 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
             pending.reject(new Error(msg.data))
           }
         }
+      } else if (msg.type === 'replaced') {
+        onReplaced?.(msg.name)
       } else if (msg.type === 'error') {
         process.stderr.write(`discord plugin: router error: ${msg.message}\n`)
         if (msg.message.startsWith('register rejected')) {
@@ -298,6 +305,7 @@ export async function startPlugin(): Promise<void> {
   // One nudge until check_inbox acks it. A second directed message stays queued (hold)
   // and is either included in that drain or nudges exactly once after the ack.
   function considerWake(): void {
+    if (retired) return
     if (latchDecision(wakeInFlight, inbox.length) !== 'send') return
     if (wakeMode !== 'tmux' || !wakePane || wakeTimer) return
     wakeInFlight = true
@@ -361,6 +369,7 @@ export async function startPlugin(): Promise<void> {
   let currentName = sessionName
   let reconnectAttempt = 0
   let shuttingDown = false
+  let retired = false
   const pendingRequests = new Map<string, PendingRequest>()
 
   function onMessage(content: string, meta: ChannelMeta): void {
@@ -418,6 +427,15 @@ export async function startPlugin(): Promise<void> {
         onMessage,
         pendingRequests,
         onPermissionVerdict,
+        onReplaced: (n: string) => {
+          // A newer client (e.g. the resumed thread of this Codex conversation) owns the name now.
+          // Stay alive for the MCP host, but never reconnect or nudge again.
+          process.stderr.write(`discord plugin: name "${n}" taken over by a newer session; retiring this client\n`)
+          retired = true
+          shuttingDown = true
+          try { currentWs?.close() } catch {}
+          currentWs = null
+        },
         ...(conversationId && { conversationId }),
       })
       currentWs = ws
@@ -712,6 +730,9 @@ export async function startPlugin(): Promise<void> {
 
   mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const args = (req.params.arguments ?? {}) as Record<string, unknown>
+    if (retired) {
+      return { content: [{ type: 'text', text: `This client was retired: a newer session took over the name "${currentName}". Discord tools are unavailable from this thread; use the active session.` }], isError: true }
+    }
     try {
       switch (req.params.name) {
         case 'reply': {
