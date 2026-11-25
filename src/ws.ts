@@ -20,7 +20,7 @@ import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
-import type { GatewayToRouterMessage, Kind, PublishResult, Target, WakeResult } from './types.js'
+import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
 import { orderByCost, resolveExact, type Activity, type Conversations, type CostClasses, type HumanMail, type Unread, type WakeBudget, type WakeLog } from './wake.js'
@@ -427,6 +427,21 @@ function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string
   return !!owners && Object.hasOwn(owners, alias) && owners[alias] === host
 }
 
+const GATEWAY_TOOL_HANDLERS = {
+  channelPost: 'channelPost',
+  reply: 'reply',
+  fetchMessages: 'fetchMessages',
+  busSessions: 'listSessions',
+  claim: 'claim',
+  releaseClaim: 'releaseClaim',
+  listClaims: 'listClaims',
+  mcpList: 'mcpList',
+  mcpDescribe: 'mcpDescribe',
+  mcpCall: 'mcpCall',
+  channelList: 'channelList',
+  channelSubscribe: 'channelSubscribe',
+} as const satisfies Record<GatewayToolCall['op'], PluginToRouterMessage['type']>
+
 function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly<WsDeps>): void {
   const inboxes = deps.inboxes
   const reply = (ok: boolean, data: string) => {
@@ -548,6 +563,22 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
       reply(true, '{}')
       break
     }
+    case 'gatewayOp': {
+      if (typeof frame.op !== 'string' || !Object.hasOwn(GATEWAY_TOOL_HANDLERS, frame.op)) {
+        reply(false, 'unsupported_gateway_operation')
+        return
+      }
+      const type = GATEWAY_TOOL_HANDLERS[frame.op]
+      const context: WsLike = {
+        data: { sessionName: target.alias, instanceId: target.conv, sendCallback: null },
+        send(message) {
+          if (nativeConnection(inboxes, target)?.data !== ws.data) return
+          try { ws.send(message) } catch { /* The gateway may have disconnected during the operation. */ }
+        },
+      }
+      dispatchLegacyMessage(context, { ...frame, type } as PluginToRouterMessage, deps, target)
+      break
+    }
     case 'busPost': {
       if (typeof frame.text !== 'string') { reply(false, 'busPost requires text'); return }
       const sender: WsLike = { data: { sessionName: target.alias, sendCallback: null }, send: message => ws.send(message) }
@@ -575,7 +606,7 @@ function agentStatus(deps: Readonly<WsDeps>, name: string) {
 }
 
 function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readonly<WsDeps>): void {
-  if (ws.data.gateway || ['registerGateway', 'registerAgent', 'releaseAgent', 'lease', 'ack', 'mark', 'wakeResult'].includes(parsed.type)) {
+  if (ws.data.gateway || ['registerGateway', 'registerAgent', 'releaseAgent', 'lease', 'ack', 'mark', 'wakeResult', 'gatewayOp'].includes(parsed.type)) {
     handleGateway(ws, parsed as GatewayToRouterMessage, deps)
     return
   }
@@ -587,6 +618,10 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
     sendError(ws, 'Not authenticated: register with the router secret first')
     return
   }
+  dispatchLegacyMessage(ws, parsed, deps)
+}
+
+function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readonly<WsDeps>, sender?: Target): void {
   switch (parsed.type) {
     case 'registerNode': {
       if (deps.secret && !matchesSecret(parsed.secret, createHash('sha256').update(deps.secret).digest('hex'))) { sendError(ws, 'register rejected: bad or missing router secret'); return }
@@ -687,17 +722,18 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         handleBusPost(ws, parsed.text, parsed.to, deps, files, parsed)
       }
       break
-    case 'channelPost':
+    case 'channelPost': {
+      const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
       if (!hasString(parsed, 'channel') || !hasString(parsed, 'text')) {
-        sendError(ws, 'channelPost requires channel and text')
+        sendOperationError(ws, requestId, 'channelPost requires channel and text')
         return
       }
-      {
-        const { files, errors } = decodeFiles((parsed as { files?: unknown }).files)
-        for (const e of errors) sendError(ws, e)
-        void handleChannelPost(ws, parsed.channel, parsed.text, parsed.to, deps, files).catch(err => sendError(ws, inboxError(err)))
-      }
+      const { files, errors } = decodeFiles(parsed.files)
+      if (errors.length && requestId) { sendOperationError(ws, requestId, errors.join(', ')); return }
+      for (const error of errors) sendError(ws, error)
+      void handleChannelPost(ws, parsed, deps, files, sender).catch(err => sendOperationError(ws, requestId, inboxError(err)))
       break
+    }
     case 'channelList':
     case 'channelCreate':
     case 'channelSubscribe':
@@ -791,23 +827,23 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       if (deps.inboxes?.target(parsed.name.trim())) { sendError(ws, 'alias already registered'); return }
       handleRename(ws, parsed.name, deps)
       break
-    case 'reply':
-      if (!hasString(parsed, 'text')) {
-        sendError(ws, 'reply requires text')
+    case 'reply': {
+      const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
+      if (!hasString(parsed, 'text') || (parsed.chatId !== undefined && typeof parsed.chatId !== 'string') ||
+          (parsed.replyTo !== undefined && typeof parsed.replyTo !== 'string')) {
+        sendOperationError(ws, requestId, 'reply requires text and valid channel and message IDs')
         return
       }
+      const { files, errors } = decodeFiles(parsed.files)
+      if (errors.length && requestId) { sendOperationError(ws, requestId, errors.join(', ')); return }
+      for (const error of errors) sendError(ws, error)
       if (deps.busChannelId && parsed.chatId === deps.busChannelId) {
-        const { files, errors } = decodeFiles(parsed.files)
-        for (const e of errors) sendError(ws, e)
-        handleBusPost(ws, parsed.text, undefined, deps, files)
-        return
+        handleBusPost(ws, parsed.text, undefined, deps, files, requestId ? { requestId } : undefined, sender)
+        break
       }
-      {
-        const { files, errors } = decodeFiles(parsed.files)
-        for (const e of errors) sendError(ws, e)
-        handleReply(ws, parsed.text, parsed.replyTo, files.length ? files : undefined, deps, parsed.chatId)
-      }
+      void handleReply(ws, parsed.text, parsed.replyTo, files, deps, parsed.chatId, requestId)
       break
+    }
     case 'react':
       if (!hasString(parsed, 'chatId') || !hasString(parsed, 'messageId') || !hasString(parsed, 'emoji')) {
         sendError(ws, 'react requires chatId, messageId, and emoji')
@@ -910,43 +946,36 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>): void
   ws.send(JSON.stringify(response))
 }
 
-function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: DiscordFile[] | undefined, deps: Readonly<WsDeps>, explicitChatId?: string): void {
+async function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: DiscordFile[], deps: Readonly<WsDeps>, explicitChatId?: string, requestId?: string): Promise<void> {
   const sessionName = ws.data.sessionName
   if (!sessionName) {
-    sendError(ws, 'Cannot reply: not registered')
+    sendOperationError(ws, requestId, 'Cannot reply: not registered')
+    return
+  }
+  const chatId = explicitChatId || deps.chatId()
+  if (!chatId) {
+    if (requestId) sendOperationError(ws, requestId, 'No active Discord chat')
     return
   }
 
-  // An explicit chat_id (e.g. a group channel the agent was addressed in) is honoured
-  // directly; otherwise fall back to the human's most recent chat.
-  if (explicitChatId && explicitChatId !== deps.chatId()) {
-    const cs = chunk(`[${sessionName}] ${text}`, deps.chunkLimit, deps.chunkMode)
-    cs.forEach((c, i) => sendToDiscord(deps.client, explicitChatId, c, i === 0 ? replyTo : undefined, i === 0 ? files : undefined))
-    return
-  }
-
-  const chatId = deps.chatId()
-  if (!chatId) return
-
-  const isActive = deps.sessions.getActive() === sessionName
-
-  if (!isActive) {
+  const activeChat = chatId === deps.chatId()
+  const sends: Promise<boolean>[] = []
+  if (activeChat && deps.sessions.getActive() !== sessionName) {
     const count = deps.sessions.bufferReply(sessionName, text)
-    sendToDiscord(deps.client, chatId, `[${sessionName} 📪] ${count} new message${count === 1 ? '' : 's'}`)
-    return
+    sends.push(sendToDiscord(deps.client, chatId, `[${sessionName} 📪] ${count} new message${count === 1 ? '' : 's'}`))
+  } else {
+    const chunks = chunk(`[${sessionName}] ${text}`, deps.chunkLimit, deps.chunkMode)
+    for (const [index, content] of chunks.entries()) {
+      const shouldReplyTo = activeChat
+        ? deps.replyToMode === 'all' || (deps.replyToMode === 'first' && index === 0)
+        : index === 0
+      sends.push(sendToDiscord(deps.client, chatId, content, shouldReplyTo ? replyTo : undefined, index === 0 ? files : undefined))
+    }
+    if (activeChat) deps.onReply?.(chatId)
   }
-
-  // Active session — prefix with [session-name], chunk, and send
-  const prefixed = `[${sessionName}] ${text}`
-  const chunks = chunk(prefixed, deps.chunkLimit, deps.chunkMode)
-
-  for (let i = 0; i < chunks.length; i++) {
-    const shouldReplyTo = replyTo != null && deps.replyToMode !== 'off' && (deps.replyToMode === 'all' || i === 0)
-    sendToDiscord(deps.client, chatId, chunks[i], shouldReplyTo ? replyTo : undefined, i === 0 ? files : undefined)
-  }
-
-  // Stop typing indicator when a reply is sent
-  deps.onReply?.(chatId)
+  if (!requestId) return
+  const sent = (await Promise.all(sends)).every(Boolean)
+  sendToolResult(ws, requestId, sent, sent ? '{}' : 'discord_unavailable')
 }
 
 function handleReact(chatId: string, messageId: string, emoji: string, deps: Readonly<WsDeps>): void {
@@ -976,24 +1005,21 @@ async function sendToDiscordAwait(client: Client, chatId: string, text: string, 
   }
 }
 
-function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly DiscordFile[]): void {
-  // Fire-and-forget: send to Discord asynchronously without blocking the caller
-  void (async () => {
-    try {
-      const ch = await fetchTextChannelOrNull(client, chatId)
-      if (!ch || !('send' in ch)) return
-
-      const validFiles = files ?? []
-      const sent = await ch.send({
-        content: text,
-        ...(validFiles.length > 0 ? { files: validFiles } : {}),
-        ...(replyTo ? { reply: { messageReference: replyTo, failIfNotExists: false } } : {}),
-      })
-      noteSent(sent.id)
-    } catch (err: unknown) {
-      process.stderr.write(`discord: send failed: ${err instanceof Error ? err.message : String(err)}\n`)
-    }
-  })()
+async function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly DiscordFile[]): Promise<boolean> {
+  try {
+    const ch = await fetchTextChannelOrNull(client, chatId)
+    if (!ch || !('send' in ch)) return false
+    const sent = await ch.send({
+      content: text,
+      ...(files?.length && { files: [...files] }),
+      ...(replyTo && { reply: { messageReference: replyTo, failIfNotExists: false } }),
+    })
+    noteSent(sent.id)
+    return true
+  } catch (err: unknown) {
+    process.stderr.write(`discord: send failed: ${err instanceof Error ? err.message : String(err)}\n`)
+    return false
+  }
 }
 
 function handleEditMessage(ws: WsLike, requestId: string, chatId: string, messageId: string, text: string, deps: Readonly<WsDeps>): void {
@@ -1307,6 +1333,11 @@ function hasString<K extends string>(obj: unknown, key: K): obj is Record<K, str
   return typeof obj === 'object' && obj !== null && typeof (obj as Record<string, unknown>)[key] === 'string'
 }
 
+function sendOperationError(ws: WsLike, requestId: string | undefined, message: string): void {
+  if (requestId) sendToolResult(ws, requestId, false, message)
+  else sendError(ws, message)
+}
+
 function sendError(ws: WsLike, message: string): void {
   const response: WsError = { type: 'error', message }
   ws.send(JSON.stringify(response))
@@ -1332,7 +1363,7 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
     return
   }
   if (!deps.busChannelId) {
-    sendError(ws, 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL')
+    sendOperationError(ws, publish?.requestId, 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL')
     return
   }
   postToChannel(ws, deps.busChannelId, undefined, text, to, deps, files, publish, sender)
@@ -1346,11 +1377,12 @@ function audience(channelId: string, deps: Readonly<WsDeps>): string[] {
   return live.filter(n => subs.has(n))
 }
 
-async function handleChannelPost(ws: WsLike, ref: string, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[]): Promise<void> {
-  if (!ws.data.sessionName) { sendError(ws, 'Cannot post: not registered'); return }
-  const ch = deps.channelOps ? await deps.channelOps.resolve(ref).catch(() => null) : null
-  if (!ch) { sendError(ws, `Unknown channel "${ref}" (use channel_list)`); return }
-  postToChannel(ws, ch.id, ch.name, text, to, deps, files)
+async function handleChannelPost(ws: WsLike, msg: WsChannelPost, deps: Readonly<WsDeps>, files: DiscordFile[], sender?: Target): Promise<void> {
+  const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined
+  if (!ws.data.sessionName) { sendOperationError(ws, requestId, 'Cannot post: not registered'); return }
+  const ch = deps.channelOps ? await deps.channelOps.resolve(msg.channel).catch(() => null) : null
+  if (!ch) { sendOperationError(ws, requestId, `Unknown channel "${msg.channel}" (use channel_list)`); return }
+  postToChannel(ws, ch.id, ch.name, msg.text, msg.to, deps, files, requestId ? { requestId, publish_id: msg.publish_id } : undefined, sender)
 }
 
 const mirrorAttempts = new WeakMap<Inboxes, Map<string, {
@@ -1499,7 +1531,7 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
         if (pending) scheduleTransport(deps, targets[index]!, pending)
       })
     }
-    if (!messageId && toLabel === 'human') { reply(false, 'discord_unavailable'); return }
+    if (!messageId && (toLabel === 'human' || (requestId && !targets.length))) { reply(false, 'discord_unavailable'); return }
     reply(true, JSON.stringify(!messageId && targets.length ? { ...result, mirror: 'failed' } : result))
   }).catch(err => reply(false, inboxError(err)))
 
