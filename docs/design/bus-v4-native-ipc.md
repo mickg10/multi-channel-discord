@@ -71,7 +71,7 @@ with their own conversation id, (b) never restarts itself or the shared Codex da
 
 ## 6. Migration (per kind, old client stopped in the same step its adapter goes live)
 M0 gateway + durability + JSON check_inbox, no adapters, **no tmux restarts**. M1 Claude (hook + inbox socket). M2 opencode. M3 Codex (queue+nudge first,
-native after the disposable race test). M4 grok/agy: ACP for gateway-owned. Live grok TUIs are pull-only (tmux repeats the stuck-composer bug) until a disposable leader-mode test passes. Live agy TUIs use the tmux nudge gated on runState. CFD sessions are excluded throughout. Gates: M1 needs Q1, M2 needs opencode MCP to carry the session id (or gateway-owned only). M5 retire plugin.ts ws client.
+native after the disposable race test). M4 grok/agy: ACP for gateway-owned. Live grok TUIs are pull-only (tmux repeats the stuck-composer bug) until a disposable leader-mode test passes. Live agy TUIs use the tmux nudge gated on runState. CFD sessions are excluded throughout. Gates: M1 needs Q1, M2 needs the two-session `ai.opencode/sessionID` echo test on the deployed binary. M5 retire plugin.ts ws client.
 Each step: disposable session test → one real agent → fleet; revert = restore old MCP entry.
 
 ## 7. Open questions for Mick
@@ -104,7 +104,7 @@ Q3 nas642 node moves from root system unit to `systemd --user` (lingering) — O
 GLM-5.3 critic unreachable. Its TUI shows three concatenated unsubmitted nudges (the live tmux bug: Enter not taken, behind the "Getting started" overlay), plus three discord MCP clients under one service. The leader probed read-only instead (above). Dispositions:
 1. opencode has a **native durable queue**: `prompt` with `delivery:"queue"`, inbox list/cancel → **adopted** as the opencode adapter (N2-compliant; `steer` forbidden).
 2. Auth: service password in a 0600 file; the gateway runs as the user and reads it per call → **adopted**; never logged.
-3. MCP spawned by the service → tool identity needs the session id. Open: does opencode pass the session id to MCP tool calls (like Codex `_meta.threadId`)? If not, gateway-owned opencode only, or one service per agent.
+3. MCP spawned by the service → tool identity needs the session id. **Resolved by codex_nas from v2.0.18 source:** tool calls carry `params._meta["ai.opencode/sessionID"]` (namespaced key, outside `arguments`; client.ts L273-281, tool/mcp.ts L65-70). Bind trusted service connection + that id; reject addressed tools without it. Remaining: two-session MCP echo on the deployed binary.
 4. The current tmux wake is broken for opencode → M2 is high value.
 GLM may still post R3 critique; it will be appended.
 
