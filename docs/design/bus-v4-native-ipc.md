@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.7** (after R7), entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v4.8** (after R8), entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -47,7 +47,7 @@ Invariant **N3 (exact identity)**: delivery target = native conversation id, nev
 A `SessionStart` hook (user settings, all sessions) runs `agent-bus register` once. It inherits
 `CLAUDE_CODE_MESSAGING_SOCKET`/`_TOKEN` and `CLAUDE_SESSION_ID`/pid, and hands them to the gateway over its
 0600 unix socket, then exits. Gateway keeps tokens **in memory only** (R2#5; a state file would hand all sessions' tokens to any same-user reader) and re-learns them from `SessionStart` (fires with `source:"clear"` and on resume; verified by claude_nas) and `UserPromptSubmit` hooks after a gateway restart. Env: `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`. Bypass sessions then accept the gateway's
-nudges (test 3). Fallbacks in order: hook missing → tmux nudge; token rejected → re-register on next hook.
+nudges (test 3). No hook registration → the session is pull-only (not tmux). A rejected token → re-register on the next hook. **tmux is used only where the *registered* transport is tmux on a gateway-launched pane** (R8#2).
 
 ## 3. Tools
 
@@ -65,7 +65,7 @@ error to the sender, never silent oldest-drop; uncertain inject → "unresolved"
 
 ## 5. Controller
 ACP workers (agy/grok) speak stdio, so each runs in its tmux-0 window behind a tiny stdio↔unix-socket bridge owned by that window's restart loop. The gateway connects to the socket, and a gateway restart reconnects instead of severing the pipe (R6#4). agy LS address and CSRF are re-learned from a per-turn hook as well as SessionStart, the same way as Claude tokens (R6#3).
-Gateway-owned agents (grok/agy ACP children, persistent helpers) are **not** children of the gateway process. Each runs in its own tmux-0 window under a tiny restart loop, so a gateway crash or upgrade never kills them (R4#3). Persisted state: msg states, woken id (**fsync before the native send**), and pane plus conversation id per agent. **Tokens are never persisted.** After a gateway restart, an idle bypass Claude has no token until its next hook fire, so its wake falls back to channel, then SendMessage helper, then tmux (R4#4).
+Gateway-owned agents (grok/agy ACP children, persistent helpers) are **not** children of the gateway process. Each runs in its own tmux-0 window under a tiny restart loop, so a gateway crash or upgrade never kills them (R4#3). Persisted state: msg states, woken id (**fsync before the native send**), and pane plus conversation id per agent. **Tokens are never persisted.** After a gateway restart, an idle bypass Claude has no token until its next hook fire, so its wake goes **pull-only** until it re-registers (R8#2: no tmux fallback for natively registered sessions, since a forced gateway crash must not turn into keystrokes into a bypass session or a permission dialog).
 Scope: a gateway controls only its own host. If the host is lost, its agents are gone too, and the router's durable mail is the cross-host continuity, so there is no standby gateway (R1#4 considered and rejected). Upgrades work by drain, then exec, and KeepAlive restarts it.
 The gateway is the never-down controller (KeepAlive/systemd --user). It (a) restarts dead agents in tmux session 0
 with their own conversation id, (b) never restarts itself or the shared Codex daemon to fix its own state,
@@ -79,6 +79,15 @@ with their own conversation id, (b) never restarts itself or the shared Codex da
 - Gateway protocol: `registerGateway{host,user,proto}` with the node secret **required** (timing-safe compare, replacing today's `!==`); `registerAgent{kind,conv,alias}` bound to ws.data.nodeName, with a host match. Every op carries `as`, which must be in that gateway's set; ops without it are rejected.
 - Coexistence: a gateway-bound alias rejects a legacy `register` with `replaced`, because the PR #11 takeover would otherwise steal it.
 - **Migration unit = config scope** (a CODEX_HOME, an opencode service, a Claude settings scope), not a single agent.
+
+### 4b. Security rules (R8, ops-upgrader)
+Baseline: a same-user process is **not** a boundary. The goal is to limit what a prompt-injected agent shell or MCP child can do.
+- **Per-call `_meta` identity is trusted only from a verified pipe.** The peer on the gateway socket must be `agent-bus-pipe` (exe path check) whose parent is the registered daemon or agent pid. Residual risk: a shell that `exec`s the pipe from under the daemon still passes, so this is a mitigation, not a proof. **Ack must carry the lease id** issued to that identity, so you can't ack mail you weren't leased.
+- **Registration is verified, not trusted.** Hook payloads give only a hint. The gateway checks the hook peer's ancestry against `CLAUDE_PID` and takes the socket path and sessionId from `claude agents --json`, never from the payload. agy LS address and CSRF are accepted only from a peer descended from that agy pid.
+- **Host identity:** `registerGateway{host}` is self-declared when per-node secrets are absent. That is **accepted risk** (Mick: "impersonation is fine"): one leaked shared secret lets an attacker read and ack any host's mail. Where a per-node secret is configured, host↔secret is enforced for drain and ack.
+- **Secrets:** the inbox-socket auth line, opencode password and agy CSRF are redacted in the serializer and raw frames are never logged. The opencode password goes in a header, never in the URL or argv. The gateway runs with `ulimit -c 0`.
+- **opencode allowlist** (replaces the denylist): GET `/api/session`, `/api/session/active`, `/api/session/{id}/inbox`, `/api/event`, `/api/session/{id}/message/*`, and POST `/api/session/{id}/prompt` with `delivery:"queue"` only.
+- Verified OK: the router sets `from_human` only for `allowFrom` authors (router.ts:355), and dispatcher re-delivery uses only the saved humanMail (ws.ts:1196).
 
 ## 5b. Codex RPC contract (pinned, R5#2)
 `initialize{capabilities.experimentalApi:true}` → version and capability allowlist (≥0.170; `thread/queue/add` present) → `thread/queue/add{threadId, input:[fixed nudge], clientUserMessageId}` and **nothing else**. Reconcile with `thread/queue/list` plus `thread/read{includeTurns:true, itemsView:"full"}`, paged to `nextCursor:null`, matching `clientUserMessageId` / `userMessage.clientId`. `clientUserMessageId` = hash(recipient threadId, bus msg id), immutable. The control socket must be owned by the user (stat check), mode 0600.
@@ -151,3 +160,12 @@ GLM may still post R3 critique; it will be appended.
 
 ### R7 claude_setup (8e4fc70)
 1–9 [v/opinion] all **accepted** into §4a: admit → commit → budget gates the wake → transport; append-only JSONL; known-identity admission; lease and ack; observational status; identity-keyed inbox plus re-key; registerGateway/registerAgent/`as` with a required node secret and timing-safe compare; legacy register can't steal gateway aliases; migrate per config scope.
+
+### R8 ops-upgrader (security, 7f4436a)
+1. Forgeable `_meta` → **accepted** as a mitigation (verified pipe peer plus parent pid; acks tied to the lease id). Residual risk documented.
+2. The tmux fallback defeats N4 and can approve dialogs → **accepted**: tmux only as a registered transport on gateway-launched panes; native sessions go pull-only on loss. The stale SendMessage mention is removed.
+3. Registration spoofing → **accepted**: ancestry check; socket and sessionId taken from `claude agents --json`.
+4. [v] Self-declared host → **documented as accepted risk**; enforced when per-node secrets exist.
+5. Token leaks → **accepted** (redaction, header, no core dumps).
+6. opencode allowlist → **accepted**.
+7. [v] from_human path → no hole.
