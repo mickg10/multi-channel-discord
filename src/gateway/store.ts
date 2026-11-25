@@ -14,6 +14,8 @@ export type Attempt = {
   text: string
   state: AttemptState
   nativeId?: string
+  /** Router lease receipt that, once echoed and accepted, frees this slot. */
+  receipt?: string
 }
 
 const OPEN: ReadonlySet<AttemptState> = new Set(['pending', 'uncertain', 'woken', 'held', 'refused'])
@@ -28,6 +30,7 @@ function isAttempt(v: unknown): v is Attempt {
     && typeof row.clientId === 'string' && typeof row.text === 'string'
     && KINDS.has(row.kind) && STATES.has(row.state)
     && (row.nativeId === undefined || typeof row.nativeId === 'string')
+    && (row.receipt === undefined || typeof row.receipt === 'string')
 }
 
 export class WakeStore {
@@ -84,6 +87,26 @@ export class WakeStore {
 
   ack(msgId: string): void {
     this.rows = this.rows.filter(row => row.msgId !== msgId)
+    this.flush()
+  }
+
+  /** Remember which durable ids a router receipt will accept. Flushed before the caller is answered. */
+  bindReceipt(ids: readonly string[], receipt: string): void {
+    let changed = false
+    for (const id of ids) {
+      const row = this.get(id)
+      if (!row || row.receipt === receipt) continue
+      row.receipt = receipt
+      changed = true
+    }
+    if (changed) this.flush()
+  }
+
+  /** The router accepted this receipt, so those attempts no longer hold the one-nudge slot. */
+  releaseReceipt(receipt: string): void {
+    const next = this.rows.filter(row => row.receipt !== receipt)
+    if (next.length === this.rows.length) return
+    this.rows = next
     this.flush()
   }
 

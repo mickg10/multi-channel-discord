@@ -17,7 +17,7 @@ export async function stepDelivery(opts: {
   const { store, adapters, target, msgId, nudge } = opts
   const prev = store.get(msgId)
   if (prev?.state === 'uncertain') {
-    const adapter = adapters.find(adapter => adapter.kind === prev.kind) ?? adapters[0]
+    const adapter = adapters.find(adapter => adapter.kind === prev.kind)
     if (!adapter) return { s: 'uncertain' }
     return adapter.reconcile(target, { msgId, text: prev.text, clientId: prev.clientId })
   }
@@ -27,14 +27,15 @@ export async function stepDelivery(opts: {
   }
   const open = store.openFor(target.conv)
   if (open && open.msgId !== msgId) return { s: 'queued' }
-  if (adapters.length === 0) return { s: 'unavailable' }
+  const matched = adapters.filter(adapter => adapter.kind === target.kind)
+  if (matched.length === 0) return { s: 'unavailable' }
   store.begin({
     msgId, conv: target.conv, kind: target.kind, host: target.host, user: target.user,
     clientId: nudge.clientId, text: nudge.text,
   })
   opts.onPending?.()
   let last: WakeResult = { s: 'unavailable' }
-  for (const adapter of adapters) {
+  for (const adapter of matched) {
     last = await adapter.wake(target, nudge)
     if (last.s !== 'unavailable') break
   }

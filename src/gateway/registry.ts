@@ -12,6 +12,8 @@ export class Registry {
   private aliases = new Map<string, string>()
 
   add(rec: AgentRec): void {
+    const oldKey = this.aliases.get(rec.alias)
+    if (oldKey) this.dropKey(oldKey)
     const key = identityKey(rec)
     const prev = this.byKey.get(key)
     if (prev) this.unlink(prev.pid, key)
@@ -20,6 +22,11 @@ export class Registry {
     pids.add(key)
     this.pids.set(rec.pid, pids)
     this.aliases.set(rec.alias, key)
+  }
+
+  remove(alias: string): void {
+    const key = this.aliases.get(alias)
+    if (key) this.dropKey(key)
   }
 
   get(id: Target): AgentRec | undefined {
@@ -50,5 +57,13 @@ export class Registry {
     if (!keys) return
     keys.delete(key)
     if (keys.size === 0) this.pids.delete(pid)
+  }
+
+  private dropKey(key: string): void {
+    const prev = this.byKey.get(key)
+    if (!prev) return
+    this.unlink(prev.pid, key)
+    this.byKey.delete(key)
+    if (this.aliases.get(prev.alias) === key) this.aliases.delete(prev.alias)
   }
 }

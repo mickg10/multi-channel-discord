@@ -9,6 +9,7 @@ type Waiter = { resolve: (value: unknown) => void; reject: (err: Error) => void 
 export class RouterLink {
   private pending = new Map<string, Waiter>()
   onWake?: (frame: Extract<RouterToGatewayMessage, { type: 'wake' }>) => Promise<unknown>
+  onReleased?: (alias: string) => void
 
   constructor(
     private secret: string,
@@ -32,6 +33,10 @@ export class RouterLink {
 
   wakeResult(alias: string, id: string, result: WakeResult): void {
     this.emit({ type: 'wakeResult', as: alias, requestId: this.nextId(), id, result })
+  }
+
+  release(alias: string): void {
+    this.emit({ type: 'releaseAgent', alias, requestId: this.nextId() })
   }
 
   lease(alias: string, receipt?: string): Promise<LeaseResult> {
@@ -58,6 +63,7 @@ export class RouterLink {
       return
     }
     if (msg.type === 'wake') void this.onWake?.(msg)
+    if (msg.type === 'agentReleased') this.onReleased?.(msg.alias)
   }
 
   private call<T>(requestId: string, frame: GatewayToRouterMessage): Promise<T> {

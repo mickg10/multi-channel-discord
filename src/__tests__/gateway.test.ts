@@ -251,6 +251,81 @@ describe('gateway skeleton', () => {
     } finally { await g.gw.close() }
   })
 
+  test('an accepted lease receipt frees the nudge and survives restart', async () => {
+    const g = await gateway()
+    try {
+      const fake = new FakeAdapter('codex')
+      g.gw.setAdapters([fake])
+      await g.gw.deliver(parent, '31')
+      g.mail.set(parent.alias, leased('A', '31'))
+      const first = await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv })
+      expect(first.receipt).toBe('rcpt-31')
+      expect(WakeStore.load(join(g.dir, 'wakes.json')).get('31')?.receipt).toBe('rcpt-31')
+      g.mail.set(parent.alias, { messages: [], unread: 0 })
+      const second = await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv, receipt: 'rcpt-31' })
+      expect(second.ok).toBe(true)
+      expect(g.gw.store.get('31')).toBeUndefined()
+      await g.gw.deliver(parent, '32')
+      expect(fake.seen.map(nudge => nudge.msgId)).toEqual(['31', '32'])
+    } finally { await g.gw.close() }
+  })
+
+  test('a stale receipt does not free the nudge', async () => {
+    const g = await gateway()
+    try {
+      const fake = new FakeAdapter('codex')
+      g.gw.setAdapters([fake])
+      await g.gw.deliver(parent, '31')
+      g.mail.set(parent.alias, leased('A', '31'))
+      await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv })
+      g.mail.set(parent.alias, { messages: [], unread: 0, receipt_status: 'stale' })
+      await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv, receipt: 'rcpt-31' })
+      expect(g.gw.store.get('31')?.state).toBe('woken')
+      const second = await g.gw.deliver(parent, '32')
+      expect(second).toEqual({ s: 'queued' })
+      expect(fake.wakeCalls).toBe(1)
+    } finally { await g.gw.close() }
+  })
+
+  test('only the target kind is woken, and a missing kind stays uncertain', async () => {
+    const g = await gateway()
+    try {
+      const codex = new FakeAdapter('codex', { s: 'refused' })
+      const opencode = new FakeAdapter('opencode', { s: 'woken', nativeId: 'oc' })
+      g.gw.setAdapters([codex, opencode])
+      const target = { ...parent, kind: 'opencode' as const, conv: 'oc-conv', alias: 'opencode@nas642:shared' }
+      const woken = await g.gw.deliver(target, '41')
+      expect(woken).toEqual({ s: 'woken', nativeId: 'oc' })
+      expect(codex.wakeCalls).toBe(0)
+      expect(opencode.wakeCalls).toBe(1)
+      g.gw.registerAgent({ ...target, pid: 70, cwd: '/work/src', transport: 'native' })
+      g.gw.setAdapters([codex])
+      g.gw.router.receive({ type: 'wake', as: target.alias, msgId: '88', n: 1, reconcile: true })
+      await g.gw.idle()
+      expect(codex.reconcileCalls).toBe(0)
+      expect(codex.wakeCalls).toBe(0)
+      expect(g.frames.some(frame => frame.type === 'wakeResult' && frame.id === '88')).toBe(false)
+    } finally { await g.gw.close() }
+  })
+
+  test('releaseAgent drops one alias and disconnect does not', async () => {
+    const g = await gateway()
+    try {
+      g.gw.registerAgent({ ...parent, conv: 'moved' })
+      expect(g.gw.registry.byAlias(parent.alias)?.conv).toBe('moved')
+      expect(g.gw.registry.byPid(parent.pid).map(agent => agent.conv)).toEqual(['moved'])
+      g.gw.release(parent.alias)
+      expect(g.gw.registry.byAlias(parent.alias)).toBeUndefined()
+      expect(g.gw.registry.byAlias(child.alias)?.conv).toBe(child.conv)
+      expect(g.frames.some(frame => frame.type === 'releaseAgent' && frame.alias === parent.alias)).toBe(true)
+      const sent = g.frames.length
+      g.gw.router.receive({ type: 'agentReleased', alias: child.alias })
+      expect(g.gw.registry.byAlias(child.alias)).toBeUndefined()
+      await g.gw.close()
+      expect(g.frames.length).toBe(sent)
+    } finally { await g.gw.close() }
+  })
+
   test('a bad wake store is left untouched', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'gw-store-'))
     const missing = join(dir, 'missing.json')

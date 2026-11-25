@@ -37,6 +37,7 @@ export class Gateway {
   constructor(private opts: GatewayOpts) {
     this.router = new RouterLink(opts.secret, opts.send ?? (() => {}), opts.audit)
     this.router.onWake = frame => this.onRouterWake(frame)
+    this.router.onReleased = alias => this.registry.remove(alias)
     this.store = WakeStore.open(opts.storePath)
     this.verify = opts.verify ?? verifyPipePeer
   }
@@ -50,6 +51,13 @@ export class Gateway {
     assertAlias(rec.kind, rec.host, rec.alias)
     this.registry.add(rec)
     this.router.registerAgent(rec)
+  }
+
+  /** Owning gateway only. Disconnect does not release aliases. */
+  release(alias: string): void {
+    if (!this.registry.byAlias(alias)) return
+    this.router.release(alias)
+    this.registry.remove(alias)
   }
 
   /**
@@ -112,8 +120,8 @@ export class Gateway {
   }
 
   private async reconcileMissing(target: Target, nudge: Nudge): Promise<WakeResult> {
-    const adapter = this.adapters.find(item => item.kind === target.kind) ?? this.adapters[0]
-    if (!adapter) return { s: 'unavailable' }
+    const adapter = this.adapters.find(item => item.kind === target.kind)
+    if (!adapter) return { s: 'uncertain' }
     const result = await adapter.reconcile(target, nudge)
     if (result.s !== 'unavailable') this.router.wakeResult(target.alias, nudge.msgId, result)
     return result
@@ -161,7 +169,12 @@ export class Gateway {
     if (msg.op === 'check_inbox') {
       if (!picked.ok) { sock.write(JSON.stringify({ ok: false, error: picked.error }) + '\n'); return }
       try {
-        const leased = await this.router.lease(picked.agent.alias, typeof msg.receipt === 'string' ? msg.receipt : undefined)
+        const echoed = typeof msg.receipt === 'string' ? msg.receipt : undefined
+        const leased = await this.router.lease(picked.agent.alias, echoed)
+        if (echoed && leased.receipt_status !== 'stale') this.store.releaseReceipt(echoed)
+        if (typeof leased.receipt === 'string' && leased.receipt.length > 0) {
+          this.store.bindReceipt(leased.messages.map(message => message.id), leased.receipt)
+        }
         sock.write(JSON.stringify({ ok: true, ...leased }) + '\n')
       } catch (err) {
         sock.write(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'lease failed' }) + '\n')
