@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 // ============================================================
 // WebSocket Protocol — messages between MCP plugin and router
 // ============================================================
@@ -335,6 +337,15 @@ export interface Target {
 }
 
 export type Nudge = { msgId: string; text: string; clientId: string }
+
+export function buildNudge(kind: Kind, conv: string, msgId: string, n: number): Nudge {
+  if (typeof msgId !== 'string' || !msgId) throw new TypeError('Invalid bus message id')
+  const hash = createHash('sha256').update(`${conv}:${msgId}`).digest('hex')
+  const clientId = kind === 'codex' ? 'bus-' + hash.slice(0, 32)
+    : kind === 'opencode' ? 'msg_bus' + hash.slice(0, 24)
+    : hash.slice(0, 32)
+  return { msgId, text: nudgeText(n), clientId }
+}
 export type WakeResult =
   | { s: 'woken'; nativeId: string }
   | { s: 'held' | 'refused' | 'uncertain' | 'unavailable' }
