@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, mock } from 'bun:test'
 import { createWsHandlers, resetBusRateLimit, routeHumanBusMessage } from '../ws.js'
-import { CostClasses, Unread } from '../wake.js'
+import { CostClasses, HumanMail, Unread } from '../wake.js'
+import { NodeRegistry } from '../nodes.js'
 import type { WsData, WsDeps } from '../ws.js'
 import { SessionManager, ProjectHistory } from '../sessions.js'
 import { mkdtemp } from 'node:fs/promises'
@@ -141,8 +142,111 @@ describe('human bus messages', () => {
     expect(routeHumanBusMessage('@codex which one', { user: 'me', from_human: 'true' }, sessions, undefined, d)).toEqual([])
     expect(msgs(b).filter(x => x.content === 'which one')).toHaveLength(0)
     expect(msgs(c).some(x => x.type === 'message')).toBe(false)
-    const nobody = deps()
-    expect(routeHumanBusMessage('everyone report status', { user: 'me', from_human: 'true' }, sessions, undefined, nobody)).toEqual([])
+    expect(routeHumanBusMessage('11: no', { user: 'me', from_human: 'true', message_id: 'q11' }, sessions, undefined, d)).toEqual(['codex@nas642:src'])
+    const eleven = msgs(b).find(x => x.content === '11: no')
+    expect(eleven.meta.from_human).toBe('true')
+    expect(msgs(a).some(x => x.content === '11: no')).toBe(false)
+    expect(msgs(c).some(x => x.content === '11: no')).toBe(false)
+  })
+
+  test('with no dispatcher, a human post wakes live push sessions and skips headless agents', () => {
+    const nodes = new NodeRegistry()
+    const notes: string[] = []
+    const d = deps({ nodes, onRouteNote: (m) => notes.push(m) })
+    const h = createWsHandlers(d)
+    const push = register(h, 'claude@mac:src')
+    const pull = makeWs()
+    h.message(pull as any, JSON.stringify({ type: 'register', name: 'pull@mac:src', projectPath: '/p', mode: 'pull' }))
+    const nodeWs = makeWs()
+    h.message(nodeWs as any, JSON.stringify({ type: 'registerNode', node: 'nas', agents: [{ name: 'headless@nas:src', kind: 'codex' }] }))
+    const woken = routeHumanBusMessage('status?', { user: 'mick', from_human: 'true', message_id: 'q' }, sessions, undefined, d)
+    expect(woken).toEqual(['claude@mac:src'])
+    const got = msgs(push).find(x => x.type === 'message')
+    expect(got.content).toBe('status?')
+    expect(got.meta.from_human).toBe('true')
+    expect(got.meta.routed).toBe('interactive')
+    expect(msgs(pull).some(x => x.type === 'message')).toBe(false)
+    expect(msgs(nodeWs).some(x => x.type === 'wake')).toBe(false)
+    expect(notes.at(-1)).toContain('routed to claude@mac:src')
+    expect(notes.at(-1)).toContain('no dispatcher')
+
+    const onlyHeadless = new NodeRegistry()
+    const quiet: string[] = []
+    const d2 = deps({ nodes: onlyHeadless, onRouteNote: (m) => quiet.push(m) })
+    const h2 = createWsHandlers(d2)
+    const node2 = makeWs()
+    h2.message(node2 as any, JSON.stringify({ type: 'registerNode', node: 'nas', agents: [{ name: 'headless@nas:src', kind: 'codex' }] }))
+    sessions.deregisterSession('claude@mac:src')
+    sessions.deregisterSession('pull@mac:src')
+    expect(routeHumanBusMessage('status?', { user: 'mick', from_human: 'true' }, sessions, undefined, d2)).toEqual([])
+    expect(msgs(node2).some(x => x.type === 'wake')).toBe(false)
+    expect(quiet[0]).toContain('not routed')
+    expect(quiet[0]).toContain('Headless')
+
+    const none: string[] = []
+    const d3 = deps({ onRouteNote: (m) => none.push(m) })
+    expect(routeHumanBusMessage('hello', { user: 'mick', from_human: 'true' }, new SessionManager(), undefined, d3)).toEqual([])
+    expect(none[0]).toContain('no agent sessions are connected')
+  })
+
+  test('a Discord reply that names a session wakes that session, not the dispatcher', () => {
+    const d = deps({ dispatcher: 'codex@nas642:src' })
+    const h = createWsHandlers(d)
+    register(h, 'codex@nas642:src')
+    const agy = register(h, 'agy@nas642:src')
+    const woken = routeHumanBusMessage('@agy@nas642:src do this', { user: 'mick', from_human: 'true', unbound_reply: 'hm1', message_id: 'r1' }, sessions, undefined, d)
+    expect(woken).toEqual(['agy@nas642:src'])
+    const got = msgs(agy).find(x => x.type === 'message')
+    expect(got.content).toBe('do this')
+    expect(got.meta.from_human).toBe('true')
+    expect(got.meta.question_id).toBe('hm1')
+  })
+
+  test('an incomplete @all token does not fan out', () => {
+    const errors: string[] = []
+    const d = deps({ onRoutingError: (m) => errors.push(m) })
+    const h = createWsHandlers(d)
+    const a = register(h, 'claude@mac:src')
+    const b = register(h, 'codex@nas642:src')
+    expect(routeHumanBusMessage('@all-team@mac:src do this', { user: 'mick', from_human: 'true' }, sessions, undefined, d)).toEqual([])
+    expect(routeHumanBusMessage('@all:synthesiz compare', { user: 'mick', from_human: 'true' }, sessions, undefined, d)).toEqual([])
+    expect(msgs(a).some(x => x.type === 'message')).toBe(false)
+    expect(msgs(b).some(x => x.type === 'message')).toBe(false)
+    expect(errors).toHaveLength(2)
+  })
+
+  test('dispatch re-delivers the original human message and only the dispatcher may call it', async () => {
+    const humanMail = new HumanMail()
+    const d = deps({ dispatcher: 'codex@nas642:src', humanMail })
+    const h = createWsHandlers(d)
+    const claude = register(h, 'claude@mac:src')
+    const dispatcher = register(h, 'codex@nas642:src')
+    const agy = register(h, 'agy@nas642:src')
+    routeHumanBusMessage('fix the router', { user: 'mick', from: 'mick', from_human: 'true', message_id: 'm1', chat_id: 'bus1' }, sessions, undefined, d)
+    expect(msgs(dispatcher).find(x => x.type === 'message').content).toBe('fix the router')
+    expect(msgs(agy).some(x => x.type === 'message')).toBe(false)
+
+    h.message(claude as any, JSON.stringify({ type: 'dispatch', requestId: 'no', messageId: 'm1', to: ['agy@nas642:src'] }))
+    expect(msgs(claude).at(-1).success).toBe(false)
+    expect(msgs(agy).some(x => x.type === 'message')).toBe(false)
+
+    h.message(dispatcher as any, JSON.stringify({ type: 'dispatch', requestId: 'bad', messageId: 'm1', to: ['agy'] }))
+    expect(msgs(dispatcher).at(-1).success).toBe(false)
+    expect(String(msgs(dispatcher).at(-1).data)).toContain('not an exact session name')
+    expect(msgs(agy).some(x => x.type === 'message')).toBe(false)
+
+    h.message(dispatcher as any, JSON.stringify({ type: 'dispatch', requestId: 'ok', messageId: 'm1', to: ['agy@nas642:src'] }))
+    const res = msgs(dispatcher).find(x => x.requestId === 'ok')
+    expect(res.success).toBe(true)
+    const got = msgs(agy).find(x => x.type === 'message')
+    expect(got.content).toBe('fix the router')
+    expect(got.meta.from_human).toBe('true')
+    expect(got.meta.question_id).toBe('m1')
+    expect(got.meta.from).toBe('mick')
+    expect(got.meta.routed).toBe('dispatch')
+    expect(msgs(claude).some(x => x.content === 'fix the router')).toBe(false)
+    await new Promise(r => setTimeout(r, 20))
+    expect(posted.some(p => p.includes('routed to agy@nas642:src'))).toBe(true)
   })
 
   test('when the dispatcher is offline, the channel owner gets the original human message', () => {

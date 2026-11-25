@@ -116,8 +116,16 @@ export interface WsPermissionRequest {
 export interface WsBusPost {
   readonly type: 'busPost'
   readonly text: string
-  /** Optional target session name; omitted = broadcast to every other session. */
+  /** Exact session, "human", or "all". Omitted mirrors the post and wakes nobody. */
   readonly to?: string
+}
+
+/** Dispatcher only: re-deliver a stored human message to these exact sessions. */
+export interface WsDispatch {
+  readonly type: 'dispatch'
+  readonly requestId: string
+  readonly messageId: string
+  readonly to: readonly string[]
 }
 
 /** Request the list of connected sessions (answered with a toolResult). */
@@ -205,6 +213,7 @@ export type PluginToRouterMessage =
   | WsChannelPost
   | WsChannelOp
   | WsBusPost
+  | WsDispatch
   | WsListSessions
   | WsRegister
   | WsRename

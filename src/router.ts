@@ -11,7 +11,7 @@ import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './ac
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
 import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, deliver as deliverFn } from './ws.js'
-import { Activity, CostClasses, Unread, WakeBudget } from './wake.js'
+import { Activity, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete, updateSkillCommands, isSkillCommand } from './slash-commands.js'
@@ -244,6 +244,8 @@ const channelOps: ChannelOps = {
 
 let wsDepsRef: Parameters<typeof createWsHandlers>[0]
 let routeError: string | undefined
+let routeNote: string | undefined
+const humanMail = new HumanMail()
 function deliverTo(name: string, text: string, meta: ChannelMeta): void { deliverFn(wsDepsRef, name, text, meta) }
 const wsHandlers = createWsHandlers(wsDepsRef = {
   sessions,
@@ -276,6 +278,8 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   channelOwners,
   staggerMs: parseInt(process.env.DISCORD_ALL_STAGGER_MS ?? '0', 10),
   onRoutingError: (message: string) => { routeError = message },
+  onRouteNote: (message: string) => { routeNote = message },
+  humanMail,
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
     updateSkillCommands(client, skills).catch((err: unknown) => {
       process.stderr.write(`discord channel: skill command registration failed: ${err instanceof Error ? err.message : String(err)}\n`)
@@ -384,6 +388,7 @@ async function handleBusInbound(msg: Message): Promise<void> {
     } catch {}
   }
   routeError = undefined
+  routeNote = undefined
   if (delivered.length === 0) {
     const bound = msg.reference?.messageId ? { ...fullMeta, unbound_reply: msg.reference.messageId } : fullMeta
     const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
@@ -391,14 +396,11 @@ async function handleBusInbound(msg: Message): Promise<void> {
   }
   process.stderr.write(`discord: bus message from ${msg.author.username} -> ${delivered.join(',') || '(no sessions)'}\n`)
   if (delivered.length === 0) {
-    const hint = routeError
-      ?? (sessions.getSessions().length || nodes.list().length
-        ? 'Nobody was woken. Name an exact session with @name, reply to their message, or set a dispatcher.'
-        : 'No agent sessions are connected.')
+    const hint = routeError ?? routeNote ?? 'not routed: no agent sessions are connected.'
     await msg.reply(hint).catch(() => {})
   } else {
     void msg.react('📨').catch(() => {})
-    if (!content.trim().startsWith('@')) await msg.reply(`woke ${delivered.join(', ')}`).catch(() => {})
+    if (!content.trim().startsWith('@')) await msg.reply(routeNote ?? `routed to ${delivered.join(', ')}`).catch(() => {})
   }
 }
 

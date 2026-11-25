@@ -53,6 +53,8 @@ either from another agent (from="<agent session name>") or from the human postin
 - Messages with from_human="true" come from the human operator. Answer them with bus_post(to="human")
   (shown in the channel, not forwarded to other agents). Only answer if the message is addressed to you
   or to everyone and you have something specific to contribute; don't repeat what other agents said.
+- If you are the dispatcher, call dispatch(message_id, to=[exact names]) to hand Mick's message on.
+  The router re-delivers his original text with from_human and question_id. Do not bus_post a paraphrase.
 - If you cannot receive pushed messages, call "check_inbox" to read messages addressed to you.
 - CHANNELS: besides the default bus channel (which every agent always receives), work can be split into
   topic channels in the same Discord server. "channel_list" shows them (with subscribers),
@@ -307,14 +309,33 @@ export async function startPlugin(): Promise<void> {
     }, maxInFlightMs)
     wakeTimer = setTimeout(() => {
       wakeTimer = null
-      if (gen !== wakeGen || inbox.length === 0) return
-      const run = (args: string[]) => new Promise<void>(res => {
-        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
-        p.on('close', () => res()); p.on('error', () => res())
-      })
-      void run(['send-keys', '-t', wakePane!, '-l', wakeText]).then(() => new Promise(r => setTimeout(r, 300)))
-        .then(() => run(['send-keys', '-t', wakePane!, 'Enter']))
+      void flushWake(gen)
     }, 2000)
+    // Recheck the inbox immediately before typing. A drain during the debounce, or a
+    // failed tmux send, must not start an empty turn or leave the latch stuck.
+    async function flushWake(gen: number): Promise<void> {
+      const run = (args: string[]) => new Promise<boolean>(res => {
+        if (gen !== wakeGen || inbox.length === 0) { res(false); return }
+        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
+        p.on('error', () => res(false))
+        p.on('close', code => res(code === 0))
+      })
+      const typed = await run(['send-keys', '-t', wakePane!, '-l', wakeText])
+      if (gen !== wakeGen) return
+      if (!typed) {
+        wakeInFlight = false
+        if (inbox.length > 0) considerWake()
+        return
+      }
+      await new Promise(r => setTimeout(r, 300))
+      if (gen !== wakeGen) return
+      const entered = await run(['send-keys', '-t', wakePane!, 'Enter'])
+      if (gen !== wakeGen) return
+      if (!entered) {
+        wakeInFlight = false
+        if (inbox.length > 0) considerWake()
+      }
+    }
   }
   function ackWake(): void {
     const remaining = inbox.length
@@ -459,6 +480,18 @@ export async function startPlugin(): Promise<void> {
   // Register tools
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
+      {
+        name: 'dispatch',
+        description: 'Dispatcher only. Re-deliver a human message to exact sessions. The router sends Mick\'s original text with from_human and question_id set to message_id. Do not paraphrase it with bus_post.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            message_id: { type: 'string', description: 'meta.message_id of the human post' },
+            to: { type: 'array', items: { type: 'string' }, description: 'Exact session names to wake' },
+          },
+          required: ['message_id', 'to'],
+        },
+      },
       {
         name: 'bus_post',
         description: 'Send a message to another AI agent (or all agents) over the shared Discord agent bus. The message is also shown in the bus channel for the human.',
@@ -686,6 +719,13 @@ export async function startPlugin(): Promise<void> {
           const inline = inlineFiles(files)
           sendWs(JSON.stringify({ type: 'reply', text, ...(chatId && { chatId }), ...(replyTo && { replyTo }), ...(inline.length && { files: inline }) }))
           return { content: [{ type: 'text', text: 'Message sent' }] }
+        }
+        case 'dispatch': {
+          const messageId = args.message_id as string | undefined
+          const to = Array.isArray(args.to) ? args.to.filter((n): n is string => typeof n === 'string' && n.length > 0) : []
+          if (!messageId || to.length === 0) throw new Error('dispatch requires message_id and to (exact session names)')
+          const r = await sendToolRequest({ type: 'dispatch', messageId, to })
+          return { content: [{ type: 'text', text: r }] }
         }
         case 'bus_post': {
           if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')

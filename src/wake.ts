@@ -62,6 +62,30 @@ export class CostClasses {
   }
 }
 
+/**
+ * Recent human posts, keyed by Discord message id. The dispatcher re-delivers
+ * one of these verbatim. Not durable: a restart forgets them.
+ */
+export class HumanMail {
+  private readonly items = new Map<string, { content: string; meta: Record<string, string | undefined> }>()
+  private readonly ids: string[] = []
+
+  remember(content: string, meta: { message_id?: string; from_human?: string }): void {
+    const id = meta.message_id
+    if (!id || meta.from_human !== 'true' || this.items.has(id)) return
+    this.items.set(id, { content, meta: { ...meta } })
+    this.ids.push(id)
+    while (this.ids.length > 200) {
+      const old = this.ids.shift()
+      if (old) this.items.delete(old)
+    }
+  }
+
+  get(id: string): { content: string; meta: Record<string, string | undefined> } | undefined {
+    return this.items.get(id)
+  }
+}
+
 /** Last time a session posted. Separate from "connected" and from inbox depth. */
 export class Activity {
   private readonly posts = new Map<string, string>()
