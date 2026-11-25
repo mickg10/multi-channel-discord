@@ -313,9 +313,10 @@ export class Inboxes {
   bind(target: Target): void {
     const previous = this.target(target.alias)
     if (previous && identityKey(previous) === identityKey(target)) return
-    // Only the first binding can inherit unbound mail. A different conversation
-    // can recover its held mail by registering its identity again.
-    const inherit = !previous && (!this.seenAliases.has(target.alias) || this.conversation(target.alias) === target.conv)
+    // Legacy mail remains name-addressed until migration. If the legacy owner
+    // is known, only its conversation can migrate that mail into a native inbox.
+    const legacyConversation = this.conversation(target.alias)
+    const inherit = legacyConversation === undefined ? !this.seenAliases.has(target.alias) : legacyConversation === target.conv
     const ids = this.list(target.alias).filter(({ meta }) => {
       const approval = meta.from_human === 'true' && meta.question_id && meta.conversation_id
       return approval ? meta.conversation_id === target.conv : inherit
@@ -427,6 +428,12 @@ export class Inboxes {
   mark(key: string, id: string, result: WakeResult): InboxEntry {
     const entry = this.get(id)
     if (entry?.key !== key) throw new Error('unknown_message')
+    const outcome = entry.state === 'leased' && entry.nativeId !== undefined ? 'woken' : entry.state
+    if (outcome === 'woken' || outcome === 'held' || outcome === 'refused' || outcome === 'unavailable') {
+      // The gateway may have lost our reply after the journal was synced.
+      if (result.s === outcome && (result.s !== 'woken' || result.nativeId === entry.nativeId)) return entry
+      throw new Error('invalid_wake_transition')
+    }
     if (entry.state === 'committed' && this.wakePending(key)) {
       throw new Error('wake_already_pending')
     }

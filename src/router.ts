@@ -48,6 +48,13 @@ function nodeSecretsProvider() {
   try { hashes = JSON.parse(readFileSync(pjoin(STATE_DIR, 'node-secrets.json'), 'utf8')) } catch {}
   return { hashes, require: REQUIRE_NODE_SECRET }
 }
+function gatewayAliasHostsProvider(): Readonly<Record<string, string>> {
+  try {
+    const owners: unknown = JSON.parse(readFileSync(pjoin(STATE_DIR, 'gateway-alias-hosts.json'), 'utf8'))
+    if (owners && typeof owners === 'object' && !Array.isArray(owners)) return owners as Record<string, string>
+  } catch { /* Bare gateway aliases fail closed without a configured owner. */ }
+  return {}
+}
 const ADMINS = new Set((process.env.DISCORD_ADMIN_SESSIONS ?? '').split(',').map(s => s.trim()).filter(Boolean))
 if (WS_HOST !== '127.0.0.1' && WS_HOST !== 'localhost' && !ROUTER_SECRET) {
   process.stderr.write('discord channel: refusing to bind non-localhost without DISCORD_ROUTER_SECRET\n')
@@ -268,6 +275,7 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   mcp: mcp ?? undefined,
   admins: ADMINS,
   nodeSecrets: nodeSecretsProvider,
+  gatewayAliasHosts: gatewayAliasHostsProvider,
   humanChannelId: HUMAN_CHANNEL,
   rules: rulesProvider,
   unread,

@@ -94,6 +94,8 @@ export interface WsDeps {
    * secret; unlisted nodes are rejected when `require` is set (else accepted with a warning).
    */
   readonly nodeSecrets?: () => { readonly hashes: Readonly<Record<string, string>>; readonly require: boolean }
+  /** Router-controlled ownership of legacy gateway aliases without a host suffix. */
+  readonly gatewayAliasHosts?: () => Readonly<Record<string, string>>
   /** Sessions allowed to manage other sessions' subscriptions (DISCORD_ADMIN_SESSIONS). */
   readonly admins?: ReadonlySet<string>
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
@@ -414,6 +416,17 @@ function matchesSecret(secret: unknown, hash: string | undefined): boolean {
     timingSafeEqual(createHash('sha256').update(secret).digest(), Buffer.from(hash, 'hex'))
 }
 
+function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
+  const lower = alias.toLowerCase()
+  if (!/^[-\w.@:/]+$/.test(alias) || HUMAN_TARGETS.has(lower) ||
+      lower === 'router' || /^all(?::(?:synthesis|independent))?$/.test(lower) || lower.startsWith('@all')) return false
+  const qualified = /^[-\w./]+@([a-z0-9.-]+)(?::[-\w./:]+)?$/i.exec(alias)
+  if (qualified) return qualified[1] === host
+  if (alias.includes('@')) return false
+  const owners = deps.gatewayAliasHosts?.()
+  return !!owners && Object.hasOwn(owners, alias) && owners[alias] === host
+}
+
 function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly<WsDeps>): void {
   const inboxes = deps.inboxes
   const reply = (ok: boolean, data: string) => {
@@ -454,8 +467,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
   if (frame.type === 'registerAgent') {
     if (!GATEWAY_KINDS.has(frame.kind) || typeof frame.conv !== 'string' || !frame.conv.trim() ||
         typeof frame.alias !== 'string' || (frame.host !== undefined && frame.host !== host) ||
-        !/^[-\w.@:/]+$/.test(frame.alias) ||
-        (frame.alias.includes('@') && frame.alias.split('@')[1]?.split(':')[0] !== host) ||
+        !gatewayAliasAllowed(deps, frame.alias, host) ||
         (deps.nodes?.get(frame.alias) && deps.nodes.get(frame.alias)?.node !== host)) {
       reply(false, 'invalid_agent_registration')
       return

@@ -35,6 +35,7 @@ function router(dir: string, extra: Partial<WsDeps> = {}) {
     nodes: new NodeRegistry(), conversations: new Conversations(), busChannelId: 'bus',
     client: { channels: { fetch: async () => null } } as unknown as WsDeps['client'],
     nodeSecrets: () => ({ hashes: { mac: digest, nas: digest, nas642: digest }, require: false }),
+    gatewayAliasHosts: () => ({ opencode_nas642_glm53_abli: 'nas642' }),
     chatId: () => null, chunkLimit: 2000, chunkMode: 'length', replyToMode: 'first', ...extra,
   }
   const handlers = createWsHandlers(deps)
@@ -522,4 +523,100 @@ test.each(['woken', 'uncertain'] as const)('a first read of an %s wake reopens t
   expect(b.inboxes.count(alias)).toBe(2)
   expect(lease(next, alias, leased.receipt).messages).toMatchObject([{ id: second!.msgId, body: 'B' }])
   expect(b.inboxes.count(alias)).toBe(1)
+})
+
+test('first gateway binding preserves ordinary mail for a different remembered legacy owner', () => {
+  const dir = directory()
+  const a = router(dir)
+  legacy(a.connect(), alias, 'pull', 'old')
+  deliver(a.deps, alias, 'prior unbound ordinary mail', {})
+  const previous = a.inboxes.list(alias)[0]!
+
+  const b = router(dir)
+  expect(b.inboxes.conversation(alias)).toBe('old')
+  const gw = b.connect()
+  gateway(gw)
+  agent(gw, alias, 'new')
+  expect(lease(gw, alias).messages).toEqual([])
+  expect(b.inboxes.list(alias).map(entry => entry.id)).toEqual([previous.id])
+
+  const c = router(dir)
+  const recovered = c.connect()
+  gateway(recovered)
+  agent(recovered, alias, 'old')
+  expect(lease(recovered, alias).messages).toMatchObject([
+    { id: previous.id, body: 'prior unbound ordinary mail' },
+  ])
+  expect(c.inboxes.list(alias)).toEqual([])
+})
+
+test('a foreign gateway cannot replace a bare legacy session or inherit its mail', () => {
+  const a = router(directory())
+  const mac = a.connect()
+  gateway(mac)
+  agent(mac, 'codex@nas642', 'foreign')
+  expect(mac.frames.at(-1)?.message).toBe('invalid_agent_registration')
+  const name = 'opencode_nas642_glm53_abli'
+  const recipient = a.connect()
+  legacy(recipient, name, 'pull')
+  deliver(a.deps, name, 'for its assigned host', {})
+  agent(mac, name, 'foreign', 'opencode')
+  expect(mac.frames.at(-1)?.message).toBe('invalid_agent_registration')
+  expect(a.inboxes.target(name)).toBeUndefined()
+  expect(recipient.frames.some(frame => frame.type === 'replaced')).toBe(false)
+
+  const nas = a.connect()
+  gateway(nas, 'nas642')
+  agent(nas, name, 'local', 'opencode')
+  expect(lease(nas, name).messages).toMatchObject([{ body: 'for its assigned host' }])
+})
+
+test('an unqualified alias needs explicit router ownership', () => {
+  const a = router(directory())
+  const mac = a.connect()
+  gateway(mac)
+  agent(mac, 'unassigned', 'claimed', 'codex')
+  expect(mac.frames.at(-1)?.message).toBe('invalid_agent_registration')
+  expect(a.inboxes.target('unassigned')).toBeUndefined()
+})
+
+test('gateway alias registration rejects reserved names even if explicitly configured', () => {
+  const names = ['human', 'admin', 'user', 'me', 'ALL', 'all:synthesis', 'router', '@all:independent']
+  const a = router(directory(), { gatewayAliasHosts: () => Object.fromEntries(names.map(name => [name, 'mac'])) })
+  const mac = a.connect()
+  gateway(mac)
+  for (const name of names) {
+    agent(mac, name, 'claimed')
+    expect(mac.frames.at(-1)?.message).toBe('invalid_agent_registration')
+    expect(a.inboxes.target(name)).toBeUndefined()
+  }
+})
+
+test.each(['woken', 'held', 'refused'] as const)('a lost %s result reply allows exact replay after restart', outcome => {
+  const dir = directory()
+  const a = router(dir)
+  const gw = a.connect()
+  gateway(gw)
+  agent(gw, alias, 'A')
+  deliver(a.deps, alias, 'wake once', {})
+  const wake = gw.frames.find(frame => frame.type === 'wake')!
+  const result = outcome === 'woken' ? { s: outcome, nativeId: 'native-original' } : { s: outcome }
+  const post = { type: 'wakeResult', as: alias, id: wake.msgId, result, requestId: 'lost' }
+  gw.failWhen(frame => frame.requestId === 'lost')
+  gw.send(post)
+  expect(gw.result('lost')).toBeUndefined()
+  if (outcome === 'woken') expect(lease(gw, alias).messages[0]?.state).toBe('leased')
+
+  const b = router(dir)
+  const replay = b.connect()
+  gateway(replay)
+  agent(replay, alias, 'A')
+  agent(replay, other, 'B')
+  replay.send({ ...post, requestId: 'exact' })
+  expect(replay.result('exact')?.success).toBe(true)
+  replay.send({ ...post, requestId: 'conflict', result: outcome === 'woken' ? { s: 'woken', nativeId: 'different' } : { s: 'woken', nativeId: 'new' } })
+  expect(replay.result('conflict')?.data).toBe('invalid_wake_transition')
+  replay.send({ ...post, requestId: 'foreign', as: other })
+  expect(replay.result('foreign')?.data).toBe('unknown_message')
+  expect(replay.frames.some(frame => frame.type === 'wake')).toBe(false)
 })
