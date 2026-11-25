@@ -12,7 +12,7 @@ const TRANSPORTS: readonly Transport[] = ['codex-queue', 'opencode-queue', 'clau
 const HOST = /^[a-z0-9][a-z0-9.-]*$/i
 const USER = /^[a-z0-9_][a-z0-9_.-]*$/i
 
-export type AdapterBinding = { kind: Kind; transport: Transport }
+export type AdapterBinding = { kind: Kind; transport: Transport; servicePath?: string }
 
 export type GatewayConfig = {
   host: string
@@ -55,10 +55,11 @@ export function setCodexControlSocket(conv: string, path: string | undefined): v
 
 /** Codecs the CLI can construct. Other transports stay unregistered until their adapter PR lands. */
 export function builtinAdapters(bindings: readonly AdapterBinding[]): Adapter[] {
+  const opencode = bindings.find(binding => binding.kind === 'opencode' && binding.transport === 'opencode-queue')
   registerAdapter('codex', 'codex-queue', () => createCodexAdapter({
     resolveControlSocket: target => codexSockets.get(target.conv),
   }))
-  registerAdapter('opencode', 'opencode-queue', () => createOpencodeAdapter())
+  registerAdapter('opencode', 'opencode-queue', () => createOpencodeAdapter(opencode?.servicePath))
   return adaptersFor(bindings)
 }
 
@@ -161,7 +162,16 @@ export function loadConfig(path: string): GatewayConfig {
     const transport = row.transport
     if (typeof kind !== 'string' || !(KINDS as readonly string[]).includes(kind)) throw new Error(`no adapter for ${String(kind)}`)
     if (typeof transport !== 'string' || !(TRANSPORTS as readonly string[]).includes(transport)) throw new Error(`no adapter for ${String(kind)}/${String(transport)}`)
-    const binding = { kind: kind as Kind, transport: transport as Transport }
+    let servicePath: string | undefined
+    if (row.servicePath !== undefined) {
+      if (kind !== 'opencode' || transport !== 'opencode-queue') throw new Error('servicePath is only valid for opencode/opencode-queue')
+      servicePath = abs(row.servicePath, 'servicePath')
+    }
+    const binding: AdapterBinding = {
+      kind: kind as Kind,
+      transport: transport as Transport,
+      ...(servicePath !== undefined ? { servicePath } : {}),
+    }
     const key = bindingKey(binding)
     if (seen.has(key)) throw new Error(`adapter ${kind}/${transport} is listed twice`)
     seen.add(key)

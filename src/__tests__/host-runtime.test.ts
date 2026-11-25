@@ -99,6 +99,42 @@ test('the cli builds the codex and opencode adapters from their transports', () 
   ])
 })
 
+test('opencode servicePath from config is passed to the adapter', async () => {
+  const dir = await tempDir()
+  const file = join(dir, 'gateway.json')
+  const servicePath = join(dir, 'service.json')
+  writeFileSync(servicePath, JSON.stringify({ url: 'http://127.0.0.1:9/', password: 'pw' }), { mode: 0o600 })
+  chmodSync(servicePath, 0o600)
+  const configured = [{ kind: 'opencode' as const, transport: 'opencode-queue' as const, servicePath }]
+  const base = {
+    host: 'nas642', user: 'mickg', routerUrl: 'wss://router.example/bus',
+    secretFile: '/s', socketPath: '/g', wakeStore: '/w', pipePath: '/p', adapters: configured,
+  }
+  writeFileSync(file, JSON.stringify(base), { mode: 0o600 })
+  chmodSync(file, 0o600)
+  expect(loadConfig(file).adapters).toEqual(configured)
+  writeFileSync(file, JSON.stringify({ ...base, adapters: [{ kind: 'opencode', transport: 'opencode-queue', servicePath: 'relative.json' }] }))
+  expect(() => loadConfig(file)).toThrow('absolute')
+  writeFileSync(file, JSON.stringify({ ...base, adapters: [{ kind: 'codex', transport: 'codex-queue', servicePath: '/tmp/service.json' }] }))
+  expect(() => loadConfig(file)).toThrow('opencode/opencode-queue')
+  const calls: string[] = []
+  const previous = globalThis.fetch
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    calls.push(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url)
+    return new Response('', { status: 503 })
+  }) as typeof fetch
+  try {
+    const built = builtinAdapters(configured)
+    const result = await built[0]!.probe({
+      host: 'nas642', user: 'mickg', kind: 'opencode', conv: 'ses_abc', alias: 'opencode@nas642',
+    })
+    expect(result).toEqual({ ok: false })
+    expect(calls).toEqual(['http://127.0.0.1:9/api/session/active'])
+  } finally {
+    globalThis.fetch = previous
+  }
+})
+
 test('a group-readable node secret is refused', async () => {
   const dir = await tempDir()
   const file = join(dir, 'secret')
