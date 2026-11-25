@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.2** (after R2), entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v4.4** (after R4), entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -31,7 +31,7 @@ Invariant **N3 (exact identity)**: delivery target = native conversation id, nev
 | **Claude Code 2.1.33x** | `~/.claude/sessions/<pid>.json`: sessionId, name, cwd, status, tmux, messagingSocketPath; re-read per call (handles /clear, /resume) | **Inbox socket** (documented, cross-session-messaging). NDJSON: `{"type":"auth","token":T}` then `{"type":"user","message":{"content":…},"from":"uds:…","priority":"next"}` | session file `status` | **Tested 16:15–16:19 Mac**: (1) ask-mode receiver: unauthenticated external post delivered, started turn. (2) bypass receiver, no token: **held** in approval dialog. (3) bypass receiver, orphaned process **with that session's `CLAUDE_CODE_MESSAGING_TOKEN`**: **delivered**, no dialog. |
 | **Codex 0.170+** | MCP `tools/call` carries `_meta.threadId`+`sessionId` (codex-rs mcp_tool_call.rs) | app-server control socket `~/.codex/app-server-control/*.sock`: `turn/start` only when `thread/read` says idle; `turn/steer` forbidden (N2) | `thread/status/changed`, `turn/completed` | codex_nas (0.172 TUI daemon, read-only), codex_mac (0.132 schema). **Unproven:** TUI renders an external turn; human-typing race. Until proven: queue + tmux nudge for TUI-owned threads. |
 | **opencode 2.x** (nas642 service 2.0.18) | session id `ses_…` (`GET /api/session`) | Service HTTP API (TUI auto-spawns `opencode serve --service` on 127.0.0.1; url and password are in `~/.local/state/opencode/service.json`, mode 0600; no password → 401). `POST /api/session/{id}/prompt` with **`delivery:"queue"`** (never `"steer"`), plus a caller-supplied `id: msg_…` for idempotency (verify). That is the native durable queue, inspectable via `GET /api/session/{id}/inbox`. `POST …/synthetic` also exists. | `GET /api/session/active` (absent = idle); `GET /api/event` SSE | Leader probe on nas642 via `opencode api GET /openapi.json` (read-only, 16:3x). **MCP servers are spawned by the service**, not the TUI (process tree), so tool identity is per service. The live tmux bug: 3 discord clients under one service, and nudge text sits unsubmitted in the TUI input. |
-| **grok 1.0.92** | ACP session id | `grok agent serve` (WS 127.0.0.1, `--secret`) / `agent stdio`; live TUI not on leader → tmux | ACP events | grok docs 15-agent-mode.md |
+| **grok 1.0.92** | ACP session id | Live TUI: **none** (no leader.sock unless the TUI was started with a leader; `agent serve` is a new WS whose secret only its starter knows), so a human-used grok TUI is **pull-only**. Gateway-owned: `grok agent stdio` (ACP `session/new`, fixed-nudge prompt) | ACP events | grok_nas R4 [verified] |
 | **agy 1.5.17** | conversation UUID (`$ANTIGRAVITY_CONVERSATION_ID`) | Gateway-owned: `agy acp` (`session/resume`/`session/prompt`, with inline per-session `mcpServers`) or stream-json stdin (omit `-p`). Live TUI: **no inject**, so tmux nudge, gated on runState | Live TUI: a SessionStart hook gives LS address and CSRF token, and `ConversationService/GetConversation` returns `runState` IDLE/RUNNING. Gateway-owned: turn framing | agy_nas verified live on nas642 (docs: headless.md, hooks.md) |
 
 ### Claude wake: order of preference (R2#6)
@@ -63,14 +63,15 @@ Commit-before-ack on enqueue; lease by msg id on drain; ack only after recipient
 error to the sender, never silent oldest-drop; uncertain inject → "unresolved", reconciled, never replayed blindly.
 
 ## 5. Controller
+Gateway-owned agents (grok/agy ACP children, persistent helpers) are **not** children of the gateway process. Each runs in its own tmux-0 window under a tiny restart loop, so a gateway crash or upgrade never kills them (R4#3). Persisted state: msg states, woken id (**fsync before the native send**), and pane plus conversation id per agent. **Tokens are never persisted.** After a gateway restart, an idle bypass Claude has no token until its next hook fire, so its wake falls back to channel, then SendMessage helper, then tmux (R4#4).
 Scope: a gateway controls only its own host. If the host is lost, its agents are gone too, and the router's durable mail is the cross-host continuity, so there is no standby gateway (R1#4 considered and rejected). Upgrades work by drain, then exec, and KeepAlive restarts it.
 The gateway is the never-down controller (KeepAlive/systemd --user). It (a) restarts dead agents in tmux session 0
 with their own conversation id, (b) never restarts itself or the shared Codex daemon to fix its own state,
 (c) applies upgrades by draining, then exec. Migration operator (an agent): ops-upgrader, restarts last.
 
 ## 6. Migration (per kind, old client stopped in the same step its adapter goes live)
-M0 gateway + durability, no adapters. M1 Claude (hook + inbox socket). M2 opencode. M3 Codex (queue+nudge first,
-native after the disposable race test). M4 grok/agy (ACP for gateway-owned, tmux for TUIs). M5 retire plugin.ts ws client.
+M0 gateway + durability + JSON check_inbox, no adapters, **no tmux restarts**. M1 Claude (hook + inbox socket). M2 opencode. M3 Codex (queue+nudge first,
+native after the disposable race test). M4 grok/agy: ACP for gateway-owned. Live grok TUIs are pull-only (tmux repeats the stuck-composer bug) until a disposable leader-mode test passes. Live agy TUIs use the tmux nudge gated on runState. CFD sessions are excluded throughout. Gates: M1 needs Q1, M2 needs opencode MCP to carry the session id (or gateway-owned only). M5 retire plugin.ts ws client.
 Each step: disposable session test → one real agent → fleet; revert = restore old MCP entry.
 
 ## 7. Open questions for Mick
@@ -106,3 +107,9 @@ GLM-5.3 critic unreachable. Its TUI shows three concatenated unsubmitted nudges 
 3. MCP spawned by the service → tool identity needs the session id. Open: does opencode pass the session id to MCP tool calls (like Codex `_meta.threadId`)? If not, gateway-owned opencode only, or one service per agent.
 4. The current tmux wake is broken for opencode → M2 is high value.
 GLM may still post R3 critique; it will be appended.
+
+### R4 grok_nas (07f3740)
+1–3. [v] No live grok inject; serve secret unknowable; `agent stdio` = new ACP process → **accepted**: grok TUIs pull-only, gateway-owned via stdio, not parented to the gateway.
+4. Restart loses tokens and the nudge counter → **accepted**: fsync woken id before send; persist pane and conversation id, never tokens; post-restart fallback chain.
+5. Migration gates → **accepted** (M0 no tmux restarts, M1 gated on Q1, M2 gated on the session id in MCP, CFD out).
+6. Simpler matrix (Claude token, Codex queue/add, opencode delivery:queue, grok/agy TUIs pull-only, headless stdio) → **matches v4.4**. agy TUIs keep the runState-gated tmux nudge, since agy's composer submits correctly.
