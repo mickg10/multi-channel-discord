@@ -130,3 +130,4 @@ GLM may still post R3 critique; it will be appended.
 3. [v] Current Inboxes can't represent the states → **accepted**: focused refactor, scoped in §4.
 4. Define "accepted" → **accepted**: native ack = woken; accepted = recipient check_inbox ack.
 5. Fastest path → **partly accepted**: no generic framework or UI. Codex and opencode run in parallel rather than Codex alone, because opencode is equally proven and broken in production today.
+- **codex_nas live bug (router 8697214, in-memory fixture):** `agentStatus` against a live push session whose route fails attempts the push, **empties the inbox** and reports pending=0, so a status probe destroys mail. **Adopted for M0:** status, count and peek are strictly observational (no drain, no push). A regression test covers the failed push on `agentStatus` and on reconnect-registration flush. Migration preflight must use only observational calls until M0 ships.
