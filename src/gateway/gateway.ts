@@ -175,11 +175,12 @@ export class Gateway {
       return
     }
     if (this.opts.onVerifiedConnection) this.opts.onVerifiedConnection(sock, verdict.agents)
-    else if (peer) this.onVerifiedConnection(sock, peer.ppid)
+    else if (peer) this.onVerifiedConnection(sock, peer.ppid, peer.parentStarted)
   }
 
-  private onVerifiedConnection(sock: Socket, parentPid: number): void {
-    void serveGatewayMcp(sock, sock, () => this.registry.byPid(parentPid), agent => this.registry.matches(agent), async (agent, op, args) => {
+  private onVerifiedConnection(sock: Socket, parentPid: number, parentStarted: string): void {
+    const agentsForCall = () => this.registry.byPid(parentPid).filter(agent => agent.started === parentStarted)
+    void serveGatewayMcp(sock, sock, agentsForCall, agent => this.registry.matches(agent), async (agent, op, args) => {
       if (op !== 'lease') return this.router.tool(agent.alias, op, args)
       const leased = await this.router.lease(agent.alias, args.receipt as string | undefined)
       this.store.clearOpen(agent.conv)

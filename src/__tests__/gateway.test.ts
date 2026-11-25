@@ -496,6 +496,10 @@ describe('gateway skeleton', () => {
       socket.write(JSON.stringify(mcpCall({ op: 'check_inbox', conv: 'moved' })) + '\n')
       expect((await read()).ok).toBe(true)
       expect(g.frames.filter(frame => frame.type === 'lease')).toHaveLength(before + 1)
+      g.gw.registerAgent({ ...parent, conv: 'replacement', started: 'linux:3' })
+      socket.write(JSON.stringify(mcpCall({ op: 'check_inbox', conv: 'replacement' })) + '\n')
+      expect(await read()).toMatchObject({ ok: false, error: 'Conversation identity is missing, mismatched, or stale' })
+      expect(g.frames.filter(frame => frame.type === 'lease')).toHaveLength(before + 1)
       socket.end()
     } finally { await g.gw.close() }
   })
