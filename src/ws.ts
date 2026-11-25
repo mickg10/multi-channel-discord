@@ -21,6 +21,7 @@ import type { Subscriptions } from './subscriptions.js'
 import type { Inboxes, NodeRegistry, Claims } from './nodes.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
+import { orderByCost, resolveExact, type Activity, type Conversations, type CostClasses, type HumanMail, type Unread, type WakeBudget, type WakeLog } from './wake.js'
 
 /** Guild channel operations the router provides (mockable in tests). */
 export interface ChannelOps {
@@ -96,6 +97,27 @@ export interface WsDeps {
   readonly humanChannelId?: string
   /** Bus rules sent once to every session on (first) register. */
   readonly rules?: () => { text: string; seen(name: string): boolean; markSeen(name: string): void } | null
+  /** Passive chatter. Not the durable inbox, and not saved across a router restart. */
+  readonly unread?: Unread
+  readonly costs?: CostClasses
+  readonly activity?: Activity
+  readonly wakeLog?: WakeLog
+  /** Cold-wake cap for non-human mail. Unset = no cap. */
+  readonly budget?: WakeBudget
+  /** Session that receives untargeted human posts. Exact name. */
+  readonly dispatcher?: string
+  /** Channel id → owner session. Used when the dispatcher is offline. */
+  readonly channelOwners?: ReadonlyMap<string, string>
+  /** Delay before premium/standard sessions are woken on an explicit @all. 0 = same turn, cheap first. */
+  readonly staggerMs?: number
+  /** Clarification for the human when a name was ambiguous or not exact. */
+  onRoutingError?: (message: string) => void
+  /** Who an untargeted human post woke, or why it woke nobody. */
+  onRouteNote?: (message: string) => void
+  /** Original human posts, so the dispatcher can re-deliver one by message id. */
+  readonly humanMail?: HumanMail
+  /** conversationId from register. Survives disconnect so a held approval keeps its owner. */
+  readonly conversations?: Conversations
 }
 
 /** A file sent inline by a client (the router is remote: it must never open client-named paths). */
@@ -138,13 +160,35 @@ function allNames(deps: Readonly<WsDeps>): string[] {
  */
 export function deliver(deps: Readonly<WsDeps>, name: string, text: string, meta: ChannelMeta): boolean {
   const live = deps.sessions.getSessions().some(s => s.name === name)
-  if (live && !pullSessions.has(name)) return deps.sessions.routeToSession(name, text, meta)
-  if (!deps.inboxes) return live ? deps.sessions.routeToSession(name, text, meta) : false
-  if (!live && !deps.nodes?.get(name)) return false
-  const n = deps.inboxes.push(name, text, meta)
-  // A live pull session is mid-turn and will check_inbox; the node re-checks after the turn.
-  if (!live) deps.nodes?.wake(name, n)
-  return true
+  const cold = !live
+  // Human mail and the router's own rules always wake. Other cold wakes are budgeted.
+  const exempt = meta.from_human === 'true' || meta.from === 'router'
+  if (cold && !exempt && deps.budget && !deps.budget.allow(name, deps.costs?.get(name) ?? 'standard')) {
+    deps.unread?.bump([name])
+    return false
+  }
+  let ok = false
+  let pending = deps.inboxes?.count(name) ?? 0
+  const known = meta.conversation_id ?? (meta.from_human === 'true' && meta.question_id ? deps.conversations?.get(name) : undefined)
+  const stamped: ChannelMeta = known ? { ...meta, conversation_id: known } : meta
+  // An approval for an offline session is held only when that conversation has checked in before.
+  // Otherwise it would sit on a display name the next conversation could inherit.
+  if (!live && !deps.nodes?.get(name) && meta.from_human === 'true' && meta.question_id && !known) return false
+  if (live && !pullSessions.has(name)) ok = deps.sessions.routeToSession(name, text, stamped)
+  else if (!deps.inboxes) ok = live ? deps.sessions.routeToSession(name, text, stamped) : false
+  else if (!live && !deps.nodes?.get(name)) {
+    if (stamped.conversation_id && meta.from_human === 'true' && meta.question_id) {
+      pending = deps.inboxes.push(name, text, stamped)
+      ok = true
+    }
+  } else {
+    pending = deps.inboxes.push(name, text, stamped)
+    // A live pull session is mid-turn and will check_inbox; the node re-checks after the turn.
+    if (!live) deps.nodes?.wake(name, pending)
+    ok = true
+  }
+  if (ok) deps.wakeLog?.record({ name, messageId: stamped.message_id, pending, cold, at: Date.now() })
+  return ok
 }
 
 function sendRulesOnce(deps: Readonly<WsDeps>, name: string): void {
@@ -347,7 +391,8 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       if (!p.requestId || !p.agent) { sendError(ws, 'agentStatus requires requestId and agent'); return }
       const live = deps.sessions.getSessions().some(s => s.name === p.agent)
       const push = live && !pullSessions.has(p.agent)
-      if (push) for (const q of deps.inboxes?.drain(p.agent) ?? []) deps.sessions.routeToSession(p.agent, q.content, { ...q.meta, queued_at: q.at })
+      const cid = deps.conversations ? (deps.conversations.get(p.agent) ?? null) : undefined
+      if (push) for (const q of deps.inboxes?.drain(p.agent, cid) ?? []) deps.sessions.routeToSession(p.agent, q.content, { ...q.meta, queued_at: q.at })
       sendToolResult(ws, p.requestId, true, JSON.stringify({ live, mode: live ? (push ? 'push' : 'pull') : null, pending: deps.inboxes?.count(p.agent) ?? 0 }))
       break
     }
@@ -357,9 +402,20 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       const who = parsed.type === 'inboxCount' ? parsed.agent : ws.data.sessionName
       if (!who) { sendToolResult(ws, parsed.requestId, false, 'not registered'); return }
       if (parsed.type === 'inboxCount') sendToolResult(ws, parsed.requestId, true, String(deps.inboxes?.count(who) ?? 0))
-      else sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.inboxes?.drain(who) ?? []))
+      else {
+        // Directed mail only. Old clients get a bare array. withUnread adds a count of
+        // passive chatter and never the bodies.
+        const bound = deps.conversations ? (deps.conversations.get(who) ?? null) : undefined
+        const messages = deps.inboxes?.drain(who, bound) ?? []
+        const withUnread = (parsed as { withUnread?: boolean }).withUnread === true
+        const unread = withUnread ? (deps.unread?.take(who) ?? 0) : 0
+        sendToolResult(ws, parsed.requestId, true, JSON.stringify(withUnread ? { messages, unread } : messages))
+      }
       break
     }
+    case 'dispatch':
+      handleDispatch(ws, parsed, deps)
+      break
     case 'busPost':
       if (!hasString(parsed, 'text')) {
         sendError(ws, 'busPost requires text')
@@ -399,15 +455,22 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         return
       }
       {
+        const row = (name: string) => ({
+          costClass: deps.costs?.get(name) ?? 'standard',
+          pending: deps.inboxes?.count(name) ?? 0,
+          unread: deps.unread?.count(name) ?? 0,
+          ...(deps.activity?.lastPost(name) && { lastPost: deps.activity.lastPost(name) }),
+        })
         const live = deps.sessions.getSessions().map(s => ({
           name: s.name, projectPath: s.projectPath, connectedAt: new Date(s.connectedAt).toISOString(),
           state: deps.nodes?.get(s.name) ? 'running' : 'live',
           ...(deps.nodes?.get(s.name) && { node: deps.nodes.get(s.name)!.node }),
+          ...row(s.name),
         }))
         const liveNames = new Set(live.map(s => s.name))
         const asleep = (deps.nodes?.list() ?? []).filter(a => !liveNames.has(a.name)).map(a => ({
           name: a.name, projectPath: a.cwd ?? '', connectedAt: '', state: 'idle', node: a.node,
-          pending: deps.inboxes?.count(a.name) ?? 0,
+          ...row(a.name),
         }))
         sendToolResult(ws, parsed.requestId, true, JSON.stringify([...live, ...asleep]))
       }
@@ -431,15 +494,21 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
           try { deps.sessions.deregisterSession(parsed.name) } catch {}
         }
       }
+      const conversationId = typeof (parsed as { conversationId?: unknown }).conversationId === 'string'
+        ? (parsed as { conversationId: string }).conversationId
+        : ''
       handleRegister(ws, parsed.name, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
       if (ws.data.sessionName) {
+        if (conversationId) deps.conversations?.set(ws.data.sessionName, conversationId)
+        const cid = deps.conversations ? (deps.conversations.get(ws.data.sessionName) ?? null) : undefined
         if ((parsed as { mode?: string }).mode === 'pull') pullSessions.add(ws.data.sessionName)
         else {
           pullSessions.delete(ws.data.sessionName)
-          // Messages queued while this agent was offline: push them now.
-          for (const q of deps.inboxes?.drain(ws.data.sessionName) ?? []) deps.sessions.routeToSession(ws.data.sessionName, q.content, { ...q.meta, queued_at: q.at })
+          // Messages queued while this agent was offline. Approvals for another conversation stay queued.
+          for (const q of deps.inboxes?.drain(ws.data.sessionName, cid) ?? []) deps.sessions.routeToSession(ws.data.sessionName, q.content, { ...q.meta, queued_at: q.at })
         }
         sendRulesOnce(deps, ws.data.sessionName)
+        deps.costs?.set(ws.data.sessionName, (parsed as { costClass?: unknown }).costClass)
       }
       break
     case 'deregister':
@@ -971,12 +1040,14 @@ function sendError(ws: WsLike, message: string): void {
 // ============================================================
 
 const busPostTimes = new Map<string, number[]>()
+/** Tests share one process. Production never calls this. */
+export function resetBusRateLimit(): void { busPostTimes.clear() }
 const HUMAN_TARGETS = new Set(['human', 'admin', 'user', 'me'])
 
 /**
- * Post `[from → to] text` to the bus channel (so humans see the conversation) and
- * deliver it to the target session, or to every other session when `to` is omitted.
- * `to` matches a session name exactly, else as a unique prefix (e.g. "codex-photos").
+ * Post `[from → to] text` to the bus channel (so humans see the conversation).
+ * `to` must be an exact session name. Omitting it mirrors the message and wakes nobody.
+ * `to=all` or `to=@all:synthesis` is an explicit fan-out.
  */
 export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[]): void {
   if (!ws.data.sessionName) {
@@ -1020,23 +1091,18 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   busPostTimes.set(from, times)
 
   const names = allNames(deps).filter(n => n !== from)
-  let targets: string[] = audience(channelId, deps).filter(n => n !== from)
-  let toLabel = channelId === deps.busChannelId ? 'all' : 'subscribers'
-  if (to && HUMAN_TARGETS.has(to.toLowerCase())) {
-    // Answer for the human: show in the channel only, do not wake other agents.
-    targets = []
-    toLabel = 'human'
-  } else if (to) {
-    const exact = names.filter(n => n === to)
-    const prefix = names.filter(n => n.startsWith(to))
-    const pick = exact.length === 1 ? exact : prefix
-    if (pick.length === 0) {
-      sendError(ws, `No connected session matches "${to}". Connected: ${names.join(', ') || '(none)'}`)
-      return
-    }
-    targets = pick
-    toLabel = pick.join(', ')
+  const heard = audience(channelId, deps).filter(n => n !== from)
+  const defaultLabel = channelId === deps.busChannelId || channelId === deps.humanChannelId ? 'all' : 'subscribers'
+  const routed = routeAgentTarget(to, names, heard, defaultLabel, deps)
+  if (!routed.ok) {
+    sendError(ws, routed.error)
+    return
   }
+  let targets = routed.targets
+  const toLabel = routed.label
+  const allMode = routed.allMode
+  if (routed.passive) deps.unread?.bump(heard)
+  deps.activity?.markPost(from)
 
   const toHuman = toLabel === 'human' && deps.humanChannelId && deps.humanChannelId !== channelId
   const where = toHuman ? deps.humanChannelId! : channelId
@@ -1049,48 +1115,174 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     source: 'agent-bus',
     from,
     to: toLabel,
+    ...(allMode && { all_mode: allMode }),
     ts: new Date(now).toISOString(),
   }
 
   const chunks = chunk(`**[${from} → ${toLabel}]**${origin} ${text}`, deps.chunkLimit, deps.chunkMode)
-  if (files?.length) {
-    // Recipients need the Discord message id to download_attachment the files.
-    void sendToDiscordAwait(deps.client, where, chunks[0], files).then(id => {
-      chunks.slice(1).forEach(c => sendToDiscord(deps.client, where, c))
-      finish(id)
-    })
-    return
-  }
-  chunks.forEach(c => sendToDiscord(deps.client, where, c))
-  finish(undefined)
+  // Deliver only after Discord accepts the mirror, so the recipient gets that message id.
+  void sendToDiscordAwait(deps.client, where, chunks[0], files?.length ? files : undefined).then(id => {
+    chunks.slice(1).forEach(c => sendToDiscord(deps.client, where, c))
+    finish(id)
+  })
 
   function finish(messageId: string | undefined): void {
     const m: ChannelMeta = { ...meta, ...(messageId && { message_id: messageId, chat_id: where }) }
-    for (const name of targets) deliver(deps, name, text, m)
+    const body = allMode === 'synthesis' ? `${text}\n\n(synthesis: read this channel for earlier replies before adding anything)` : text
+    deliverNamed(targets, body, m, deps)
   }
 
 }
 
+type AgentRoute = { ok: true; targets: string[]; label: string; passive: boolean; allMode?: 'independent' | 'synthesis' } | { ok: false; error: string }
+
+/** `to` omitted or `subscribers` = mirror only. `all` = explicit fan-out. Anything else must be exact. */
+function routeAgentTarget(to: string | undefined, names: readonly string[], heard: readonly string[], defaultLabel: string, deps: Readonly<WsDeps>): AgentRoute {
+  if (!to) return { ok: true, targets: [], label: defaultLabel, passive: true }
+  const low = to.toLowerCase()
+  if (HUMAN_TARGETS.has(low)) return { ok: true, targets: [], label: 'human', passive: false }
+  if (low === 'subscribers') return { ok: true, targets: [], label: 'subscribers', passive: true }
+  const all = /^(?:@)?all(?::(synthesis|independent))?$/.exec(low)
+  if (all) {
+    const mode = all[1] === 'synthesis' ? 'synthesis' : 'independent'
+    return { ok: true, targets: orderByCost(heard, n => deps.costs?.get(n) ?? 'standard'), label: 'all', passive: false, allMode: mode }
+  }
+  const resolved = resolveExact(to, names)
+  if (!resolved.ok) return { ok: false, error: resolved.error }
+  return { ok: true, targets: [resolved.name], label: resolved.name, passive: false }
+}
+
+function deliverNamed(names: readonly string[], text: string, meta: ChannelMeta, deps: Readonly<WsDeps>): void {
+  const delay = meta.all_mode && (deps.staggerMs ?? 0) > 0 ? deps.staggerMs! : 0
+  if (delay <= 0) {
+    for (const name of names) deliver(deps, name, text, meta)
+    return
+  }
+  const cheap = names.filter(n => (deps.costs?.get(n) ?? 'standard') === 'cheap')
+  const rest = names.filter(n => !cheap.includes(n))
+  for (const name of cheap) deliver(deps, name, text, meta)
+  if (rest.length) setTimeout(() => { for (const name of rest) deliver(deps, name, text, meta) }, delay)
+}
+
+function oneHumanTarget(deps: Readonly<WsDeps> | undefined, meta: ChannelMeta, names: readonly string[]): string | undefined {
+  const dispatcher = deps?.dispatcher
+  if (dispatcher && names.includes(dispatcher)) return dispatcher
+  const owner = meta.chat_id ? deps?.channelOwners?.get(meta.chat_id) : undefined
+  if (owner && names.includes(owner)) return owner
+  return undefined
+}
+
+/** Live push sessions. Pull-mode and node-only headless agents are not interactive. */
+function interactiveNames(deps: Readonly<WsDeps> | undefined, sessions: SessionManager, pool: readonly string[]): string[] {
+  const live = new Set((deps ? deps.sessions : sessions).getSessions().map(s => s.name))
+  return pool.filter(n => live.has(n) && !pullSessions.has(n))
+}
+
+/** Dispatcher re-delivers a stored human post. Anyone else is refused. */
+function handleDispatch(ws: WsLike, parsed: { requestId?: string; messageId?: string; to?: readonly unknown[] }, deps: Readonly<WsDeps>): void {
+  const requestId = parsed.requestId
+  const messageId = parsed.messageId
+  const to = parsed.to
+  if (typeof requestId !== 'string' || typeof messageId !== 'string' || !Array.isArray(to)) {
+    sendError(ws, 'dispatch requires requestId, messageId, and to')
+    return
+  }
+  const me = ws.data.sessionName
+  if (!me) { sendToolResult(ws, requestId, false, 'not registered'); return }
+  if (!deps.dispatcher || me !== deps.dispatcher) {
+    sendToolResult(ws, requestId, false, 'only the dispatcher can re-deliver a human message')
+    return
+  }
+  const saved = deps.humanMail?.get(messageId)
+  if (!saved) { sendToolResult(ws, requestId, false, `no human message ${messageId}`); return }
+  const names = allNames(deps)
+  const targets: string[] = []
+  for (const raw of to) {
+    if (typeof raw !== 'string' || !raw) { sendToolResult(ws, requestId, false, 'to must be exact session names'); return }
+    const resolved = resolveExact(raw, names)
+    if (!resolved.ok) { sendToolResult(ws, requestId, false, resolved.error); return }
+    if (!targets.includes(resolved.name)) targets.push(resolved.name)
+  }
+  if (targets.length === 0) { sendToolResult(ws, requestId, false, 'to must name at least one session'); return }
+  for (const name of targets) {
+    deliver(deps, name, saved.content, {
+      ...saved.meta,
+      from_human: 'true',
+      question_id: messageId,
+      message_id: messageId,
+      to: name,
+      routed: 'dispatch',
+    })
+  }
+  const note = `routed to ${targets.join(', ')}`
+  if (saved.meta.chat_id) sendToDiscord(deps.client, saved.meta.chat_id, note)
+  sendToolResult(ws, requestId, true, JSON.stringify({ delivered: targets, question_id: messageId }))
+}
+
 /**
- * Deliver a human-authored message posted in the bus channel. A leading "@name"
- * (or "name:") targets one session; otherwise every session receives it.
+ * Deliver a human-authored message. An exact `@name` wakes that session.
+ * A prefix or a typo wakes nobody and asks the sender. Untargeted text wakes
+ * the dispatcher, or the channel owner if the dispatcher is offline.
+ * With neither, it wakes live interactive sessions and skips headless agents.
+ * `@all` is the explicit fan-out and must be the whole token. `@all:synthesis`
+ * tells later sessions to read earlier replies; it does not attach them.
+ * A Discord reply that also names a session follows the name, not the dispatcher.
  */
 export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager, audienceNames?: readonly string[], deps?: Readonly<WsDeps>): string[] {
   const names = deps ? allNames(deps) : sessions.getSessions().map(s => s.name)
-  const send = (n: string, t: string, m: ChannelMeta) => deps ? deliver(deps, n, t, m) : sessions.routeToSession(n, t, m)
-  const everyone = audienceNames ? names.filter(n => audienceNames.includes(n)) : names
-  const m = content.match(/^\s*@?([\w.@:/-]+?)[:,]?\s+([\s\S]*)$/)
-  if (m) {
-    const want = m[1]
-    const exact = names.filter(n => n === want)
-    const pick = exact.length === 1 ? exact : names.filter(n => n.startsWith(want))
-    if (pick.length > 0) {
-      for (const n of pick) send(n, m[2], { ...meta, to: pick.join(', ') })
-      return pick
+  const send = (n: string, t: string, m: ChannelMeta) => {
+    if (deps) deliver(deps, n, t, m)
+    else sessions.routeToSession(n, t, m)
+  }
+  const pool = audienceNames ? names.filter(n => audienceNames.includes(n)) : names
+  deps?.humanMail?.remember(content, meta)
+  const replyMeta: ChannelMeta = meta.unbound_reply
+    ? { in_reply_to: meta.unbound_reply, question_id: meta.question_id ?? meta.unbound_reply }
+    : {}
+  // The mode, when present, must be the whole word. `@all-team` and `@all:synthesiz` are not broadcasts.
+  const all = content.match(/^\s*@all(?::(synthesis|independent))?(?:\s+|$)([\s\S]*)$/i)
+  if (all) {
+    const mode = all[1]?.toLowerCase() === 'synthesis' ? 'synthesis' : 'independent'
+    const body = all[2]?.trim() ? all[2] : content
+    const ordered = orderByCost(pool, n => deps?.costs?.get(n) ?? 'standard')
+    const text = mode === 'synthesis' ? `${body}\n\n(synthesis: read this channel for earlier replies before adding anything)` : body
+    if (deps) deliverNamed(ordered, text, { ...meta, ...replyMeta, to: 'all', all_mode: mode }, deps)
+    else for (const n of ordered) send(n, text, { ...meta, ...replyMeta, to: 'all', all_mode: mode })
+    return ordered
+  }
+  // A bare first word is not an address. `@name` or `name:` is. "11: no" has a colon
+  // but matches nobody, so it falls through instead of becoming an error.
+  const m = content.match(/^\s*(@)?([\w.@:/-]+?)(:)?\s+([\s\S]*)$/)
+  if (m && (m[1] || m[3])) {
+    const token = m[2]
+    const resolved = resolveExact(token, names)
+    if (resolved.ok) {
+      send(resolved.name, m[4], { ...meta, ...replyMeta, to: resolved.name })
+      return [resolved.name]
+    }
+    const prefix = names.some(n => n.startsWith(token))
+    if (m[1] || prefix) {
+      deps?.onRoutingError?.(resolved.error)
+      return []
     }
   }
-  for (const n of everyone) send(n, content, { ...meta, to: audienceNames ? 'subscribers' : 'all' })
-  return everyone
+  const one = oneHumanTarget(deps, meta, names)
+  if (one) {
+    send(one, content, { ...meta, ...replyMeta, to: one, routed: 'dispatcher' })
+    deps?.unread?.bump(pool.filter(n => n !== one))
+    deps?.onRouteNote?.(`routed to ${one}`)
+    return [one]
+  }
+  const interactive = orderByCost(interactiveNames(deps, sessions, pool), n => deps?.costs?.get(n) ?? 'standard')
+  if (interactive.length > 0) {
+    for (const n of interactive) send(n, content, { ...meta, ...replyMeta, to: n, routed: 'interactive' })
+    deps?.onRouteNote?.(`routed to ${interactive.join(', ')} (no dispatcher; live interactive only)`)
+    return interactive
+  }
+  deps?.onRouteNote?.(names.length
+    ? 'not routed: no live interactive session is connected. Headless agents were not woken.'
+    : 'not routed: no agent sessions are connected.')
+  return []
 }
 
 async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>): Promise<void> {

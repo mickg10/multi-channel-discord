@@ -109,7 +109,7 @@ const defaultPs = (): string => { try { return execFileSync('ps', ['-eo', 'pid=,
 
 /** Sentinel session: continue the most recent conversation in the agent's cwd (adopt an existing one). */
 export const LAST = 'last'
-const DISCORD_TOOLS = ['bus_post', 'bus_sessions', 'check_inbox', 'reply', 'react', 'edit_message', 'fetch_messages',
+const DISCORD_TOOLS = ['bus_post', 'dispatch', 'bus_sessions', 'check_inbox', 'reply', 'react', 'edit_message', 'fetch_messages',
   'download_attachment', 'ask_user', 'channel_post', 'channel_list', 'channel_create', 'channel_subscribe',
   'channel_unsubscribe', 'channel_archive', 'claim', 'release_claim', 'list_claims',
   'mcp_list', 'mcp_describe', 'mcp_call']

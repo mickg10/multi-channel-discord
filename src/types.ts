@@ -28,6 +28,10 @@ export interface WsRegister {
   readonly mode?: 'push' | 'pull'
   /** Replace an existing session with this name instead of getting a "-2" suffix. */
   readonly takeover?: boolean
+  /** cheap | standard | premium. Omitted = standard. Used to order and budget cold wakes. */
+  readonly costClass?: 'cheap' | 'standard' | 'premium'
+  /** Stable id of this conversation. A reused display name with a different id does not inherit held approvals. */
+  readonly conversationId?: string
 }
 
 /** Plugin → Router: rename this session */
@@ -114,8 +118,16 @@ export interface WsPermissionRequest {
 export interface WsBusPost {
   readonly type: 'busPost'
   readonly text: string
-  /** Optional target session name; omitted = broadcast to every other session. */
+  /** Exact session, "human", or "all". Omitted mirrors the post and wakes nobody. */
   readonly to?: string
+}
+
+/** Dispatcher only: re-deliver a stored human message to these exact sessions. */
+export interface WsDispatch {
+  readonly type: 'dispatch'
+  readonly requestId: string
+  readonly messageId: string
+  readonly to: readonly string[]
 }
 
 /** Request the list of connected sessions (answered with a toolResult). */
@@ -158,6 +170,8 @@ export interface WsInboxOp {
   readonly type: 'inboxPull' | 'inboxCount' | 'agentStatus'
   readonly requestId: string
   readonly agent?: string
+  /** New clients: return { messages, unread } instead of a bare array. */
+  readonly withUnread?: boolean
 }
 
 /** Atomic task claims. */
@@ -201,6 +215,7 @@ export type PluginToRouterMessage =
   | WsChannelPost
   | WsChannelOp
   | WsBusPost
+  | WsDispatch
   | WsListSessions
   | WsRegister
   | WsRename

@@ -20,6 +20,7 @@ import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
+import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
 
@@ -46,17 +47,19 @@ AGENT BUS: You are one of several AI agents (Claude Code, Codex, Antigravity/agy
 machines, all connected to the same Discord router. Messages whose meta has source="agent-bus" come
 either from another agent (from="<agent session name>") or from the human posting in the bus channel.
 - Your own session name is returned by "bus_sessions" (marked "you"); it looks like "<agent>@<host>:<project>".
-- To message another agent use "bus_post" with to="<session name or unique prefix>"; omit "to" to broadcast.
+- To message another agent use "bus_post" with to="<exact session name>"; omit "to" to mirror without waking anyone. "to=all" is an explicit fan-out.
   Use "bus_sessions" to see who is connected.
 - To answer another agent, call "bus_post" with to=<the message's from>. Do NOT use "reply" for agent traffic.
 - Messages with from_human="true" come from the human operator. Answer them with bus_post(to="human")
   (shown in the channel, not forwarded to other agents). Only answer if the message is addressed to you
   or to everyone and you have something specific to contribute; don't repeat what other agents said.
+- If you are the dispatcher, call dispatch(message_id, to=[exact names]) to hand Mick's message on.
+  The router re-delivers his original text with from_human and question_id. Do not bus_post a paraphrase.
 - If you cannot receive pushed messages, call "check_inbox" to read messages addressed to you.
 - CHANNELS: besides the default bus channel (which every agent always receives), work can be split into
   topic channels in the same Discord server. "channel_list" shows them (with subscribers),
   "channel_create" makes one (you are subscribed automatically), "channel_subscribe"/"channel_unsubscribe"
-  choose what you receive, and "channel_post" posts in one (delivered to its subscribers, or to="name").
+  choose what you can read. "channel_post" mirrors to subscribers without waking them, unless to="<exact name>".
   Inbound messages carry meta channel=<name> and chat_id=<id>; answer in the SAME channel with
   channel_post(channel=<chat_id>, to=<from>) — or to="human" for the human. Subscriptions persist.
   Create a channel for a multi-agent task instead of flooding the default bus; invite peers by asking
@@ -108,11 +111,13 @@ export interface ConnectToRouterOptions {
   readonly onMessage?: (content: string, meta: ChannelMeta) => void
   readonly pendingRequests?: Map<string, PendingRequest>
   readonly onPermissionVerdict?: (requestId: string, behavior: 'allow' | 'deny') => void
+  /** Stable conversation id. A later session that reuses the display name does not inherit held approvals. */
+  readonly conversationId?: string
 }
 
 /** Connect to the router via WebSocket and register. */
 export async function connectToRouter(opts: ConnectToRouterOptions): Promise<ConnectResult> {
-  const { wsPort, name, projectPath, onMessage, pendingRequests, onPermissionVerdict } = opts
+  const { wsPort, name, projectPath, onMessage, pendingRequests, onPermissionVerdict, conversationId } = opts
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(process.env.DISCORD_ROUTER_URL || `ws://localhost:${wsPort}`)
     const timeout = setTimeout(() => {
@@ -132,7 +137,9 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
         || (agentKind === 'claude' ? parent : `${parent}-${process.pid}`)
       const secret = process.env.DISCORD_ROUTER_SECRET || undefined
       const mode = process.env.DISCORD_MODE === 'pull' ? 'pull' : 'push'
-      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(secret && { secret }) }))
+      const costClass = process.env.DISCORD_COST_CLASS
+      const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
+      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
     }
 
     ws.onmessage = (event) => {
@@ -283,17 +290,63 @@ export async function startPlugin(): Promise<void> {
   if (wakeMode === 'tmux') process.stderr.write(`discord plugin: tmux wake ${wakePane ? `-> pane ${wakePane}` : 'disabled (no pane found)'}\n`)
   const wakeText = process.env.DISCORD_WAKE_TEXT || 'New agent-bus/Discord message(s): call the discord check_inbox tool and handle them.'
   let wakeTimer: ReturnType<typeof setTimeout> | null = null
-  function wake(): void {
+  let wakeInFlight = false
+  let wakeGen = 0
+  let flightTimer: ReturnType<typeof setTimeout> | null = null
+  // If check_inbox never acks, open the latch so a dropped turn cannot swallow later mail.
+  const maxInFlightMs = 15 * 60 * 1000
+  // One nudge until check_inbox acks it. A second directed message stays queued (hold)
+  // and is either included in that drain or nudges exactly once after the ack.
+  function considerWake(): void {
+    if (latchDecision(wakeInFlight, inbox.length) !== 'send') return
     if (wakeMode !== 'tmux' || !wakePane || wakeTimer) return
+    wakeInFlight = true
+    const gen = ++wakeGen
+    if (flightTimer) clearTimeout(flightTimer)
+    flightTimer = setTimeout(() => {
+      flightTimer = null
+      if (!wakeInFlight) return
+      wakeInFlight = false
+      if (inbox.length > 0) considerWake()
+    }, maxInFlightMs)
     wakeTimer = setTimeout(() => {
       wakeTimer = null
-      const run = (args: string[]) => new Promise<void>(res => {
-        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
-        p.on('close', () => res()); p.on('error', () => res())
-      })
-      void run(['send-keys', '-t', wakePane, '-l', wakeText]).then(() => new Promise(r => setTimeout(r, 300)))
-        .then(() => run(['send-keys', '-t', wakePane, 'Enter']))
+      void flushWake(gen)
     }, 2000)
+    // Recheck the inbox immediately before typing. A drain during the debounce, or a
+    // failed tmux send, must not start an empty turn or leave the latch stuck.
+    async function flushWake(gen: number): Promise<void> {
+      const run = (args: string[]) => new Promise<boolean>(res => {
+        if (gen !== wakeGen || inbox.length === 0) { res(false); return }
+        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
+        p.on('error', () => res(false))
+        p.on('close', code => res(code === 0))
+      })
+      const typed = await run(['send-keys', '-t', wakePane!, '-l', wakeText])
+      if (gen !== wakeGen) return
+      if (!typed) {
+        wakeInFlight = false
+        if (inbox.length > 0) considerWake()
+        return
+      }
+      await new Promise(r => setTimeout(r, 300))
+      if (gen !== wakeGen) return
+      const entered = await run(['send-keys', '-t', wakePane!, 'Enter'])
+      if (gen !== wakeGen) return
+      if (!entered) {
+        wakeInFlight = false
+        if (inbox.length > 0) considerWake()
+      }
+    }
+  }
+  function ackWake(): void {
+    const remaining = inbox.length
+    const next = afterDrain(remaining)
+    wakeInFlight = next.inFlight
+    wakeGen++
+    if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null }
+    if (flightTimer) { clearTimeout(flightTimer); flightTimer = null }
+    if (next.nudge) considerWake()
   }
 
   const mcp = new Server(
@@ -314,7 +367,7 @@ export async function startPlugin(): Promise<void> {
     process.stderr.write(`discord plugin: received message from router: "${content.slice(0, 50)}"\n`)
     inbox.push({ content, meta, at: new Date().toISOString() })
     if (inbox.length > INBOX_MAX) inbox.splice(0, inbox.length - INBOX_MAX)
-    wake()
+    considerWake()
     mcp.notification({
       method: 'notifications/claude/channel',
       params: { content, meta },
@@ -357,6 +410,7 @@ export async function startPlugin(): Promise<void> {
     // Don't auto-spawn the router — it's a Discord bot that must be started manually.
     // The plugin just connects to it.
     try {
+      const conversationId = process.env.DISCORD_CONVERSATION_ID || claude?.sessionId
       const { ws, registeredName } = await connectToRouter({
         wsPort,
         name: currentName,
@@ -364,6 +418,7 @@ export async function startPlugin(): Promise<void> {
         onMessage,
         pendingRequests,
         onPermissionVerdict,
+        ...(conversationId && { conversationId }),
       })
       currentWs = ws
       currentName = registeredName
@@ -430,13 +485,25 @@ export async function startPlugin(): Promise<void> {
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
+        name: 'dispatch',
+        description: 'Dispatcher only. Re-deliver a human message to exact sessions. The router sends Mick\'s original text with from_human and question_id set to message_id. Do not paraphrase it with bus_post.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            message_id: { type: 'string', description: 'meta.message_id of the human post' },
+            to: { type: 'array', items: { type: 'string' }, description: 'Exact session names to wake' },
+          },
+          required: ['message_id', 'to'],
+        },
+      },
+      {
         name: 'bus_post',
         description: 'Send a message to another AI agent (or all agents) over the shared Discord agent bus. The message is also shown in the bus channel for the human.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             text: { type: 'string', description: 'Message text' },
-            to: { type: 'string', description: 'Target session name or unique prefix (see bus_sessions); "human" to answer the human operator only; omit to broadcast to all other agents.' },
+            to: { type: 'string', description: 'Exact session name (see bus_sessions). "human" answers the human only. "all" wakes every other session. Omit to mirror in the channel without waking anyone. A prefix is rejected.' },
             files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of local files to attach (max 4, 10 MB each). Uploaded inline; the human sees them in Discord.' },
           },
           required: ['text'],
@@ -545,7 +612,7 @@ export async function startPlugin(): Promise<void> {
       },
       {
         name: 'check_inbox',
-        description: 'Return (and clear) Discord / agent-bus messages delivered to this session since the last check. Use this if you do not receive pushed channel messages.',
+        description: 'Return (and clear) directed Discord / agent-bus messages waiting for this session. Also reports a count of passive channel messages since the last check, without their text. Use fetch_messages to read those.',
         inputSchema: {
           type: 'object' as const,
           properties: { peek: { type: 'boolean', description: 'If true, do not clear the inbox' } },
@@ -657,6 +724,13 @@ export async function startPlugin(): Promise<void> {
           sendWs(JSON.stringify({ type: 'reply', text, ...(chatId && { chatId }), ...(replyTo && { replyTo }), ...(inline.length && { files: inline }) }))
           return { content: [{ type: 'text', text: 'Message sent' }] }
         }
+        case 'dispatch': {
+          const messageId = args.message_id as string | undefined
+          const to = Array.isArray(args.to) ? args.to.filter((n): n is string => typeof n === 'string' && n.length > 0) : []
+          if (!messageId || to.length === 0) throw new Error('dispatch requires message_id and to (exact session names)')
+          const r = await sendToolRequest({ type: 'dispatch', messageId, to })
+          return { content: [{ type: 'text', text: r }] }
+        }
         case 'bus_post': {
           if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
           const to = args.to as string | undefined
@@ -721,25 +795,31 @@ export async function startPlugin(): Promise<void> {
           return { content: [{ type: 'text', text: `Connected sessions:\n${lines.join('\n')}` }] }
         }
         case 'check_inbox': {
-          // Router-side durable queue (messages that arrived while we were offline / pull mode).
+          // Router-side durable queue (directed messages that arrived while we were offline / pull mode).
           let queued: Array<{ content: string; meta: ChannelMeta; at: string }> = []
+          let unread = 0
           if (!args.peek && currentWs && currentWs.readyState === WebSocket.OPEN) {
             // Bounded: an older router doesn't know inboxPull and would leave the request hanging.
             try {
-              queued = JSON.parse(await Promise.race([
-                sendToolRequest({ type: 'inboxPull' }),
+              const raw = JSON.parse(await Promise.race([
+                sendToolRequest({ type: 'inboxPull', withUnread: true }),
                 new Promise<string>((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
-              ]))
+              ])) as { messages?: typeof queued; unread?: number } | typeof queued
+              if (Array.isArray(raw)) queued = raw
+              else {
+                queued = raw.messages ?? []
+                unread = raw.unread ?? 0
+              }
             } catch {}
           }
           const items = [...queued, ...(args.peek ? inbox.slice() : inbox.splice(0, inbox.length))]
-          if (items.length === 0) return { content: [{ type: 'text', text: 'Inbox empty.' }] }
-          const text = items.map(m => {
-            const from = m.meta.from ?? m.meta.user ?? 'unknown'
-            const where = m.meta.source === 'agent-bus' ? `#${m.meta.channel ?? 'bus'} chat_id=${m.meta.chat_id ?? '?'}` : `chat ${m.meta.chat_id ?? '?'}`
-            return `[${m.meta.ts ?? m.at}] (${where}) from ${from}${m.meta.message_id ? ` msg=${m.meta.message_id}` : ''}:\n${m.content}`
-          }).join('\n\n')
-          return { content: [{ type: 'text', text }] }
+          // Ack the single-flight latch only on a real drain. Mail that arrived after the
+          // splice is still in `inbox` and nudges once; it is not dropped.
+          if (!args.peek) ackWake()
+          const passive = unread > 0 ? `${unread} passive message(s) since you last looked are in channel history (fetch_messages). They were not put in this inbox.` : ''
+          if (items.length === 0) return { content: [{ type: 'text', text: passive || 'Inbox empty.' }] }
+          const text = items.map(m => formatInboxLine(m)).join('\n\n')
+          return { content: [{ type: 'text', text: passive ? `${text}\n\n${passive}` : text }] }
         }
         case 'react': {
           sendWs(JSON.stringify({ type: 'react', chatId: args.chat_id, messageId: args.message_id, emoji: args.emoji }))

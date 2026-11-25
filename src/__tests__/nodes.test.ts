@@ -1,8 +1,9 @@
 import { describe, test, expect, beforeEach, mock } from 'bun:test'
-import { createWsHandlers, deliver } from '../ws.js'
+import { createWsHandlers, deliver, resetBusRateLimit } from '../ws.js'
 import type { WsData, WsDeps } from '../ws.js'
 import { SessionManager, ProjectHistory } from '../sessions.js'
 import { Inboxes, NodeRegistry } from '../nodes.js'
+import { Conversations, Unread, WakeBudget } from '../wake.js'
 import { Subscriptions } from '../subscriptions.js'
 import { buildCommand, parseTurnOutput, bootstrapPrompt } from '../node.js'
 import { mkdtemp } from 'node:fs/promises'
@@ -18,7 +19,7 @@ let sessions: SessionManager, history: ProjectHistory, inboxes: Inboxes, nodes: 
 function deps(extra: Partial<WsDeps> = {}): WsDeps {
   return {
     sessions, history, inboxes, nodes,
-    client: { channels: { fetch: mock(async (id: string) => ({ isTextBased: () => true, send: mock(async (p: any) => { posted.push([id, typeof p === 'string' ? p : p.content]); return {} }) })) } } as any,
+    client: { channels: { fetch: mock(async (id: string) => ({ isTextBased: () => true, send: mock(async (p: any) => { posted.push([id, typeof p === 'string' ? p : p.content]); return { id: 'mid' } }) })) } } as any,
     chatId: () => 'dm1', chunkLimit: 2000, chunkMode: 'length', replyToMode: 'first',
     busChannelId: 'bus1', humanChannelId: 'hq1', subs: new Subscriptions(), ...extra,
   }
@@ -29,6 +30,7 @@ const regNode = (h: any, node: string, agents: string[]) => { const ws = makeWs(
 beforeEach(async () => {
   sessions = new SessionManager(); history = new ProjectHistory(await mkdtemp(join(tmpdir(), 'n-')))
   inboxes = new Inboxes(); nodes = new NodeRegistry(); posted = []
+  resetBusRateLimit()
 })
 
 describe('node agents', () => {
@@ -74,14 +76,111 @@ describe('node agents', () => {
     expect(list.find((s: any) => s.name === 'codex@n:y')).toMatchObject({ state: 'idle', node: 'n', pending: 1 })
   })
 
-  test('broadcast reaches node agents; node disconnect removes them', async () => {
-    const h = createWsHandlers(deps())
+  test('untargeted busPost does not queue or wake a node agent', async () => {
+    const unread = new Unread()
+    const h = createWsHandlers(deps({ unread }))
     const nodeWs = regNode(h, 'n', ['codex@n:z'])
     const a = reg(h, 'claude@mac:src')
     h.message(a as any, JSON.stringify({ type: 'busPost', text: 'all hands' }))
-    expect(inboxes.count('codex@n:z')).toBe(1)
+    await tick()
+    expect(inboxes.count('codex@n:z')).toBe(0)
+    expect(unread.count('codex@n:z')).toBe(1)
+    expect(msgs(nodeWs).filter(m => m.type === 'wake')).toHaveLength(0)
     h.close(nodeWs as any)
     expect(nodes.list()).toHaveLength(0)
+  })
+
+  test('100 passive posts wake nobody, and a fresh router does not replay them', async () => {
+    const unread = new Unread()
+    const h = createWsHandlers(deps({ unread, busMaxPerMinute: 500 }))
+    const nodeWs = regNode(h, 'n', ['codex@n:a', 'agy@n:b'])
+    const sender = reg(h, 'claude@mac:src')
+    for (let i = 0; i < 100; i++) h.message(sender as any, JSON.stringify({ type: 'busPost', text: 'chatter ' + i }))
+    await tick()
+    expect(inboxes.count('codex@n:a')).toBe(0)
+    expect(inboxes.count('agy@n:b')).toBe(0)
+    expect(msgs(nodeWs).filter(m => m.type === 'wake')).toHaveLength(0)
+    expect(unread.count('codex@n:a')).toBe(100)
+    expect(unread.count('agy@n:b')).toBe(100)
+    const pull = reg(h, 'codex@n:a', 'pull')
+    h.message(pull as any, JSON.stringify({ type: 'inboxPull', requestId: 'u', withUnread: true }))
+    const pulled = JSON.parse(msgs(pull).find(m => m.requestId === 'u').data)
+    expect(pulled.messages).toEqual([])
+    expect(pulled.unread).toBe(100)
+    expect(unread.count('codex@n:a')).toBe(0)
+
+    sessions = new SessionManager()
+    inboxes = new Inboxes()
+    nodes = new NodeRegistry()
+    const unread2 = new Unread()
+    const h2 = createWsHandlers(deps({ unread: unread2, busMaxPerMinute: 500 }))
+    const node2 = regNode(h2, 'n', ['codex@n:a', 'agy@n:b'])
+    expect(inboxes.count('codex@n:a')).toBe(0)
+    expect(msgs(node2).filter(m => m.type === 'wake')).toHaveLength(0)
+    const s = reg(h2, 'claude@mac:src')
+    h2.message(s as any, JSON.stringify({ type: 'busPost', text: 'do it', to: 'codex@n:a' }))
+    await tick()
+    expect(inboxes.count('codex@n:a')).toBe(1)
+    expect(inboxes.count('agy@n:b')).toBe(0)
+    const queued = inboxes.drain('codex@n:a')
+    expect(queued[0].content).toBe('do it')
+    expect(queued[0].meta.message_id).toBe('mid')
+    expect(msgs(node2).filter(m => m.type === 'wake')).toHaveLength(1)
+    expect(msgs(node2).filter(m => m.type === 'wake')[0].agent).toBe('codex@n:a')
+  })
+
+  test('an approval stays with the conversation that asked', () => {
+    const conversations = new Conversations()
+    const d = deps({ conversations })
+    const h = createWsHandlers(d)
+    const first = makeWs()
+    h.message(first, JSON.stringify({ type: 'register', name: 'codex@n:a', projectPath: '/p', conversationId: 'conv-a' }))
+    h.message(first, JSON.stringify({ type: 'deregister' }))
+    expect(deliver(d, 'codex@n:a', 'yes', { from_human: 'true', question_id: 'q1', from: 'mick' })).toBe(true)
+    expect(inboxes.count('codex@n:a')).toBe(1)
+    const reuse = makeWs()
+    h.message(reuse, JSON.stringify({ type: 'register', name: 'codex@n:a', projectPath: '/p', conversationId: 'conv-b' }))
+    expect(msgs(reuse).some(m => m.type === 'message' && m.content === 'yes')).toBe(false)
+    expect(inboxes.count('codex@n:a')).toBe(1)
+    h.message(reuse, JSON.stringify({ type: 'deregister' }))
+    const back = makeWs()
+    h.message(back, JSON.stringify({ type: 'register', name: 'codex@n:a', projectPath: '/p', conversationId: 'conv-a' }))
+    const got = msgs(back).find(m => m.type === 'message' && m.content === 'yes')
+    expect(got.meta.question_id).toBe('q1')
+    expect(got.meta.conversation_id).toBe('conv-a')
+    expect(got.meta.from_human).toBe('true')
+    expect(inboxes.count('codex@n:a')).toBe(0)
+  })
+
+  test('an approval with no conversation id is not left on a bare name', () => {
+    const d = deps({ conversations: new Conversations() })
+    expect(deliver(d, 'gone@x', 'yes', { from_human: 'true', question_id: 'q1' })).toBe(false)
+    expect(inboxes.count('gone@x')).toBe(0)
+  })
+
+  test('a node agent still receives an approval between turns', () => {
+    const d = deps({ conversations: new Conversations() })
+    const h = createWsHandlers(d)
+    const nodeWs = regNode(h, 'nas', ['headless@nas'])
+    expect(deliver(d, 'headless@nas', 'yes', { from_human: 'true', question_id: 'q1' })).toBe(true)
+    expect(inboxes.count('headless@nas')).toBe(1)
+    expect(msgs(nodeWs).some(m => m.type === 'wake')).toBe(true)
+  })
+
+  test('a cold wake over budget becomes unread and does not wake', async () => {
+    const unread = new Unread()
+    const budget = new WakeBudget({ cheap: 100, standard: 1, premium: 1 })
+    const h = createWsHandlers(deps({ unread, budget, busMaxPerMinute: 50 }))
+    const nodeWs = regNode(h, 'n', ['codex@n:a'])
+    const a = reg(h, 'claude@mac:src')
+    h.message(a as any, JSON.stringify({ type: 'busPost', text: 'one', to: 'codex@n:a' }))
+    await tick()
+    expect(inboxes.count('codex@n:a')).toBe(1)
+    h.message(a as any, JSON.stringify({ type: 'busPost', text: 'two', to: 'codex@n:a' }))
+    await tick()
+    expect(inboxes.count('codex@n:a')).toBe(1)
+    expect(unread.count('codex@n:a')).toBe(1)
+    expect(msgs(nodeWs).filter(m => m.type === 'wake')).toHaveLength(1)
   })
 })
 

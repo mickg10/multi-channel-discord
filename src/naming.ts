@@ -57,6 +57,7 @@ export interface ClaudeSession {
   readonly cwd?: string
   readonly name?: string
   readonly nameSource?: string
+  readonly sessionId?: string
 }
 
 /** The session file of the Claude Code process `pid`; undefined if `pid` is not one. */
