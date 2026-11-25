@@ -32,6 +32,10 @@ async function gateway(agents: Array<typeof parent> = [parent, child]) {
   let gw!: Gateway
   const send = (frame: GatewayToRouterMessage) => {
     frames.push(frame)
+    if (frame.type === 'wakeResult') {
+      gw.router.receive({ type: 'toolResult', requestId: frame.requestId, success: true, data: '{}' })
+      return
+    }
     if (frame.type !== 'lease' && frame.type !== 'ack') return
     const requestId = frame.requestId
     if (frame.type === 'lease') {
@@ -162,7 +166,7 @@ describe('gateway skeleton', () => {
         const primary = new FakeAdapter('codex', { s })
         const fallback = new FakeAdapter('agy')
         g.gw.setAdapters([primary, fallback])
-        const result = await g.gw.deliver(target, id)
+        const result = await g.gw.deliver(target, id, makeNudge(target.kind, target.conv, id))
         expect(result).toEqual({ s })
         expect(primary.wakeCalls).toBe(1)
         expect(primary.turns).toBe(0)
@@ -179,7 +183,7 @@ describe('gateway skeleton', () => {
       const fallback = new FakeAdapter('codex', { s: 'woken', nativeId: 'q' })
       g.gw.setAdapters([primary, fallback])
       const fall = { ...parent, conv: 'fall-conv', alias: 'codex@nas642:fall' }
-      const woken = await g.gw.deliver(fall, '13')
+      const woken = await g.gw.deliver(fall, '13', makeNudge(fall.kind, fall.conv, '13'))
       expect(woken).toEqual({ s: 'woken', nativeId: 'q' })
       expect(primary.wakeCalls).toBe(1)
       expect(primary.turns).toBe(0)
@@ -193,7 +197,7 @@ describe('gateway skeleton', () => {
     const g = await gateway()
     try {
       g.gw.setAdapters([])
-      const result = await g.gw.deliver(parent, '99')
+      const result = await g.gw.deliver(parent, '99', makeNudge(parent.kind, parent.conv, '99'))
       expect(result).toEqual({ s: 'unavailable' })
       expect(g.frames.some(frame => frame.type === 'mark' || frame.type === 'wakeResult')).toBe(false)
       expect(existsSync(join(g.dir, 'wakes.json'))).toBe(false)
@@ -208,10 +212,10 @@ describe('gateway skeleton', () => {
         throw new Error('crash before wakeResult')
       })
       g.gw.setAdapters([fake])
-      await expect(g.gw.deliver(parent, '21')).rejects.toThrow('crash')
+      await expect(g.gw.deliver(parent, '21', makeNudge(parent.kind, parent.conv, '21'))).rejects.toThrow('crash')
       expect(fake.wakeCalls).toBe(1)
       expect(fake.turns).toBe(0)
-      const again = await g.gw.deliver(parent, '21')
+      const again = await g.gw.deliver(parent, '21', makeNudge(parent.kind, parent.conv, '21'))
       expect(again).toEqual({ s: 'woken', nativeId: 'reconciled' })
       expect(fake.wakeCalls).toBe(1)
       expect(fake.reconcileCalls).toBe(1)
@@ -224,8 +228,8 @@ describe('gateway skeleton', () => {
     try {
       const fake = new FakeAdapter('codex')
       g.gw.setAdapters([fake])
-      await g.gw.deliver(parent, '31')
-      const second = await g.gw.deliver(parent, '32')
+      await g.gw.deliver(parent, '31', makeNudge(parent.kind, parent.conv, '31'))
+      const second = await g.gw.deliver(parent, '32', makeNudge(parent.kind, parent.conv, '32'))
       expect(second).toEqual({ s: 'queued' })
       expect(fake.wakeCalls).toBe(1)
       expect(g.frames.filter(frame => frame.type === 'mark' && frame.id === '32')).toHaveLength(0)
@@ -251,39 +255,19 @@ describe('gateway skeleton', () => {
     } finally { await g.gw.close() }
   })
 
-  test('an accepted lease receipt frees the nudge and survives restart', async () => {
+  test('a successful check_inbox reopens the nudge, including a stale receipt', async () => {
     const g = await gateway()
     try {
       const fake = new FakeAdapter('codex')
       g.gw.setAdapters([fake])
-      await g.gw.deliver(parent, '31')
-      g.mail.set(parent.alias, leased('A', '31'))
-      const first = await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv })
-      expect(first.receipt).toBe('rcpt-31')
-      expect(WakeStore.load(join(g.dir, 'wakes.json')).get('31')?.receipt).toBe('rcpt-31')
-      g.mail.set(parent.alias, { messages: [], unread: 0 })
-      const second = await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv, receipt: 'rcpt-31' })
-      expect(second.ok).toBe(true)
-      expect(g.gw.store.get('31')).toBeUndefined()
-      await g.gw.deliver(parent, '32')
-      expect(fake.seen.map(nudge => nudge.msgId)).toEqual(['31', '32'])
-    } finally { await g.gw.close() }
-  })
-
-  test('a stale receipt does not free the nudge', async () => {
-    const g = await gateway()
-    try {
-      const fake = new FakeAdapter('codex')
-      g.gw.setAdapters([fake])
-      await g.gw.deliver(parent, '31')
-      g.mail.set(parent.alias, leased('A', '31'))
-      await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv })
+      await g.gw.deliver(parent, '31', makeNudge(parent.kind, parent.conv, '31'))
       g.mail.set(parent.alias, { messages: [], unread: 0, receipt_status: 'stale' })
-      await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv, receipt: 'rcpt-31' })
-      expect(g.gw.store.get('31')?.state).toBe('woken')
-      const second = await g.gw.deliver(parent, '32')
-      expect(second).toEqual({ s: 'queued' })
-      expect(fake.wakeCalls).toBe(1)
+      const looked = await rpc(g.sock, g.setPeer, pipe(parent.pid), { op: 'check_inbox', conv: parent.conv, receipt: 'old' })
+      expect(looked.ok).toBe(true)
+      expect(g.gw.store.get('31')).toBeUndefined()
+      expect(WakeStore.load(join(g.dir, 'wakes.json')).get('31')).toBeUndefined()
+      await g.gw.deliver(parent, '32', makeNudge(parent.kind, parent.conv, '32'))
+      expect(fake.seen.map(nudge => nudge.msgId)).toEqual(['31', '32'])
     } finally { await g.gw.close() }
   })
 
@@ -294,12 +278,16 @@ describe('gateway skeleton', () => {
       const opencode = new FakeAdapter('opencode', { s: 'woken', nativeId: 'oc' })
       g.gw.setAdapters([codex, opencode])
       const target = { ...parent, kind: 'opencode' as const, conv: 'oc-conv', alias: 'opencode@nas642:shared' }
-      const woken = await g.gw.deliver(target, '41')
+      const woken = await g.gw.deliver(target, '41', makeNudge(target.kind, target.conv, '41'))
       expect(woken).toEqual({ s: 'woken', nativeId: 'oc' })
       expect(codex.wakeCalls).toBe(0)
       expect(opencode.wakeCalls).toBe(1)
       g.gw.registerAgent({ ...target, pid: 70, cwd: '/work/src', transport: 'native' })
       g.gw.setAdapters([codex])
+      const claude = { ...parent, kind: 'claude' as const, conv: 'claude-conv', alias: 'claude@nas642:one' }
+      const onlyCodex = await g.gw.deliver(claude, '55', makeNudge('claude', claude.conv, '55'))
+      expect(onlyCodex).toEqual({ s: 'unavailable' })
+      expect(codex.wakeCalls).toBe(0)
       g.gw.router.receive({ type: 'wake', as: target.alias, msgId: '88', n: 1, reconcile: true })
       await g.gw.idle()
       expect(codex.reconcileCalls).toBe(0)
@@ -323,6 +311,65 @@ describe('gateway skeleton', () => {
       expect(g.gw.registry.byAlias(child.alias)).toBeUndefined()
       await g.gw.close()
       expect(g.frames.length).toBe(sent)
+    } finally { await g.gw.close() }
+  })
+
+  test('a dropped wakeResult is replayed from the finished row without another wake', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'gw-replay-'))
+    const path = join(dir, 'wakes.json')
+    const frames: GatewayToRouterMessage[] = []
+    const send = (frame: GatewayToRouterMessage) => { frames.push(frame) }
+    const first = new Gateway({ host: 'nas642', user: 'mickg', secret: 'node-secret', storePath: path, send })
+    const fake = new FakeAdapter('codex')
+    first.setAdapters([fake])
+    first.registerAgent(parent)
+    try {
+      await first.deliver(parent, '31', makeNudge(parent.kind, parent.conv, '31'))
+      expect(fake.wakeCalls).toBe(1)
+      expect(first.store.get('31')?.state).toBe('woken')
+      expect(first.store.get('31')?.reported).toBeUndefined()
+      const second = new Gateway({ host: 'nas642', user: 'mickg', secret: 'node-secret', storePath: path, send })
+      const replay = new FakeAdapter('codex')
+      second.setAdapters([replay])
+      second.registerAgent(parent)
+      second.resumeFromDisk()
+      second.router.receive({ type: 'wake', as: parent.alias, msgId: '31', n: 1, reconcile: true })
+      await second.idle()
+      expect(replay.wakeCalls).toBe(0)
+      expect(replay.reconcileCalls).toBe(0)
+      const results = frames.filter(frame => frame.type === 'wakeResult' && frame.id === '31')
+      expect(results.length).toBeGreaterThanOrEqual(2)
+      expect(results.every(frame => frame.type === 'wakeResult' && frame.result.s === 'woken')).toBe(true)
+      await second.close()
+    } finally { await first.close() }
+  })
+
+  test('a pipe captured before rebind cannot address the new conversation', async () => {
+    const g = await gateway()
+    try {
+      g.setPeer(pipe(parent.pid))
+      const socket = connect(g.sock)
+      await new Promise<void>((resolve, reject) => { socket.once('connect', () => resolve()); socket.once('error', reject) })
+      const read = () => new Promise<Record<string, unknown>>((resolve, reject) => {
+        let buf = ''
+        const onData = (data: Buffer) => {
+          buf += data.toString()
+          const nl = buf.indexOf('\n')
+          if (nl < 0) return
+          socket.off('data', onData)
+          resolve(JSON.parse(buf.slice(0, nl)) as Record<string, unknown>)
+        }
+        socket.on('data', onData)
+        socket.on('error', reject)
+      })
+      socket.write(JSON.stringify({ op: 'check_inbox', conv: parent.conv }) + '\n')
+      expect((await read()).ok).toBe(true)
+      const before = g.frames.filter(frame => frame.type === 'lease').length
+      g.gw.registerAgent({ ...parent, conv: 'moved' })
+      socket.write(JSON.stringify({ op: 'check_inbox', conv: parent.conv }) + '\n')
+      expect(await read()).toMatchObject({ ok: false, error: 'alias rebound' })
+      expect(g.frames.filter(frame => frame.type === 'lease')).toHaveLength(before)
+      socket.end()
     } finally { await g.gw.close() }
   })
 

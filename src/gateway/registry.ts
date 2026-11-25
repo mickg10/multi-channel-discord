@@ -4,17 +4,22 @@ export type AgentRec = Target & {
   pid: number
   cwd?: string
   transport: 'native' | 'pull' | 'tmux'
+  /** Bumped on every add. Pipe connections captured an older generation are stale. */
+  gen?: number
 }
 
 export class Registry {
   private byKey = new Map<string, AgentRec>()
   private pids = new Map<number, Set<string>>()
   private aliases = new Map<string, string>()
+  private generation = 0
 
   add(rec: AgentRec): void {
-    const oldKey = this.aliases.get(rec.alias)
+    const stored: AgentRec = { ...rec, gen: ++this.generation }
+    const oldKey = this.aliases.get(stored.alias)
     if (oldKey) this.dropKey(oldKey)
-    const key = identityKey(rec)
+    const key = identityKey(stored)
+    rec = stored
     const prev = this.byKey.get(key)
     if (prev) this.unlink(prev.pid, key)
     this.byKey.set(key, rec)
@@ -46,6 +51,12 @@ export class Registry {
   byAlias(alias: string): AgentRec | undefined {
     const key = this.aliases.get(alias)
     return key ? this.byKey.get(key) : undefined
+  }
+
+  /** True only for the record currently bound to this alias and generation. */
+  matches(rec: AgentRec): boolean {
+    const current = this.byAlias(rec.alias)
+    return !!current && current.gen !== undefined && current.gen === rec.gen && identityKey(current) === identityKey(rec)
   }
 
   list(): AgentRec[] {

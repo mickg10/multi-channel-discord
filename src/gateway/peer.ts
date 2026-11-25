@@ -1,6 +1,6 @@
 import type { AgentRec, Registry } from './registry.js'
 
-/** Platform hook. A later PR fills this from SO_PEERCRED. This PR only defines the check. */
+/** Platform hook. TODO(PR5): SO_PEERCRED / LOCAL_PEERPID. Absent credentials fail closed. */
 export type PeerInfo = { pid: number; exe: string; ppid: number }
 
 export type PeerVerdict = { ok: true; agents: AgentRec[] } | { ok: false; error: string }

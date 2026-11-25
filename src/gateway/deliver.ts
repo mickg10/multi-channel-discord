@@ -30,7 +30,7 @@ export async function stepDelivery(opts: {
   const matched = adapters.filter(adapter => adapter.kind === target.kind)
   if (matched.length === 0) return { s: 'unavailable' }
   store.begin({
-    msgId, conv: target.conv, kind: target.kind, host: target.host, user: target.user,
+    msgId, conv: target.conv, kind: target.kind, host: target.host, user: target.user, alias: target.alias,
     clientId: nudge.clientId, text: nudge.text,
   })
   opts.onPending?.()

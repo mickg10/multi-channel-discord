@@ -4,9 +4,9 @@ import { stepDelivery } from './deliver.js'
 import { verifyPipePeer, type PeerInfo } from './peer.js'
 import { type AgentRec, Registry } from './registry.js'
 import { RouterLink } from './router-link.js'
-import { WakeStore } from './store.js'
+import { WakeStore, type Attempt, type AttemptState } from './store.js'
 import {
-  assertAlias, buildNudge, makeNudge,
+  assertAlias, buildNudge,
   type Adapter, type DeliveryResult, type GatewayToRouterMessage, type LeaseResult, type Nudge, type Target, type WakeResult,
 } from './types.js'
 
@@ -38,6 +38,7 @@ export class Gateway {
     this.router = new RouterLink(opts.secret, opts.send ?? (() => {}), opts.audit)
     this.router.onWake = frame => this.onRouterWake(frame)
     this.router.onReleased = alias => this.registry.remove(alias)
+    this.router.onReported = id => this.store.markReported(id)
     this.store = WakeStore.open(opts.storePath)
     this.verify = opts.verify ?? verifyPipePeer
   }
@@ -65,9 +66,13 @@ export class Gateway {
    * The wake row is fsynced, then the router is marked uncertain, then the adapter runs.
    * wakeResult is sent only after that I/O returns. No row means nothing was begun, so nothing is finished.
    */
-  async deliver(target: Target, msgId: string, opts?: { nudge?: Nudge; reconcile?: boolean }): Promise<DeliveryResult> {
-    const nudge = opts?.nudge ?? makeNudge(target.kind, target.conv, msgId)
+  async deliver(target: Target, msgId: string, nudge: Nudge, opts?: { reconcile?: boolean }): Promise<DeliveryResult> {
     const before = this.store.get(msgId)
+    if (before && isTerminal(before.state)) {
+      const result = toWake(before)
+      this.router.wakeResult(before.alias, msgId, result)
+      return result
+    }
     if (opts?.reconcile && !before) return this.reconcileMissing(target, nudge)
     const result = await stepDelivery({
       store: this.store, adapters: this.adapters, target, msgId, nudge,
@@ -82,9 +87,10 @@ export class Gateway {
     return result
   }
 
-  /** Restart path. Pending rows are already uncertain. A bad file is left in place. */
+  /** Restart path. Pending rows are already uncertain. Finished results the router never acked are sent again. */
   resumeFromDisk(): void {
     this.store = WakeStore.load(this.opts.storePath)
+    for (const row of this.store.unreported()) this.router.wakeResult(row.alias, row.msgId, toWake(row))
   }
 
   /** Resolves when router-driven wakes started so far have settled. */
@@ -114,7 +120,7 @@ export class Gateway {
     const rec = this.registry.byAlias(frame.as)
     if (!rec) return Promise.resolve({ s: 'unavailable' })
     const nudge = buildNudge(rec.kind, rec.conv, frame.msgId, frame.n)
-    const run = this.deliver(rec, frame.msgId, { nudge, reconcile: frame.reconcile === true })
+    const run = this.deliver(rec, frame.msgId, nudge, { reconcile: frame.reconcile === true })
     this.tail = this.tail.then(() => run.then(() => undefined, () => undefined))
     return run
   }
@@ -166,15 +172,16 @@ export class Gateway {
       return
     }
     const picked = pickAgent(agents, msg.conv)
+    if (picked.ok && !this.registry.matches(picked.agent)) {
+      sock.write(JSON.stringify({ ok: false, error: 'alias rebound' }) + '\n')
+      return
+    }
     if (msg.op === 'check_inbox') {
       if (!picked.ok) { sock.write(JSON.stringify({ ok: false, error: picked.error }) + '\n'); return }
       try {
         const echoed = typeof msg.receipt === 'string' ? msg.receipt : undefined
         const leased = await this.router.lease(picked.agent.alias, echoed)
-        if (echoed && leased.receipt_status !== 'stale') this.store.releaseReceipt(echoed)
-        if (typeof leased.receipt === 'string' && leased.receipt.length > 0) {
-          this.store.bindReceipt(leased.messages.map(message => message.id), leased.receipt)
-        }
+        this.store.clearOpen(picked.agent.conv)
         sock.write(JSON.stringify({ ok: true, ...leased }) + '\n')
       } catch (err) {
         sock.write(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : 'lease failed' }) + '\n')
@@ -198,6 +205,16 @@ export class Gateway {
     }
     sock.write(JSON.stringify({ ok: false, error: 'unknown op' }) + '\n')
   }
+}
+
+function isTerminal(state: AttemptState): boolean {
+  return state === 'woken' || state === 'held' || state === 'refused' || state === 'unavailable'
+}
+
+function toWake(row: Attempt): WakeResult {
+  if (row.state === 'woken') return { s: 'woken', nativeId: row.nativeId ?? '' }
+  if (row.state === 'held' || row.state === 'refused' || row.state === 'unavailable') return { s: row.state }
+  return { s: 'uncertain' }
 }
 
 /**

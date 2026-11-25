@@ -10,12 +10,13 @@ export type Attempt = {
   kind: Kind
   host: string
   user: string
+  alias: string
   clientId: string
   text: string
   state: AttemptState
   nativeId?: string
-  /** Router lease receipt that, once echoed and accepted, frees this slot. */
-  receipt?: string
+  /** Set only after the router acks wakeResult. Unset means the result must be sent again. */
+  reported?: boolean
 }
 
 const OPEN: ReadonlySet<AttemptState> = new Set(['pending', 'uncertain', 'woken', 'held', 'refused'])
@@ -27,10 +28,10 @@ function isAttempt(v: unknown): v is Attempt {
   const row = v as Attempt
   return typeof row.msgId === 'string' && row.msgId.length > 0
     && typeof row.conv === 'string' && typeof row.host === 'string' && typeof row.user === 'string'
-    && typeof row.clientId === 'string' && typeof row.text === 'string'
+    && typeof row.alias === 'string' && typeof row.clientId === 'string' && typeof row.text === 'string'
     && KINDS.has(row.kind) && STATES.has(row.state)
     && (row.nativeId === undefined || typeof row.nativeId === 'string')
-    && (row.receipt === undefined || typeof row.receipt === 'string')
+    && (row.reported === undefined || typeof row.reported === 'boolean')
 }
 
 export class WakeStore {
@@ -90,24 +91,24 @@ export class WakeStore {
     this.flush()
   }
 
-  /** Remember which durable ids a router receipt will accept. Flushed before the caller is answered. */
-  bindReceipt(ids: readonly string[], receipt: string): void {
-    let changed = false
-    for (const id of ids) {
-      const row = this.get(id)
-      if (!row || row.receipt === receipt) continue
-      row.receipt = receipt
-      changed = true
-    }
-    if (changed) this.flush()
-  }
-
-  /** The router accepted this receipt, so those attempts no longer hold the one-nudge slot. */
-  releaseReceipt(receipt: string): void {
-    const next = this.rows.filter(row => row.receipt !== receipt)
+  /** The agent called check_inbox, so this conversation may be nudged again. Pending sends stay. */
+  clearOpen(conv: string): void {
+    const next = this.rows.filter(row => row.conv !== conv || row.state === 'pending' || !OPEN.has(row.state))
     if (next.length === this.rows.length) return
     this.rows = next
     this.flush()
+  }
+
+  markReported(msgId: string): void {
+    const row = this.get(msgId)
+    if (!row || row.reported) return
+    row.reported = true
+    this.flush()
+  }
+
+  /** Finished results whose wakeResult the router has not acked. */
+  unreported(): Attempt[] {
+    return this.rows.filter(row => row.reported !== true && (row.state === 'woken' || row.state === 'held' || row.state === 'refused' || row.state === 'unavailable'))
   }
 
   private flush(): void {

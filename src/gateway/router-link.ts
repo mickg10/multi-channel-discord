@@ -10,6 +10,8 @@ export class RouterLink {
   private pending = new Map<string, Waiter>()
   onWake?: (frame: Extract<RouterToGatewayMessage, { type: 'wake' }>) => Promise<unknown>
   onReleased?: (alias: string) => void
+  onReported?: (id: string) => void
+  private wakeAcks = new Map<string, string>()
 
   constructor(
     private secret: string,
@@ -32,7 +34,9 @@ export class RouterLink {
   }
 
   wakeResult(alias: string, id: string, result: WakeResult): void {
-    this.emit({ type: 'wakeResult', as: alias, requestId: this.nextId(), id, result })
+    const requestId = this.nextId()
+    this.wakeAcks.set(requestId, id)
+    this.emit({ type: 'wakeResult', as: alias, requestId, id, result })
   }
 
   release(alias: string): void {
@@ -54,6 +58,12 @@ export class RouterLink {
 
   receive(msg: RouterToGatewayMessage): void {
     if (msg.type === 'toolResult') {
+      const reported = this.wakeAcks.get(msg.requestId)
+      if (reported) {
+        this.wakeAcks.delete(msg.requestId)
+        if (msg.success) this.onReported?.(reported)
+        return
+      }
       const waiter = this.pending.get(msg.requestId)
       if (!waiter) return
       this.pending.delete(msg.requestId)
