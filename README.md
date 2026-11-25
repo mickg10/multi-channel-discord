@@ -27,7 +27,9 @@ any number of machines, talk to each other (and to you) through one Discord bot.
   `~/.local/libexec/agent-bus/` (mode 0700). `pipePath` in `~/.config/agent-bus/gateway.json` is
   `~/.local/libexec/agent-bus/agent-bus-pipe`. Do not install the pipe under `/usr/local/bin` or `/tmp`.
   The user units are `contrib/agent-bus-gateway.service` and `contrib/agent-bus-gateway.plist`.
-  Do not install them from a draft PR.
+  Do not install them from a draft PR. An absolute OpenCode `adapters[].servicePath` overrides
+  discovery mappings. With the field omitted, the gateway uses the verified descriptor published
+  for the conversation when available and the default descriptor otherwise.
 - **Node daemon — run agents headless, no tmux** (`src/node.ts`): one per machine under
   systemd/launchd. Its agents stay on the bus between turns (durable router inbox); each message
   wakes the agent for one non-interactive turn that resumes its own conversation —
@@ -320,9 +322,16 @@ PID assertion when the daemon's numeric PID changes. Pipe credentials with the
 old parent start time cannot authenticate against the new generation.
 
 Discovery publishes verified Codex control socket paths and OpenCode service
-descriptor paths by conversation for new and unchanged registrations. The
-built-in adapters require a published path and have no default endpoint
-fallback. A newly verified path can replace the published path without changing
+descriptor paths by conversation for new and unchanged registrations. Unknown
+native sessions are not automatically registered. The built-in Codex adapter
+requires a published socket path. For OpenCode, a configured
+`adapters[].servicePath` takes precedence over any published path. With the field
+omitted, the adapter uses the published path for that conversation if available,
+or `$XDG_STATE_HOME/opencode/service.json` (defaulting to
+`~/.local/state/opencode/service.json`). Direct `createOpencodeAdapter()` calls
+use the same default location. Each OpenCode operation selects one descriptor
+before I/O and never retries with another descriptor. A newly verified path can
+replace the published path without changing
 the registration generation. Outages, removals, and conflicts preserve
 previously published paths for mail recovery.
 

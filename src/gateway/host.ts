@@ -4,7 +4,7 @@ import { computeBackoff } from '../reconnect.js'
 import { Gateway } from './gateway.js'
 import { disableCoreDumps, readPeer } from './peer-cred.js'
 import { createCodexAdapter } from './adapters/codex.js'
-import { createOpencodeAdapter } from './adapters/opencode.js'
+import { createOpencodeAdapter, defaultOpencodeServicePath } from './adapters/opencode.js'
 import { assertNodeSecret, type Adapter, type GatewayToRouterMessage, type Kind, type RouterToGatewayMessage, type Transport } from './types.js'
 
 const KINDS: readonly Kind[] = ['claude', 'codex', 'opencode', 'grok', 'agy']
@@ -12,7 +12,7 @@ const TRANSPORTS: readonly Transport[] = ['codex-queue', 'opencode-queue', 'clau
 const HOST = /^[a-z0-9][a-z0-9.-]*$/i
 const USER = /^[a-z0-9_][a-z0-9_.-]*$/i
 
-export type AdapterBinding = { kind: Kind; transport: Transport }
+export type AdapterBinding = { kind: Kind; transport: Transport; servicePath?: string }
 
 export type GatewayConfig = {
   host: string
@@ -61,10 +61,16 @@ export function setOpencodeServicePath(conv: string, path: string | undefined): 
 
 /** Codecs the CLI can construct. Other transports stay unregistered until their adapter PR lands. */
 export function builtinAdapters(bindings: readonly AdapterBinding[]): Adapter[] {
+  const servicePath = bindings.find(binding =>
+    binding.kind === 'opencode' && binding.transport === 'opencode-queue')?.servicePath
   registerAdapter('codex', 'codex-queue', () => createCodexAdapter({
     resolveControlSocket: target => codexSockets.get(target.conv),
   }))
-  registerAdapter('opencode', 'opencode-queue', () => createOpencodeAdapter(target => opencodeServicePaths.get(target.conv)))
+  registerAdapter('opencode', 'opencode-queue', () => {
+    if (servicePath !== undefined) return createOpencodeAdapter(servicePath)
+    const defaultPath = defaultOpencodeServicePath()
+    return createOpencodeAdapter(target => opencodeServicePaths.get(target.conv) ?? defaultPath)
+  })
   return adaptersFor(bindings)
 }
 
@@ -167,7 +173,16 @@ export function loadConfig(path: string): GatewayConfig {
     const transport = row.transport
     if (typeof kind !== 'string' || !(KINDS as readonly string[]).includes(kind)) throw new Error(`no adapter for ${String(kind)}`)
     if (typeof transport !== 'string' || !(TRANSPORTS as readonly string[]).includes(transport)) throw new Error(`no adapter for ${String(kind)}/${String(transport)}`)
-    const binding = { kind: kind as Kind, transport: transport as Transport }
+    let servicePath: string | undefined
+    if (row.servicePath !== undefined) {
+      if (kind !== 'opencode' || transport !== 'opencode-queue') throw new Error('servicePath is only valid for opencode/opencode-queue')
+      servicePath = abs(row.servicePath, 'servicePath')
+    }
+    const binding: AdapterBinding = {
+      kind: kind as Kind,
+      transport: transport as Transport,
+      ...(servicePath !== undefined ? { servicePath } : {}),
+    }
     const key = bindingKey(binding)
     if (seen.has(key)) throw new Error(`adapter ${kind}/${transport} is listed twice`)
     seen.add(key)

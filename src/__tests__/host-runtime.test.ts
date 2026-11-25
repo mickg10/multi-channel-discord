@@ -4,7 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { FakeAdapter, Registry, adaptersFor, builtinAdapters, darwinStartTime, loadConfig, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, readNodeSecret, setOpencodeServicePath, startHost, startTimeFromStat, verifyPipePeer, type AdapterBinding, type DarwinSys, type GatewayToRouterMessage } from '../gateway/index.js'
+import { FakeAdapter, Registry, adaptersFor, builtinAdapters, darwinStartTime, loadConfig, peerFromDarwin, peerFromLinux, ppidFromStat, processIdentity, processIdentityFromDarwin, readNodeSecret, setOpencodeServicePath, startHost, startTimeFromStat, verifyPipePeer, type Adapter, type AdapterBinding, type DarwinSys, type GatewayToRouterMessage } from '../gateway/index.js'
 import { buildNudge, type Target } from '../types.js'
 import { LOCAL_PEERCRED, LOCAL_PEERPID, SOL_LOCAL } from '../gateway/peer-cred.js'
 
@@ -106,17 +106,21 @@ test('the built-in OpenCode adapter resolves published descriptors on each opera
   const originalStateHome = process.env.XDG_STATE_HOME
   const targets = ['ses_publishedA', 'ses_publishedB'].map((conv): Target =>
     ({ host: 'nas642', user: 'fixture', kind: 'opencode', conv, alias: conv }))
-  const unknown: Target = { ...targets[0], conv: 'ses_unpublished' }
+  const defaultOrigin = 'http://127.0.0.1:43200'
+  const defaultPassword = 'fake-default'
+  const defaultPath = join(dir, 'opencode', 'service.json')
+  let failingOrigin: string | undefined
   const requests: Array<{ url: string; authorization: string | null }> = []
   try {
     process.env.XDG_STATE_HOME = dir
     mkdirSync(join(dir, 'opencode'))
-    writeFileSync(join(dir, 'opencode', 'service.json'),
-      JSON.stringify({ url: 'http://127.0.0.1:43200', password: 'fake-default' }), { mode: 0o600 })
+    writeFileSync(defaultPath,
+      JSON.stringify({ url: defaultOrigin, password: defaultPassword }), { mode: 0o600 })
     globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const request = new Request(input, init)
       requests.push({ url: request.url, authorization: request.headers.get('authorization') })
-      const path = new URL(request.url).pathname
+      const { origin, pathname: path } = new URL(request.url)
+      if (origin === failingOrigin) return new Response('', { status: 503 })
       if (path === '/api/session/active') return Response.json({ data: {} })
       const [, , , conv, action] = path.split('/')
       const nudge = buildNudge('opencode', conv, 'fixture-message', 1)
@@ -125,14 +129,23 @@ test('the built-in OpenCode adapter resolves published descriptors on each opera
     }, { preconnect: originalFetch.preconnect })
     const [adapter] = builtinAdapters([{ kind: 'opencode', transport: 'opencode-queue' }])
 
-    async function expectUnavailable(target: Target) {
-      const nudge = buildNudge('opencode', target.conv, 'fixture-message', 1)
-      expect(await adapter.probe(target)).toEqual({ ok: false })
-      expect(await adapter.wake(target, nudge)).toEqual({ s: 'unavailable' })
-      expect(await adapter.reconcile(target, nudge)).toEqual({ s: 'unavailable' })
+    function expectRequests(origin: string, password: string, paths: string[]) {
+      expect(requests.splice(0)).toEqual(paths.map(path => ({
+        url: origin + path, authorization: 'Basic ' + Buffer.from('opencode:' + password).toString('base64'),
+      })))
     }
-    await expectUnavailable(targets[0])
-    expect(requests).toEqual([])
+
+    async function expectOperations(adapter: Adapter, target: Target, origin: string, password: string) {
+      const nudge = buildNudge('opencode', target.conv, 'fixture-message', 1)
+      const woken = { s: 'woken', nativeId: nudge.clientId } as const
+      expect(await adapter.probe(target)).toEqual({ ok: true })
+      expect(await adapter.wake(target, nudge)).toEqual(woken)
+      expect(await adapter.reconcile(target, nudge)).toEqual(woken)
+      const session = '/api/session/' + target.conv
+      expectRequests(origin, password, ['/api/session/active', session, session + '/prompt', session + '/inbox'])
+    }
+
+    await expectOperations(adapter, targets[0], defaultOrigin, defaultPassword)
 
     const services = targets.map((target, index) => {
       const origin = 'http://127.0.0.1:' + (43201 + index)
@@ -143,24 +156,61 @@ test('the built-in OpenCode adapter resolves published descriptors on each opera
       return { target, origin, password }
     })
     for (const { target, origin, password } of services) {
-      const nudge = buildNudge('opencode', target.conv, 'fixture-message', 1)
-      const woken = { s: 'woken', nativeId: nudge.clientId } as const
-      expect(await adapter.probe(target)).toEqual({ ok: true })
-      expect(await adapter.wake(target, nudge)).toEqual(woken)
-      expect(await adapter.reconcile(target, nudge)).toEqual(woken)
-      const session = '/api/session/' + target.conv
-      expect(requests.splice(0)).toEqual(['/api/session/active', session, session + '/prompt', session + '/inbox'].map(path => ({
-        url: origin + path, authorization: 'Basic ' + Buffer.from('opencode:' + password).toString('base64'),
-      })))
+      await expectOperations(adapter, target, origin, password)
     }
-    await expectUnavailable(unknown)
-    expect(requests).toEqual([])
+
+    const { target, origin, password } = services[0]
+    failingOrigin = origin
+    expect(await adapter.probe(target)).toEqual({ ok: false })
+    expectRequests(origin, password, ['/api/session/active'])
+
+    const [configured] = builtinAdapters([{ kind: 'opencode', transport: 'opencode-queue', servicePath: defaultPath }])
+    await expectOperations(configured, target, defaultOrigin, defaultPassword)
+
+    setOpencodeServicePath(target.conv, undefined)
+    await expectOperations(adapter, target, defaultOrigin, defaultPassword)
   } finally {
     globalThis.fetch = originalFetch
     if (originalStateHome === undefined) delete process.env.XDG_STATE_HOME
     else process.env.XDG_STATE_HOME = originalStateHome
     for (const target of targets) setOpencodeServicePath(target.conv, undefined)
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('opencode servicePath from config is passed to the adapter', async () => {
+  const dir = await tempDir()
+  const file = join(dir, 'gateway.json')
+  const servicePath = join(dir, 'service.json')
+  writeFileSync(servicePath, JSON.stringify({ url: 'http://127.0.0.1:9/', password: 'pw' }), { mode: 0o600 })
+  chmodSync(servicePath, 0o600)
+  const configured = [{ kind: 'opencode' as const, transport: 'opencode-queue' as const, servicePath }]
+  const base = {
+    host: 'nas642', user: 'mickg', routerUrl: 'wss://router.example/bus',
+    secretFile: '/s', socketPath: '/g', wakeStore: '/w', pipePath: '/p', adapters: configured,
+  }
+  writeFileSync(file, JSON.stringify(base), { mode: 0o600 })
+  chmodSync(file, 0o600)
+  expect(loadConfig(file).adapters).toEqual(configured)
+  writeFileSync(file, JSON.stringify({ ...base, adapters: [{ kind: 'opencode', transport: 'opencode-queue', servicePath: 'relative.json' }] }))
+  expect(() => loadConfig(file)).toThrow('absolute')
+  writeFileSync(file, JSON.stringify({ ...base, adapters: [{ kind: 'codex', transport: 'codex-queue', servicePath: '/tmp/service.json' }] }))
+  expect(() => loadConfig(file)).toThrow('opencode/opencode-queue')
+  const calls: string[] = []
+  const previous = globalThis.fetch
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    calls.push(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url)
+    return new Response('', { status: 503 })
+  }) as typeof fetch
+  try {
+    const built = builtinAdapters(configured)
+    const result = await built[0]!.probe({
+      host: 'nas642', user: 'mickg', kind: 'opencode', conv: 'ses_abc', alias: 'opencode@nas642',
+    })
+    expect(result).toEqual({ ok: false })
+    expect(calls).toEqual(['http://127.0.0.1:9/api/session/active'])
+  } finally {
+    globalThis.fetch = previous
   }
 })
 

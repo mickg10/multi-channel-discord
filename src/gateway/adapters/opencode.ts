@@ -102,9 +102,12 @@ function matchesQueued(value: unknown, target: Target, nudge: Nudge): boolean {
     && record(item.payload)?.text === nudge.text
 }
 
+export function defaultOpencodeServicePath(): string {
+  return join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'opencode', 'service.json')
+}
+
 export function createOpencodeAdapter(
-  servicePath: string | ((target: Target) => string | undefined) =
-    join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'opencode', 'service.json'),
+  servicePath: string | ((target: Target) => string | undefined) = defaultOpencodeServicePath(),
   fetchRequest: typeof globalThis.fetch = globalThis.fetch,
 ): Adapter {
   function requestFor(target: Target) {
