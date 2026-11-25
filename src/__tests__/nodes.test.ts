@@ -74,14 +74,32 @@ describe('node agents', () => {
     expect(list.find((s: any) => s.name === 'codex@n:y')).toMatchObject({ state: 'idle', node: 'n', pending: 1 })
   })
 
-  test('broadcast reaches node agents; node disconnect removes them', async () => {
+  test('untargeted post does not queue or wake a node agent; disconnect removes it', async () => {
     const h = createWsHandlers(deps())
     const nodeWs = regNode(h, 'n', ['codex@n:z'])
     const a = reg(h, 'claude@mac:src')
     h.message(a as any, JSON.stringify({ type: 'busPost', text: 'all hands' }))
-    expect(inboxes.count('codex@n:z')).toBe(1)
+    expect(inboxes.count('codex@n:z')).toBe(0)
+    expect(msgs(nodeWs).some(m => m.type === 'wake')).toBe(false)
     h.close(nodeWs as any)
     expect(nodes.list()).toHaveLength(0)
+  })
+
+  test('100 passive posts are not replayed as wakes after the inbox file is reloaded', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'wake-'))
+    const file = join(dir, 'inboxes.json')
+    inboxes = new Inboxes(file)
+    const h = createWsHandlers(deps({ busMaxPerMinute: 200 }))
+    const nodeWs = regNode(h, 'n', ['codex@n:z'])
+    const a = reg(h, 'flood@test')
+    for (let i = 0; i < 100; i++) h.message(a as any, JSON.stringify({ type: 'busPost', text: 'chatter ' + i }))
+    h.message(a as any, JSON.stringify({ type: 'busPost', text: 'only you', to: 'codex@n:z' }))
+    await new Promise(r => setTimeout(r, 300))
+    expect(inboxes.count('codex@n:z')).toBe(1)
+    expect(msgs(nodeWs).filter(m => m.type === 'wake')).toHaveLength(1)
+    const reloaded = new Inboxes(file)
+    expect(reloaded.count('codex@n:z')).toBe(1)
+    expect(reloaded.drain('codex@n:z').map(q => q.content)).toEqual(['only you'])
   })
 })
 

@@ -21,6 +21,7 @@ import type { Subscriptions } from './subscriptions.js'
 import type { Inboxes, NodeRegistry, Claims } from './nodes.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
+import { PassiveLog, resolveRecipients } from './wake.js'
 
 /** Guild channel operations the router provides (mockable in tests). */
 export interface ChannelOps {
@@ -92,8 +93,17 @@ export interface WsDeps {
   readonly nodeSecrets?: () => { readonly hashes: Readonly<Record<string, string>>; readonly require: boolean }
   /** Sessions allowed to manage other sessions' subscriptions (DISCORD_ADMIN_SESSIONS). */
   readonly admins?: ReadonlySet<string>
-  /** Channel where every to="human" post lands; everyone receives the human's posts there. */
+  /** Channel where every to="human" post lands. Human posts there do not wake the fleet. */
   readonly humanChannelId?: string
+  /**
+   * Passive channel history. Not durable: a router restart drops it instead of replaying
+   * chatter as wakes. check_inbox appends a bounded summary.
+   */
+  readonly passive?: PassiveLog
+  /** One cheap session that receives untargeted human posts. Unset = those posts wake nobody. */
+  readonly dispatcher?: string
+  /** Tell the sender why a to= or @name was not delivered. */
+  readonly onReject?: (error: string) => void
   /** Bus rules sent once to every session on (first) register. */
   readonly rules?: () => { text: string; seen(name: string): boolean; markSeen(name: string): void } | null
 }
@@ -357,7 +367,15 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       const who = parsed.type === 'inboxCount' ? parsed.agent : ws.data.sessionName
       if (!who) { sendToolResult(ws, parsed.requestId, false, 'not registered'); return }
       if (parsed.type === 'inboxCount') sendToolResult(ws, parsed.requestId, true, String(deps.inboxes?.count(who) ?? 0))
-      else sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.inboxes?.drain(who) ?? []))
+      else {
+        const directed = deps.inboxes?.drain(who) ?? []
+        const since = deps.passive?.summary(who, ch =>
+          ch === deps.busChannelId || ch === deps.humanChannelId || (deps.subs?.has(who, ch) ?? false)) ?? ''
+        const out = since
+          ? [...directed, { content: since, meta: { from: 'router', source: 'agent-bus', kind: 'digest', to: who }, at: new Date().toISOString() }]
+          : directed
+        sendToolResult(ws, parsed.requestId, true, JSON.stringify(out))
+      }
       break
     }
     case 'busPost':
@@ -990,14 +1008,6 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
   postToChannel(ws, deps.busChannelId, undefined, text, to, deps, files)
 }
 
-/** Sessions that receive untargeted traffic in a channel: everyone for the default bus, else subscribers. */
-function audience(channelId: string, deps: Readonly<WsDeps>): string[] {
-  const live = allNames(deps)
-  if (channelId === deps.busChannelId || channelId === deps.humanChannelId) return live
-  const subs = new Set(deps.subs?.subscribers(channelId) ?? [])
-  return live.filter(n => subs.has(n))
-}
-
 async function handleChannelPost(ws: WsLike, ref: string, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[]): Promise<void> {
   if (!ws.data.sessionName) { sendError(ws, 'Cannot post: not registered'); return }
   const ch = deps.channelOps ? await deps.channelOps.resolve(ref).catch(() => null) : null
@@ -1020,22 +1030,20 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   busPostTimes.set(from, times)
 
   const names = allNames(deps).filter(n => n !== from)
-  let targets: string[] = audience(channelId, deps).filter(n => n !== from)
+  // Untargeted posts are passive: mirrored to Discord, summarized later, and they wake nobody.
+  // A to= wakes only an exact session, or a prefix that matches exactly one. Two matches do not fan out.
+  let targets: string[] = []
   let toLabel = channelId === deps.busChannelId ? 'all' : 'subscribers'
   if (to && HUMAN_TARGETS.has(to.toLowerCase())) {
-    // Answer for the human: show in the channel only, do not wake other agents.
     targets = []
     toLabel = 'human'
   } else if (to) {
-    const exact = names.filter(n => n === to)
-    const prefix = names.filter(n => n.startsWith(to))
-    const pick = exact.length === 1 ? exact : prefix
-    if (pick.length === 0) {
-      sendError(ws, `No connected session matches "${to}". Connected: ${names.join(', ') || '(none)'}`)
-      return
-    }
-    targets = pick
-    toLabel = pick.join(', ')
+    const resolved = resolveRecipients(to, names)
+    if (!resolved.ok) { sendError(ws, resolved.error); return }
+    targets = resolved.names
+    toLabel = resolved.names.join(', ')
+  } else {
+    deps.passive?.add({ channelId, from, text })
   }
 
   const toHuman = toLabel === 'human' && deps.humanChannelId && deps.humanChannelId !== channelId
@@ -1049,6 +1057,7 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     source: 'agent-bus',
     from,
     to: toLabel,
+    ...(targets.length > 0 && { wake: '1' }),
     ts: new Date(now).toISOString(),
   }
 
@@ -1072,25 +1081,31 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
 }
 
 /**
- * Deliver a human-authored message posted in the bus channel. A leading "@name"
- * (or "name:") targets one session; otherwise every session receives it.
+ * Deliver a human-authored message. "@name" or "name:" wakes one session.
+ * An ambiguous name wakes nobody and onReject tells the sender. An untargeted
+ * post wakes the dispatcher if one is configured, otherwise nobody.
  */
 export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager, audienceNames?: readonly string[], deps?: Readonly<WsDeps>): string[] {
-  const names = deps ? allNames(deps) : sessions.getSessions().map(s => s.name)
+  const names = (deps ? allNames(deps) : sessions.getSessions().map(s => s.name))
+    .filter(n => !audienceNames || audienceNames.includes(n))
   const send = (n: string, t: string, m: ChannelMeta) => deps ? deliver(deps, n, t, m) : sessions.routeToSession(n, t, m)
-  const everyone = audienceNames ? names.filter(n => audienceNames.includes(n)) : names
-  const m = content.match(/^\s*@?([\w.@:/-]+?)[:,]?\s+([\s\S]*)$/)
-  if (m) {
-    const want = m[1]
-    const exact = names.filter(n => n === want)
-    const pick = exact.length === 1 ? exact : names.filter(n => n.startsWith(want))
-    if (pick.length > 0) {
-      for (const n of pick) send(n, m[2], { ...meta, to: pick.join(', ') })
-      return pick
-    }
+  const addressed = content.match(/^\s*@([\w.@:/-]+)\s+([\s\S]*)$/) ?? content.match(/^\s*([\w.@:/-]+):\s+([\s\S]*)$/)
+  if (addressed) {
+    const resolved = resolveRecipients(addressed[1], names)
+    if (!resolved.ok) { deps?.onReject?.(resolved.error); return [] }
+    for (const n of resolved.names) send(n, addressed[2], { ...meta, to: n, wake: '1' })
+    return resolved.names
   }
-  for (const n of everyone) send(n, content, { ...meta, to: audienceNames ? 'subscribers' : 'all' })
-  return everyone
+  if (deps?.dispatcher && names.includes(deps.dispatcher)) {
+    send(deps.dispatcher, content, { ...meta, to: deps.dispatcher, wake: '1' })
+    return [deps.dispatcher]
+  }
+  deps?.passive?.add({
+    channelId: meta.chat_id ?? deps?.busChannelId ?? 'bus',
+    from: meta.from ?? meta.user ?? 'human',
+    text: content,
+  })
+  return []
 }
 
 async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>): Promise<void> {

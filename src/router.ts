@@ -19,6 +19,7 @@ import type { ChannelMeta } from './types.js'
 import { ActivityType, ChannelType, type Message, type Guild } from 'discord.js'
 import { Subscriptions } from './subscriptions.js'
 import { Inboxes, NodeRegistry, Claims } from './nodes.js'
+import { PassiveLog, askerFromBotPost } from './wake.js'
 import { McpRegistry, Grants, McpAudit, PendingMcpCalls } from './mcp.js'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
@@ -247,6 +248,8 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   inboxes,
   nodes,
   claims,
+  passive: new PassiveLog(),
+  dispatcher: process.env.DISCORD_DISPATCHER || undefined,
   mcp: mcp ?? undefined,
   admins: ADMINS,
   nodeSecrets: nodeSecretsProvider,
@@ -346,25 +349,33 @@ async function handleBusInbound(msg: Message): Promise<void> {
   let channelName: string | undefined
   try { channelName = 'name' in msg.channel ? (msg.channel as { name: string }).name : undefined } catch {}
   const fullMeta: ChannelMeta = { ...meta, ...(channelName && { channel: channelName }) }
-  // A Discord reply to an agent's post goes to that agent only ("**[name → ...]**" prefix).
+  // A Discord reply is an approval of that question only. It wakes the asker, or nobody.
   let delivered: string[] = []
   if (msg.reference?.messageId) {
+    const questionId = msg.reference.messageId
     try {
-      const ref = await msg.channel.messages.fetch(msg.reference.messageId)
-      const m = ref.author.id === client.user?.id ? ref.content.match(/^\*\*\[([^\]\s]+) →/) : null
-      if (m) {
-        const asker = m[1]
-        deliverTo(asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id })
+      const ref = await msg.channel.messages.fetch(questionId)
+      const asker = ref.author.id === client.user?.id ? askerFromBotPost(ref.content) : null
+      const known = asker !== null && (sessions.getSessions().some(s => s.name === asker) || nodes.get(asker))
+      if (asker && known) {
+        deliverTo(asker, content, { ...fullMeta, to: asker, in_reply_to: questionId, question_id: questionId, wake: '1' })
         delivered = [asker]
+      } else {
+        await msg.reply(`Reply ${questionId} is not bound to one connected session. Not sent.`).catch(() => {})
+        return
       }
-    } catch {}
+    } catch {
+      await msg.reply(`Could not bind reply to question ${questionId}. Not sent.`).catch(() => {})
+      return
+    }
   }
   if (delivered.length === 0) {
     const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
     delivered = routeHumanBusMessage(content, fullMeta, sessions, everyone ? undefined : subs.subscribers(msg.channelId), wsDepsRef)
   }
-  process.stderr.write(`discord: bus message from ${msg.author.username} -> ${delivered.join(',') || '(no sessions)'}\n`)
-  if (delivered.length === 0) {
+  process.stderr.write(`discord: bus message from ${msg.author.username} -> ${delivered.join(',') || '(no wake)'}\n`)
+  const anySession = sessions.getSessions().length > 0 || nodes.list().length > 0
+  if (delivered.length === 0 && !anySession) {
     await msg.reply('No agent sessions are connected.').catch(() => {})
   } else {
     void msg.react('📨').catch(() => {})

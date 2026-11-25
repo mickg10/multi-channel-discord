@@ -20,6 +20,7 @@ import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
+import { createWakeLatch } from './wake.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
 
@@ -46,7 +47,8 @@ AGENT BUS: You are one of several AI agents (Claude Code, Codex, Antigravity/agy
 machines, all connected to the same Discord router. Messages whose meta has source="agent-bus" come
 either from another agent (from="<agent session name>") or from the human posting in the bus channel.
 - Your own session name is returned by "bus_sessions" (marked "you"); it looks like "<agent>@<host>:<project>".
-- To message another agent use "bus_post" with to="<session name or unique prefix>"; omit "to" to broadcast.
+- To message another agent use "bus_post" with to="<exact session name, or a prefix that matches one session>".
+  An ambiguous prefix is rejected and wakes nobody. Omitting "to" mirrors the post to the channel and does not wake anyone.
   Use "bus_sessions" to see who is connected.
 - To answer another agent, call "bus_post" with to=<the message's from>. Do NOT use "reply" for agent traffic.
 - Messages with from_human="true" come from the human operator. Answer them with bus_post(to="human")
@@ -56,7 +58,7 @@ either from another agent (from="<agent session name>") or from the human postin
 - CHANNELS: besides the default bus channel (which every agent always receives), work can be split into
   topic channels in the same Discord server. "channel_list" shows them (with subscribers),
   "channel_create" makes one (you are subscribed automatically), "channel_subscribe"/"channel_unsubscribe"
-  choose what you receive, and "channel_post" posts in one (delivered to its subscribers, or to="name").
+  choose what you see in the digest, and "channel_post" posts in one (mirrored to Discord; to="name" is what wakes a session).
   Inbound messages carry meta channel=<name> and chat_id=<id>; answer in the SAME channel with
   channel_post(channel=<chat_id>, to=<from>) — or to="human" for the human. Subscriptions persist.
   Create a channel for a multi-agent task instead of flooding the default bus; invite peers by asking
@@ -282,18 +284,19 @@ export async function startPlugin(): Promise<void> {
   if (wakeMode === 'tmux' && !wakePane) wakePane = await findTmuxPane(tmuxBin)
   if (wakeMode === 'tmux') process.stderr.write(`discord plugin: tmux wake ${wakePane ? `-> pane ${wakePane}` : 'disabled (no pane found)'}\n`)
   const wakeText = process.env.DISCORD_WAKE_TEXT || 'New agent-bus/Discord message(s): call the discord check_inbox tool and handle them.'
-  let wakeTimer: ReturnType<typeof setTimeout> | null = null
+  // One nudge per burst. A second nudge is sent only when check_inbox leaves directed mail behind.
+  const wakeLatch = createWakeLatch(() => {
+    if (wakeMode !== 'tmux' || !wakePane) return
+    const run = (args: string[]) => new Promise<void>(res => {
+      const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
+      p.on('close', () => res()); p.on('error', () => res())
+    })
+    void run(['send-keys', '-t', wakePane, '-l', wakeText]).then(() => new Promise(r => setTimeout(r, 300)))
+      .then(() => run(['send-keys', '-t', wakePane, 'Enter']))
+  })
   function wake(): void {
-    if (wakeMode !== 'tmux' || !wakePane || wakeTimer) return
-    wakeTimer = setTimeout(() => {
-      wakeTimer = null
-      const run = (args: string[]) => new Promise<void>(res => {
-        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
-        p.on('close', () => res()); p.on('error', () => res())
-      })
-      void run(['send-keys', '-t', wakePane, '-l', wakeText]).then(() => new Promise(r => setTimeout(r, 300)))
-        .then(() => run(['send-keys', '-t', wakePane, 'Enter']))
-    }, 2000)
+    if (wakeMode !== 'tmux' || !wakePane) return
+    wakeLatch.arrive()
   }
 
   const mcp = new Server(
@@ -732,7 +735,9 @@ export async function startPlugin(): Promise<void> {
               ]))
             } catch {}
           }
-          const items = [...queued, ...(args.peek ? inbox.slice() : inbox.splice(0, inbox.length))]
+          const drained = args.peek ? inbox.slice() : inbox.splice(0, inbox.length)
+          if (!args.peek) wakeLatch.ack(inbox.length)
+          const items = [...queued, ...drained]
           if (items.length === 0) return { content: [{ type: 'text', text: 'Inbox empty.' }] }
           const text = items.map(m => {
             const from = m.meta.from ?? m.meta.user ?? 'unknown'
