@@ -153,8 +153,16 @@ test.each([false, true])('A8 shares legacy handling for every operation (gateway
   expect(await call('mcpCall', { server: 'fixture', method: 'read' })).toMatchObject({ success: true, data: '{"method":"read"}' })
   const wrong = grants.issue('writer', { session: alias, instance: 'different-instance' })
   expect(await call('mcpCall', { server: 'writer', method: 'write', grant: wrong.id, instanceId: 'different-instance' })).toMatchObject({ success: false, data: expect.stringContaining('grant rejected') })
-  const valid = grants.issue('writer', { session: alias, instance })
-  expect(await call('mcpCall', { server: 'writer', method: 'write', grant: valid.id })).toMatchObject({ success: true, data: '{"method":"write"}' })
+  const legacyGrant = grants.issue('writer', { session: alias, instance })
+  const legacyResult = await call('mcpCall', { server: 'writer', method: 'write', grant: legacyGrant.id })
+  if (gateway) {
+    expect(legacyResult).toMatchObject({ success: false, data: expect.stringContaining('grant rejected') })
+    const nativeInstance = 'native:' + JSON.stringify(['mac', 'fixture-user', 'codex', instance])
+    const nativeGrant = grants.issue('writer', { session: alias, instance: nativeInstance })
+    expect(await call('mcpCall', { server: 'writer', method: 'write', grant: nativeGrant.id })).toMatchObject({ success: true, data: '{"method":"write"}' })
+  } else {
+    expect(legacyResult).toMatchObject({ success: true, data: '{"method":"write"}' })
+  }
 
   expect(await call('channelSubscribe', { channel: 'topic', session: foreignAlias })).toMatchObject({ success: false, data: 'only admin sessions may act for another session' })
   expect(await call('channelSubscribe', { channel: 'missing' })).toMatchObject({ success: false })

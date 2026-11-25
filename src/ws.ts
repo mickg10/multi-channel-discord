@@ -570,7 +570,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
       }
       const type = GATEWAY_TOOL_HANDLERS[frame.op]
       const context: WsLike = {
-        data: { sessionName: target.alias, instanceId: target.conv, sendCallback: null },
+        data: { sessionName: target.alias, instanceId: `native:${identityKey(target)}`, sendCallback: null },
         send(message) {
           if (nativeConnection(inboxes, target)?.data !== ws.data) return
           try { ws.send(message) } catch { /* The gateway may have disconnected during the operation. */ }
