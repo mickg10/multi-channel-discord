@@ -11,6 +11,7 @@ import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './ac
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
 import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, deliver as deliverFn } from './ws.js'
+import { Activity, CostClasses, Unread, WakeBudget } from './wake.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete, updateSkillCommands, isSkillCommand } from './slash-commands.js'
@@ -136,6 +137,20 @@ const subs = Subscriptions.inStateDir(STATE_DIR)
 const inboxes = Inboxes.inStateDir(STATE_DIR)
 const nodes = new NodeRegistry()
 const claims = Claims.inStateDir(STATE_DIR)
+const unread = new Unread()
+const costs = new CostClasses()
+const activity = new Activity()
+const wakeBudget = new WakeBudget({
+  cheap: parseInt(process.env.DISCORD_WAKE_BUDGET_CHEAP ?? '1000', 10),
+  standard: parseInt(process.env.DISCORD_WAKE_BUDGET_STANDARD ?? '120', 10),
+  premium: parseInt(process.env.DISCORD_WAKE_BUDGET_PREMIUM ?? '30', 10),
+})
+// channelId=session,channelId=session. Owner receives untargeted human posts when the dispatcher is offline.
+const channelOwners = new Map<string, string>()
+for (const pair of (process.env.DISCORD_CHANNEL_OWNERS ?? '').split(',')) {
+  const [id, owner] = pair.split('=').map(s => s.trim())
+  if (id && owner) channelOwners.set(id, owner)
+}
 
 // Remote MCP over the bus: git-declared registry (MCP_REGISTRY or state dir), runtime in state dir.
 // A missing registry file = feature present but empty (mcp_list returns []); a malformed file
@@ -228,6 +243,7 @@ const channelOps: ChannelOps = {
 }
 
 let wsDepsRef: Parameters<typeof createWsHandlers>[0]
+let routeError: string | undefined
 function deliverTo(name: string, text: string, meta: ChannelMeta): void { deliverFn(wsDepsRef, name, text, meta) }
 const wsHandlers = createWsHandlers(wsDepsRef = {
   sessions,
@@ -252,6 +268,14 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   nodeSecrets: nodeSecretsProvider,
   humanChannelId: HUMAN_CHANNEL,
   rules: rulesProvider,
+  unread,
+  costs,
+  activity,
+  budget: wakeBudget,
+  dispatcher: process.env.DISCORD_DISPATCHER || undefined,
+  channelOwners,
+  staggerMs: parseInt(process.env.DISCORD_ALL_STAGGER_MS ?? '0', 10),
+  onRoutingError: (message: string) => { routeError = message },
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
     updateSkillCommands(client, skills).catch((err: unknown) => {
       process.stderr.write(`discord channel: skill command registration failed: ${err instanceof Error ? err.message : String(err)}\n`)
@@ -354,20 +378,27 @@ async function handleBusInbound(msg: Message): Promise<void> {
       const m = ref.author.id === client.user?.id ? ref.content.match(/^\*\*\[([^\]\s]+) →/) : null
       if (m) {
         const asker = m[1]
-        deliverTo(asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id })
+        deliverTo(asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id, question_id: ref.id })
         delivered = [asker]
       }
     } catch {}
   }
+  routeError = undefined
   if (delivered.length === 0) {
+    const bound = msg.reference?.messageId ? { ...fullMeta, unbound_reply: msg.reference.messageId } : fullMeta
     const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
-    delivered = routeHumanBusMessage(content, fullMeta, sessions, everyone ? undefined : subs.subscribers(msg.channelId), wsDepsRef)
+    delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : subs.subscribers(msg.channelId), wsDepsRef)
   }
   process.stderr.write(`discord: bus message from ${msg.author.username} -> ${delivered.join(',') || '(no sessions)'}\n`)
   if (delivered.length === 0) {
-    await msg.reply('No agent sessions are connected.').catch(() => {})
+    const hint = routeError
+      ?? (sessions.getSessions().length || nodes.list().length
+        ? 'Nobody was woken. Name an exact session with @name, reply to their message, or set a dispatcher.'
+        : 'No agent sessions are connected.')
+    await msg.reply(hint).catch(() => {})
   } else {
     void msg.react('📨').catch(() => {})
+    if (!content.trim().startsWith('@')) await msg.reply(`woke ${delivered.join(', ')}`).catch(() => {})
   }
 }
 

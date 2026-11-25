@@ -28,6 +28,8 @@ export interface WsRegister {
   readonly mode?: 'push' | 'pull'
   /** Replace an existing session with this name instead of getting a "-2" suffix. */
   readonly takeover?: boolean
+  /** cheap | standard | premium. Omitted = standard. Used to order and budget cold wakes. */
+  readonly costClass?: 'cheap' | 'standard' | 'premium'
 }
 
 /** Plugin → Router: rename this session */
@@ -158,6 +160,8 @@ export interface WsInboxOp {
   readonly type: 'inboxPull' | 'inboxCount' | 'agentStatus'
   readonly requestId: string
   readonly agent?: string
+  /** New clients: return { messages, unread } instead of a bare array. */
+  readonly withUnread?: boolean
 }
 
 /** Atomic task claims. */
