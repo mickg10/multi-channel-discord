@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- User agent. Install in ~/Library/LaunchAgents. Do not install from a draft PR.
+     KeepAlive restarts it. Core 0 is ulimit -c 0. No UserName: a LaunchAgent runs as the login user. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>net.mickg.agent-bus-gateway</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/agent-bus-gateway</string>
+    <string>--config</string>
+    <string>/Users/USER/.config/agent-bus/gateway.json</string>
+  </array>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>Core</key>
+    <integer>0</integer>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,15 @@
+# User unit. Install as the login user (systemd --user). Do not install from a draft PR.
+# LimitCORE=0 is ulimit -c 0. There is no User= line: a user manager already runs as that user.
+[Unit]
+Description=Agent bus gateway
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agent-bus-gateway --config %h/.config/agent-bus/gateway.json
+Restart=always
+RestartSec=1
+LimitCORE=0
+
+[Install]
+WantedBy=default.target
