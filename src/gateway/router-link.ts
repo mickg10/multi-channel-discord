@@ -56,6 +56,13 @@ export class RouterLink {
     return this.call(requestId, { type: 'ack', as: alias, requestId, leaseId, id, receipt }).then(() => undefined)
   }
 
+  /** The socket is gone. Callers retry; nothing here was acked. */
+  failPending(err: Error): void {
+    const waiters = [...this.pending.values()]
+    this.pending.clear()
+    for (const waiter of waiters) waiter.reject(err)
+  }
+
   receive(msg: RouterToGatewayMessage): void {
     if (msg.type === 'toolResult') {
       const reported = this.wakeAcks.get(msg.requestId)
