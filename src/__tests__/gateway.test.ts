@@ -520,7 +520,7 @@ describe('gateway skeleton', () => {
       const before = g.frames.length
       const closed = new Promise<void>(resolve => { socket.once('close', () => resolve()) })
       socket.on('error', (error: NodeJS.ErrnoException) => {
-        if (error.code !== 'ECONNRESET') throw error
+        if (error.code !== 'ECONNRESET' && error.code !== 'EPIPE') throw error
       })
       socket.write(padding)
       socket.write(padding)
