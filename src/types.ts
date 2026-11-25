@@ -117,6 +117,8 @@ export interface WsPermissionRequest {
 /** Post to the shared agent bus channel and fan out to other sessions. */
 export interface WsBusPost {
   readonly type: 'busPost'
+  readonly requestId?: string
+  readonly publish_id?: string
   readonly text: string
   /** Exact session, "human", or "all". Omitted mirrors the post and wakes nobody. */
   readonly to?: string
@@ -316,3 +318,65 @@ export interface ProjectHistoryEntry {
   readonly lastUsed: number
   readonly name: string
 }
+
+// Native gateway protocol (v1).
+export type Kind = 'claude' | 'codex' | 'opencode' | 'grok' | 'agy'
+export const NUDGE_CONST = 'Check your agent bus inbox.' as const
+
+export interface Target {
+  readonly host: string
+  readonly user: string
+  readonly kind: Kind
+  readonly conv: string
+  readonly alias: string
+}
+
+export type Nudge = { msgId: string; text: typeof NUDGE_CONST; clientId: string }
+export type WakeResult =
+  | { s: 'woken'; nativeId: string }
+  | { s: 'held' | 'refused' | 'uncertain' | 'unavailable' }
+
+export interface Adapter {
+  kind: Kind
+  probe(t: Target): Promise<{ ok: boolean }>
+  wake(t: Target, n: Nudge): Promise<WakeResult>
+  reconcile(t: Target, n: Nudge): Promise<WakeResult>
+}
+
+export type WakeState = 'committed' | WakeResult['s']
+
+export interface LeasedMessage {
+  readonly id: string
+  readonly leaseId: string
+  readonly body: string
+  readonly from: string
+  readonly from_human: boolean
+  readonly state: WakeState
+  readonly meta: ChannelMeta
+}
+
+export interface LeaseResult {
+  readonly messages: readonly LeasedMessage[]
+  readonly receipt?: string
+  readonly unread: number
+}
+
+export interface PublishResult {
+  readonly publish_id: string
+  readonly committed: readonly string[]
+}
+
+export type GatewayToRouterMessage =
+  | { type: 'registerGateway'; host: string; user: string; proto: 1; secret: string; requestId?: string }
+  | { type: 'registerAgent'; kind: Kind; conv: string; alias: string; host?: string; requestId?: string }
+  | { type: 'lease'; as: string; requestId: string; receipt?: string }
+  | { type: 'ack'; as: string; requestId: string; leaseId: string; id: string }
+  | { type: 'mark'; as: string; requestId: string; id: string; state: 'uncertain' }
+  | { type: 'wakeResult'; as: string; requestId: string; id: string; result: WakeResult }
+  | (WsBusPost & { as: string; requestId: string })
+
+export type RouterToGatewayMessage =
+  | { type: 'gatewayRegistered'; host: string; user: string; proto: 1 }
+  | { type: 'agentRegistered'; as: string; target: Target }
+  | { type: 'wake'; as: string; nudge: Nudge; reconcile?: true }
+  | WsToolResult | WsError
