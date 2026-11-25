@@ -54,6 +54,11 @@ function woken(nudge: Nudge): WakeResult {
   return { s: 'woken', nativeId: nudge.clientId }
 }
 
+function validNudge(nudge: Nudge): boolean {
+  return /^\[agent-bus\] mail waiting \(id (0|[1-9][0-9]*)\) — call check_inbox(?![\s\S])/.test(nudge.text)
+    && /^msg_bus[0-9a-f]{24}(?![\s\S])/.test(nudge.clientId)
+}
+
 function matchesQueued(value: unknown, target: Target, nudge: Nudge): boolean {
   const item = record(value)
   return item?.id === nudge.clientId && item.sessionID === target.conv && item.delivery === 'queue'
@@ -80,12 +85,14 @@ export function createOpencodeAdapter(
       }
     },
     async wake(target, nudge) {
+      if (!validNudge(nudge)) return { s: 'refused' }
       const endpoint = sessionPath(target)
       const request = endpoint && await serviceRequest(servicePath, fetchRequest)
       if (!request) return { s: 'unavailable' }
       try {
         const response = await request(endpoint + '/prompt', { text: nudge.text, id: nudge.clientId, delivery: 'queue' })
-        if (response.status === 401) return { s: 'unavailable' }
+        if ([401, 404, 410].includes(response.status)) return { s: 'unavailable' }
+        if (response.status === 429) return { s: 'uncertain' }
         if (response.status >= 400 && response.status < 500) return { s: 'refused' }
         if (response.ok && matchesQueued(await data(response), target, nudge)) return woken(nudge)
       } catch (error) {
@@ -97,18 +104,19 @@ export function createOpencodeAdapter(
       return { s: 'uncertain' }
     },
     async reconcile(target, nudge) {
+      if (!validNudge(nudge)) return { s: 'refused' }
       const endpoint = sessionPath(target)
       const request = endpoint && await serviceRequest(servicePath, fetchRequest)
       if (!request) return { s: 'unavailable' }
       try {
         const inbox = await request(endpoint + '/inbox')
-        if (inbox.status === 401) return { s: 'unavailable' }
+        if ([401, 404, 410].includes(inbox.status)) return { s: 'unavailable' }
         if (inbox.ok) {
           const pending = await data(inbox)
           if (Array.isArray(pending) && pending.some(item => matchesQueued(item, target, nudge))) return woken(nudge)
         }
         const message = await request(endpoint + '/message/' + encodeURIComponent(nudge.clientId))
-        if (message.status === 401) return { s: 'unavailable' }
+        if (message.status === 401 || message.status === 410) return { s: 'unavailable' }
         if (message.ok) {
           const item = record(await data(message))
           if (item?.id === nudge.clientId && item.type === 'user' && item.text === nudge.text) return woken(nudge)

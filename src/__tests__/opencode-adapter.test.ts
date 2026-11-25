@@ -52,6 +52,11 @@ test('queued wake and reconciliation use the same ID across adapter restarts', a
   try {
     await writeFile(path, JSON.stringify({ url: 'http://127.0.0.1:43210', password: 'fixture' }), { mode: 0o600 })
     const adapter = createOpencodeAdapter(path, fetchRequest)
+    for (const forged of [{ ...nudge, text: nudge.text + '\n' }, { ...nudge, clientId: '..' }]) {
+      expect(await adapter.wake(target, forged)).toEqual({ s: 'refused' })
+      expect(await adapter.reconcile(target, forged)).toEqual({ s: 'refused' })
+    }
+    expect(requests).toHaveLength(0)
     const accepted = { s: 'woken', nativeId: nudge.clientId } as const
     expect(await adapter.probe(target)).toEqual({ ok: true })
     expect(await adapter.reconcile(target, nudge)).toEqual({ s: 'uncertain' })
@@ -62,12 +67,11 @@ test('queued wake and reconciliation use the same ID across adapter restarts', a
     expect(await restarted.reconcile(target, nudge)).toEqual(accepted)
     expect(await restarted.wake(target, nudge)).toEqual(accepted)
     expect(submissions.size).toBe(1)
-    status = 401
-    expect(await adapter.wake(target, nudge)).toEqual({ s: 'unavailable' })
-    status = 409
-    expect(await adapter.wake(target, nudge)).toEqual({ s: 'refused' })
-    status = 500
-    expect(await adapter.wake(target, nudge)).toEqual({ s: 'uncertain' })
+    for (const [code, result] of [[401, 'unavailable'], [404, 'unavailable'], [410, 'unavailable'],
+      [403, 'refused'], [409, 'refused'], [429, 'uncertain'], [500, 'uncertain']] as const) {
+      status = code
+      expect(await adapter.wake(target, nudge)).toEqual({ s: result })
+    }
     await chmod(path, 0o644)
     const before = requests.length
     expect(await adapter.wake(target, nudge)).toEqual({ s: 'unavailable' })
