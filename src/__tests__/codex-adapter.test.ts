@@ -41,6 +41,7 @@ test("gateway notice and client ID pass through unchanged, with only allowlisted
     expect(params).toEqual({ threadId: target.conv, input, clientUserMessageId: clientId });
     return { queuedSubmission: { ...fixtures.enqueue.result.queuedSubmission, clientUserMessageId: clientId } };
   });
+  expect(adapter).toMatchObject({ kind: "codex", transport: "codex-queue" });
   expect(await adapter.wake(target, { ...nudge, body: "secret", from_human: true, from: "sender", approvalPolicy: "never" } as typeof nudge))
     .toEqual({ s: "woken", nativeId: fixtures.enqueue.result.queuedSubmission.id });
   expect(calls.map(call => call.method)).toEqual(["initialize", "initialized", "thread/queue/list", "thread/queue/add"]);

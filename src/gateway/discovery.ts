@@ -362,12 +362,13 @@ export class NativeDiscovery {
       if (incomplete.has(kind)) return outcome('incomplete')
       if (!match) return outcome('not_listed')
       match.result.unmapped--
-      if (current && identityKey(current) === identity && current.pid === match.pid && current.transport === 'native') {
+      const transport = kind === 'codex' ? 'codex-queue' : 'opencode-queue'
+      if (current && identityKey(current) === identity && current.pid === match.pid && current.transport === transport) {
         return outcome('unchanged')
       }
       return {
         ...outcome('blocked'),
-        registration: { alias, conv, kind, host, user, pid: match.pid, transport: 'native' },
+        registration: { alias, conv, kind, host, user, pid: match.pid, transport },
       }
     })
     check()

@@ -102,6 +102,7 @@ export function createOpencodeAdapter(
 ): Adapter {
   return {
     kind: 'opencode',
+    transport: 'opencode-queue',
     async probe(target) {
       const endpoint = sessionPath(target)
       const request = endpoint && await serviceRequest(servicePath, fetchRequest)

@@ -464,6 +464,7 @@ export function createCodexAdapter({
 
   return {
     kind: "codex",
+    transport: "codex-queue",
     async probe(target) {
       let ok = false;
       await run(target, async (rpc, threadId) => {

@@ -75,7 +75,10 @@ test('Codex fully paginates, preserves shared daemon aliases and invalidates gen
     'initialized', ['thread/loaded/list', { limit: 50 }], ['thread/loaded/list', { limit: 50, cursor: 'opaque cursor' }],
   ])
   const first = gateway.registry.byAlias(alias)!
-  expect(gateway.registry.byPid(123).map(x => x.conv)).toEqual(['thread-a', 'thread-b'])
+  expect(gateway.registry.byPid(123)).toMatchObject([
+    { conv: 'thread-a', transport: 'codex-queue' },
+    { conv: 'thread-b', transport: 'codex-queue' },
+  ])
   expect(await discovery.refresh()).toMatchObject({ bindings: [
     { alias, status: 'unchanged' }, { alias: secondAlias, status: 'unchanged' },
   ] })
@@ -86,7 +89,7 @@ test('Codex fully paginates, preserves shared daemon aliases and invalidates gen
   await discovery.refresh()
   const restarted = gateway.registry.byAlias(alias)!
   expect(gateway.registry.matches(first)).toBe(false)
-  expect(restarted).toMatchObject({ pid: 456, conv: 'thread-a' })
+  expect(restarted).toMatchObject({ pid: 456, conv: 'thread-a', transport: 'codex-queue' })
   await discovery.refresh()
   expect(gateway.registry.matches(restarted)).toBe(true)
   expect(frames).toHaveLength(4)
@@ -313,7 +316,15 @@ test('OpenCode sends only authenticated GETs and follows cursor.next after the l
     bindings: [{ alias: bare, status: 'registered' }, { alias: 'opencode@nas642:other', status: 'registered' }] })
   expect(requests).toEqual([null, 'opaque+/=', 'last'])
   const first = gateway.registry.byAlias(bare)!
-  expect(first.pid).toBe(100)
+  expect(gateway.registry.byPid(100)).toMatchObject([
+    { conv: 'ses_exampleA', transport: 'opencode-queue' },
+    { conv: 'ses_exampleB', transport: 'opencode-queue' },
+  ])
+  expect(await discovery.refresh()).toMatchObject({ bindings: [
+    { alias: bare, status: 'unchanged' }, { alias: 'opencode@nas642:other', status: 'unchanged' },
+  ] })
+  expect(gateway.registry.matches(first)).toBe(true)
+  expect(frames).toHaveLength(2)
   await writeBindings({ [bare]: { kind: 'opencode', conv: 'ses_exampleA', pid: 100 },
     'opencode@nas642:other': { kind: 'opencode', conv: 'ses_exampleB' } })
   await descriptor(200)
@@ -325,8 +336,10 @@ test('OpenCode sends only authenticated GETs and follows cursor.next after the l
   await discovery.refresh()
   expect(gateway.registry.matches(first)).toBe(false)
   const restarted = gateway.registry.byAlias(bare)!
-  expect(restarted.pid).toBe(200)
-  await discovery.refresh()
+  expect(restarted).toMatchObject({ pid: 200, transport: 'opencode-queue' })
+  expect(await discovery.refresh()).toMatchObject({ bindings: [
+    { alias: bare, status: 'unchanged' }, { alias: 'opencode@nas642:other', status: 'unchanged' },
+  ] })
   expect(gateway.registry.matches(restarted)).toBe(true)
   expect(frames).toHaveLength(4)
 })

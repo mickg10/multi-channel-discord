@@ -260,6 +260,7 @@ Configure the local native endpoints separately in `config.discoveries`.
 Give each selected endpoint a unique source ID. The Codex daemon PID is required
 in the source definition and must be updated after a restart. Discovery reads
 the OpenCode PID from the private service descriptor on each pass.
+Live daemon PID and start-time resolution is pending in PR5a before installation.
 
 The separate `gateway-alias-hosts.json` proves host ownership. A bare alias
 such as `opencode_nas642_glm53_abli` requires an exact entry for the local host.
@@ -297,6 +298,12 @@ removed binding preserves the registration and its mail. Retained aliases
 continue to own their native identities until explicitly released or rebound.
 An unchanged registration keeps its generation. A changed source PID or a
 confirmed explicit conversation rebind updates it.
+
+Discovery pins Codex registrations to `codex-queue` and OpenCode registrations
+to `opencode-queue`. The gateway selects exactly one adapter for the registered
+kind and transport. An `unavailable` wake result is terminal and leaves the
+message available through `check_inbox` only. It triggers no fallback, wake
+retry, release, or rebind.
 
 Call `await discovery.refresh()` for a one-shot pass or to supersede an older
 pass. `await discovery.stop()` cancels polling and fences off stale results.

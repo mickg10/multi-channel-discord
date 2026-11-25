@@ -52,6 +52,7 @@ test('queued wake and reconciliation use the same ID across adapter restarts', a
   try {
     await writeFile(path, JSON.stringify({ url: 'http://127.0.0.1:43210', password: 'fixture' }), { mode: 0o600 })
     const adapter = createOpencodeAdapter(path, fetchRequest)
+    expect(adapter).toMatchObject({ kind: 'opencode', transport: 'opencode-queue' })
     for (const forged of [{ ...nudge, text: nudge.text + '\n' }, { ...nudge, clientId: '..' }]) {
       expect(await adapter.wake(target, forged)).toEqual({ s: 'refused' })
       expect(await adapter.reconcile(target, forged)).toEqual({ s: 'refused' })
