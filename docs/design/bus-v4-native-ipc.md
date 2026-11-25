@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.5** (after R5), entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v4.6** (after R6), entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -38,8 +38,7 @@ Invariant **N3 (exact identity)**: delivery target = native conversation id, nev
 ### Claude wake: order of preference (R2#6)
 1. Sessions whose MCP pipe declares the channel capability (launched with the channel flag): a channel notification down the pipe. Documented, no token, no hold, no model turn.
 2. Plain `claude` sessions: a token post to the inbox socket (https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket).
-3. A cheap node-owned Claude `SendMessage` (claude_nas).
-4. tmux.
+3. tmux. (The Haiku `SendMessage` helper is **cut** in R6#1: an extra process, cost per wake, and mode holds.)
 
 **Conversation check before every Claude nudge (R2#4):** the token is per process, not per conversation. `/clear` changes sessionId under the same pid, socket and token. Before nudging, the gateway compares the pid's *current* sessionId (`claude agents --json`) with the mail's target. On mismatch it sends no nudge, and the mail waits for that conversation.
 **Frames:** an authed client could also send control frames (`rename`, `peer_message_status`, `notify_when_idle`, …). The gateway sends only `type:user` with the constant nudge. Any other frame type is a code-review blocker.
@@ -59,11 +58,13 @@ Agents keep an MCP entry, but it points at the **gateway**, not the router:
 Gateway stamps `(host,user,kind,conv-id)` on every call to the router; router rejects node-secret-only calls.
 
 ## 4. Durability (fixes live router bugs found by codex_nas)
+**Every admitted directed message is committed to Inboxes *before* any transport, live-push or wake-budget decision.** Today's live-push and over-budget paths skip the inbox entirely (R6#2, verified on 8697214). If commit fails, the sender gets an explicit error.
 Per message, one stable msg id across reconnects: **committed** (router fsync, synchronous) → **woken** (a native ack such as Codex queue/add or opencode prompt means the *adapter's nudge was admitted*, not that mail was read) → **accepted** (the recipient's `check_inbox` returned it and acked). Terminal side-states: **held / refused / uncertain**, operator-visible, mail still readable, no fallback (N4). Implementation is a **focused Inboxes and protocol refactor**, not a router rewrite (R5#3). It needs a synchronous atomic commit, entries with id, state and lease, a lease/ACK on drain, wake attempt and ACK records, restart recovery, and overflow surfaced to the sender instead of dropping at 501.
 Commit-before-ack on enqueue; lease by msg id on drain; ack only after recipient accepted; overflow is an
 error to the sender, never silent oldest-drop; uncertain inject → "unresolved", reconciled, never replayed blindly.
 
 ## 5. Controller
+ACP workers (agy/grok) speak stdio, so each runs in its tmux-0 window behind a tiny stdio↔unix-socket bridge owned by that window's restart loop. The gateway connects to the socket, and a gateway restart reconnects instead of severing the pipe (R6#4). agy LS address and CSRF are re-learned from a per-turn hook as well as SessionStart, the same way as Claude tokens (R6#3).
 Gateway-owned agents (grok/agy ACP children, persistent helpers) are **not** children of the gateway process. Each runs in its own tmux-0 window under a tiny restart loop, so a gateway crash or upgrade never kills them (R4#3). Persisted state: msg states, woken id (**fsync before the native send**), and pane plus conversation id per agent. **Tokens are never persisted.** After a gateway restart, an idle bypass Claude has no token until its next hook fire, so its wake falls back to channel, then SendMessage helper, then tmux (R4#4).
 Scope: a gateway controls only its own host. If the host is lost, its agents are gone too, and the router's durable mail is the cross-host continuity, so there is no standby gateway (R1#4 considered and rejected). Upgrades work by drain, then exec, and KeepAlive restarts it.
 The gateway is the never-down controller (KeepAlive/systemd --user). It (a) restarts dead agents in tmux session 0
@@ -75,7 +76,7 @@ with their own conversation id, (b) never restarts itself or the shared Codex da
 
 ## 6. Migration (per kind, old client stopped in the same step its adapter goes live)
 M0 gateway + Inboxes refactor + JSON check_inbox, no adapters, **no tmux restarts**. Build order (R5#5): M0, then **Codex (Mac) and opencode in parallel**, since both have passing canaries and opencode's tmux wake is broken today. Then Claude (after Q1), then agy/grok. No generic adapter framework or status UI: a minimal `Adapter{probe, wake, reconcile}` interface only. M1 Claude (hook + inbox socket). M2 opencode. M3 Codex (queue+nudge first,
-native after the disposable race test). M4 grok/agy: ACP for gateway-owned. Live grok TUIs are pull-only (tmux repeats the stuck-composer bug) until a disposable leader-mode test passes. Live agy TUIs use the tmux nudge gated on runState. CFD sessions are excluded throughout. Gates: M1 needs Q1, The M2 identity gate has passed. The idempotency and busy-ordering gate has also **passed** (codex_nas 16:48, isolated 2.0.18). The same caller `msg_…` id gives one pending item that is never merged into the busy turn, dispatches once, and is still deduped after dispatch and after a service restart. **Caution:** a changed body that reuses an id returns success but keeps the original, so the id is derived from an immutable (recipient, nudge) pair and success is never read as "this text accepted". Remaining M2 gate: visual rendering in an attached TUI. M5 retire plugin.ts ws client.
+native after the disposable race test). M4 grok/agy: ACP for gateway-owned. Live grok TUIs are pull-only (tmux repeats the stuck-composer bug) until a disposable leader-mode test passes. Live agy TUIs that a human uses are **pull-only**: a runState check and then a tmux send is still check-then-send, which N2 forbids (R6#3). The tmux nudge is allowed only on panes the gateway itself launched. **M4 is deferred** until M0, M2 and M3 are proven (R6#1). CFD sessions are excluded throughout. Gates: M1 needs Q1, The M2 identity gate has passed. The idempotency and busy-ordering gate has also **passed** (codex_nas 16:48, isolated 2.0.18). The same caller `msg_…` id gives one pending item that is never merged into the busy turn, dispatches once, and is still deduped after dispatch and after a service restart. **Caution:** a changed body that reuses an id returns success but keeps the original, so the id is derived from an immutable (recipient, nudge) pair and success is never read as "this text accepted". Remaining M2 gate: visual rendering in an attached TUI. M5 retire plugin.ts ws client.
 Each step: disposable session test → one real agent → fleet; revert = restore old MCP entry.
 
 ## 7. Open questions for Mick
@@ -131,3 +132,10 @@ GLM may still post R3 critique; it will be appended.
 4. Define "accepted" → **accepted**: native ack = woken; accepted = recipient check_inbox ack.
 5. Fastest path → **partly accepted**: no generic framework or UI. Codex and opencode run in parallel rather than Codex alone, because opencode is equally proven and broken in production today.
 - **codex_nas live bug (router 8697214, in-memory fixture):** `agentStatus` against a live push session whose route fails attempts the push, **empties the inbox** and reports pending=0, so a status probe destroys mail. **Adopted for M0:** status, count and peek are strictly observational (no drain, no push). A regression test covers the failed push on `agentStatus` and on reconnect-registration flush. Migration preflight must use only observational calls until M0 ships.
+
+### R6 agy@mac:src (e3c8a8a)
+1. Cut the Claude Haiku-SendMessage tier; defer M4 → **accepted**.
+2. [v] Live-push and budget paths bypass the durable inbox → **accepted**: commit before any transport decision (M0).
+3. [v] runState+tmux on human agy panes = check-then-send; LS creds lost on restart → **accepted**: human agy TUIs are pull-only; per-turn hook re-registers.
+4. [v] ACP stdio severed by a gateway restart → **accepted**: per-worker stdio↔socket bridge in tmux-0.
+5. agy per-session mcpServers under `session/resume` → **M4 gate** (2-session probe).
