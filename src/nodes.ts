@@ -55,10 +55,32 @@ export class Inboxes {
     return this.map.get(name)?.length ?? 0
   }
 
-  drain(name: string): QueuedMessage[] {
+  /**
+   * Pull this agent's queue.
+   * Omit `conversationId` to take everything (older callers).
+   * Pass a string to take mail for that conversation, or null when the session has none.
+   * A human approval stamped for a different conversation stays queued.
+   */
+  drain(name: string, conversationId?: string | null): QueuedMessage[] {
     const q = this.map.get(name) ?? []
-    if (q.length) { this.map.delete(name); this.save() }
-    return q
+    if (!q.length) return []
+    if (conversationId === undefined) {
+      this.map.delete(name)
+      this.save()
+      return q
+    }
+    const give: QueuedMessage[] = []
+    const hold: QueuedMessage[] = []
+    for (const item of q) {
+      const bound = item.meta.conversation_id
+      const approval = item.meta.from_human === 'true' && Boolean(item.meta.question_id)
+      if (approval && bound && bound !== conversationId) hold.push(item)
+      else give.push(item)
+    }
+    if (hold.length) this.map.set(name, hold)
+    else this.map.delete(name)
+    if (give.length || hold.length !== q.length) this.save()
+    return give
   }
 
   private save(): void {

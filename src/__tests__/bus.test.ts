@@ -147,6 +147,13 @@ describe('human bus messages', () => {
     expect(eleven.meta.from_human).toBe('true')
     expect(msgs(a).some(x => x.content === '11: no')).toBe(false)
     expect(msgs(c).some(x => x.content === '11: no')).toBe(false)
+    const errors: string[] = []
+    const worded = deps({ dispatcher: 'codex@nas642:src', onRoutingError: (m) => errors.push(m) })
+    expect(routeHumanBusMessage('claude look at the latch', { user: 'me', from_human: 'true' }, sessions, undefined, worded)).toEqual(['codex@nas642:src'])
+    expect(msgs(a).some(x => x.content === 'claude look at the latch')).toBe(false)
+    expect(routeHumanBusMessage('codex: restart yourself', { user: 'me', from_human: 'true' }, sessions, undefined, worded)).toEqual([])
+    expect(errors.at(-1)).toContain('not an exact session name')
+    expect(msgs(b).some(x => x.content === 'restart yourself')).toBe(false)
   })
 
   test('with no dispatcher, a human post wakes live push sessions and skips headless agents', () => {

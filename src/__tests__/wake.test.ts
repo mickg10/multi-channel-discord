@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test'
-import { afterDrain, latchDecision, resolveExact, WakeBudget } from '../wake.js'
+import { afterDrain, formatInboxLine, latchDecision, resolveExact, WakeBudget } from '../wake.js'
 
 describe('exact names', () => {
   const names = ['codex@mac', 'codex@nas642', 'agy@mac:src']
@@ -40,5 +40,19 @@ describe('cold wake budget', () => {
     expect(b.allow('a', 'premium', 0)).toBe(true)
     expect(b.allow('a', 'premium', 10)).toBe(false)
     expect(b.allow('a', 'premium', 2000)).toBe(true)
+  })
+})
+
+describe('inbox line', () => {
+  test('keeps question_id and in_reply_to so two short replies stay distinct', () => {
+    const line = formatInboxLine({
+      content: 'yes',
+      at: 't',
+      meta: { from: 'mick', source: 'agent-bus', chat_id: 'c', message_id: 'm2', question_id: 'q1', in_reply_to: 'q1' },
+    })
+    expect(line).toContain('question_id=q1')
+    expect(line).toContain('in_reply_to=q1')
+    expect(line).toContain('msg=m2')
+    expect(line).toContain('\nyes')
   })
 })

@@ -3,7 +3,7 @@ import { createWsHandlers, deliver, resetBusRateLimit } from '../ws.js'
 import type { WsData, WsDeps } from '../ws.js'
 import { SessionManager, ProjectHistory } from '../sessions.js'
 import { Inboxes, NodeRegistry } from '../nodes.js'
-import { Unread, WakeBudget } from '../wake.js'
+import { Conversations, Unread, WakeBudget } from '../wake.js'
 import { Subscriptions } from '../subscriptions.js'
 import { buildCommand, parseTurnOutput, bootstrapPrompt } from '../node.js'
 import { mkdtemp } from 'node:fs/promises'
@@ -127,6 +127,44 @@ describe('node agents', () => {
     expect(queued[0].meta.message_id).toBe('mid')
     expect(msgs(node2).filter(m => m.type === 'wake')).toHaveLength(1)
     expect(msgs(node2).filter(m => m.type === 'wake')[0].agent).toBe('codex@n:a')
+  })
+
+  test('an approval stays with the conversation that asked', () => {
+    const conversations = new Conversations()
+    const d = deps({ conversations })
+    const h = createWsHandlers(d)
+    const first = makeWs()
+    h.message(first, JSON.stringify({ type: 'register', name: 'codex@n:a', projectPath: '/p', conversationId: 'conv-a' }))
+    h.message(first, JSON.stringify({ type: 'deregister' }))
+    expect(deliver(d, 'codex@n:a', 'yes', { from_human: 'true', question_id: 'q1', from: 'mick' })).toBe(true)
+    expect(inboxes.count('codex@n:a')).toBe(1)
+    const reuse = makeWs()
+    h.message(reuse, JSON.stringify({ type: 'register', name: 'codex@n:a', projectPath: '/p', conversationId: 'conv-b' }))
+    expect(msgs(reuse).some(m => m.type === 'message' && m.content === 'yes')).toBe(false)
+    expect(inboxes.count('codex@n:a')).toBe(1)
+    h.message(reuse, JSON.stringify({ type: 'deregister' }))
+    const back = makeWs()
+    h.message(back, JSON.stringify({ type: 'register', name: 'codex@n:a', projectPath: '/p', conversationId: 'conv-a' }))
+    const got = msgs(back).find(m => m.type === 'message' && m.content === 'yes')
+    expect(got.meta.question_id).toBe('q1')
+    expect(got.meta.conversation_id).toBe('conv-a')
+    expect(got.meta.from_human).toBe('true')
+    expect(inboxes.count('codex@n:a')).toBe(0)
+  })
+
+  test('an approval with no conversation id is not left on a bare name', () => {
+    const d = deps({ conversations: new Conversations() })
+    expect(deliver(d, 'gone@x', 'yes', { from_human: 'true', question_id: 'q1' })).toBe(false)
+    expect(inboxes.count('gone@x')).toBe(0)
+  })
+
+  test('a node agent still receives an approval between turns', () => {
+    const d = deps({ conversations: new Conversations() })
+    const h = createWsHandlers(d)
+    const nodeWs = regNode(h, 'nas', ['headless@nas'])
+    expect(deliver(d, 'headless@nas', 'yes', { from_human: 'true', question_id: 'q1' })).toBe(true)
+    expect(inboxes.count('headless@nas')).toBe(1)
+    expect(msgs(nodeWs).some(m => m.type === 'wake')).toBe(true)
   })
 
   test('a cold wake over budget becomes unread and does not wake', async () => {

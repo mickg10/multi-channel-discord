@@ -11,7 +11,7 @@ import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './ac
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
 import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, deliver as deliverFn } from './ws.js'
-import { Activity, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
+import { Activity, Conversations, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete, updateSkillCommands, isSkillCommand } from './slash-commands.js'
@@ -246,7 +246,8 @@ let wsDepsRef: Parameters<typeof createWsHandlers>[0]
 let routeError: string | undefined
 let routeNote: string | undefined
 const humanMail = new HumanMail()
-function deliverTo(name: string, text: string, meta: ChannelMeta): void { deliverFn(wsDepsRef, name, text, meta) }
+const conversations = new Conversations()
+function deliverTo(name: string, text: string, meta: ChannelMeta): boolean { return deliverFn(wsDepsRef, name, text, meta) }
 const wsHandlers = createWsHandlers(wsDepsRef = {
   sessions,
   history,
@@ -280,6 +281,7 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   onRoutingError: (message: string) => { routeError = message },
   onRouteNote: (message: string) => { routeNote = message },
   humanMail,
+  conversations,
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
     updateSkillCommands(client, skills).catch((err: unknown) => {
       process.stderr.write(`discord channel: skill command registration failed: ${err instanceof Error ? err.message : String(err)}\n`)
@@ -376,20 +378,24 @@ async function handleBusInbound(msg: Message): Promise<void> {
   const fullMeta: ChannelMeta = { ...meta, ...(channelName && { channel: channelName }) }
   // A Discord reply to an agent's post goes to that agent only ("**[name → ...]**" prefix).
   let delivered: string[] = []
+  let boundMiss: string | undefined
   if (msg.reference?.messageId) {
     try {
       const ref = await msg.channel.messages.fetch(msg.reference.messageId)
       const m = ref.author.id === client.user?.id ? ref.content.match(/^\*\*\[([^\]\s]+) →/) : null
       if (m) {
         const asker = m[1]
-        deliverTo(asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id, question_id: ref.id })
-        delivered = [asker]
+        const held = deliverTo(asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id, question_id: ref.id })
+        if (held) delivered = [asker]
+        else boundMiss = asker
       }
     } catch {}
   }
   routeError = undefined
   routeNote = undefined
-  if (delivered.length === 0) {
+  if (boundMiss) {
+    routeNote = `not delivered to ${boundMiss}: that session is offline and has no conversation id. Reply again when they are back, or name a live session with @name.`
+  } else if (delivered.length === 0) {
     const bound = msg.reference?.messageId ? { ...fullMeta, unbound_reply: msg.reference.messageId } : fullMeta
     const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
     delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : subs.subscribers(msg.channelId), wsDepsRef)

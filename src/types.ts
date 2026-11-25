@@ -30,6 +30,8 @@ export interface WsRegister {
   readonly takeover?: boolean
   /** cheap | standard | premium. Omitted = standard. Used to order and budget cold wakes. */
   readonly costClass?: 'cheap' | 'standard' | 'premium'
+  /** Stable id of this conversation. A reused display name with a different id does not inherit held approvals. */
+  readonly conversationId?: string
 }
 
 /** Plugin → Router: rename this session */

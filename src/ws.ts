@@ -21,7 +21,7 @@ import type { Subscriptions } from './subscriptions.js'
 import type { Inboxes, NodeRegistry, Claims } from './nodes.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
-import { orderByCost, resolveExact, type Activity, type CostClasses, type HumanMail, type Unread, type WakeBudget, type WakeLog } from './wake.js'
+import { orderByCost, resolveExact, type Activity, type Conversations, type CostClasses, type HumanMail, type Unread, type WakeBudget, type WakeLog } from './wake.js'
 
 /** Guild channel operations the router provides (mockable in tests). */
 export interface ChannelOps {
@@ -116,6 +116,8 @@ export interface WsDeps {
   onRouteNote?: (message: string) => void
   /** Original human posts, so the dispatcher can re-deliver one by message id. */
   readonly humanMail?: HumanMail
+  /** conversationId from register. Survives disconnect so a held approval keeps its owner. */
+  readonly conversations?: Conversations
 }
 
 /** A file sent inline by a client (the router is remote: it must never open client-named paths). */
@@ -167,16 +169,25 @@ export function deliver(deps: Readonly<WsDeps>, name: string, text: string, meta
   }
   let ok = false
   let pending = deps.inboxes?.count(name) ?? 0
-  if (live && !pullSessions.has(name)) ok = deps.sessions.routeToSession(name, text, meta)
-  else if (!deps.inboxes) ok = live ? deps.sessions.routeToSession(name, text, meta) : false
-  else if (!live && !deps.nodes?.get(name)) ok = false
-  else {
-    pending = deps.inboxes.push(name, text, meta)
+  const known = meta.conversation_id ?? (meta.from_human === 'true' && meta.question_id ? deps.conversations?.get(name) : undefined)
+  const stamped: ChannelMeta = known ? { ...meta, conversation_id: known } : meta
+  // An approval for an offline session is held only when that conversation has checked in before.
+  // Otherwise it would sit on a display name the next conversation could inherit.
+  if (!live && !deps.nodes?.get(name) && meta.from_human === 'true' && meta.question_id && !known) return false
+  if (live && !pullSessions.has(name)) ok = deps.sessions.routeToSession(name, text, stamped)
+  else if (!deps.inboxes) ok = live ? deps.sessions.routeToSession(name, text, stamped) : false
+  else if (!live && !deps.nodes?.get(name)) {
+    if (stamped.conversation_id && meta.from_human === 'true' && meta.question_id) {
+      pending = deps.inboxes.push(name, text, stamped)
+      ok = true
+    }
+  } else {
+    pending = deps.inboxes.push(name, text, stamped)
     // A live pull session is mid-turn and will check_inbox; the node re-checks after the turn.
     if (!live) deps.nodes?.wake(name, pending)
     ok = true
   }
-  if (ok) deps.wakeLog?.record({ name, messageId: meta.message_id, pending, cold, at: Date.now() })
+  if (ok) deps.wakeLog?.record({ name, messageId: stamped.message_id, pending, cold, at: Date.now() })
   return ok
 }
 
@@ -380,7 +391,8 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       if (!p.requestId || !p.agent) { sendError(ws, 'agentStatus requires requestId and agent'); return }
       const live = deps.sessions.getSessions().some(s => s.name === p.agent)
       const push = live && !pullSessions.has(p.agent)
-      if (push) for (const q of deps.inboxes?.drain(p.agent) ?? []) deps.sessions.routeToSession(p.agent, q.content, { ...q.meta, queued_at: q.at })
+      const cid = deps.conversations ? (deps.conversations.get(p.agent) ?? null) : undefined
+      if (push) for (const q of deps.inboxes?.drain(p.agent, cid) ?? []) deps.sessions.routeToSession(p.agent, q.content, { ...q.meta, queued_at: q.at })
       sendToolResult(ws, p.requestId, true, JSON.stringify({ live, mode: live ? (push ? 'push' : 'pull') : null, pending: deps.inboxes?.count(p.agent) ?? 0 }))
       break
     }
@@ -393,7 +405,8 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       else {
         // Directed mail only. Old clients get a bare array. withUnread adds a count of
         // passive chatter and never the bodies.
-        const messages = deps.inboxes?.drain(who) ?? []
+        const bound = deps.conversations ? (deps.conversations.get(who) ?? null) : undefined
+        const messages = deps.inboxes?.drain(who, bound) ?? []
         const withUnread = (parsed as { withUnread?: boolean }).withUnread === true
         const unread = withUnread ? (deps.unread?.take(who) ?? 0) : 0
         sendToolResult(ws, parsed.requestId, true, JSON.stringify(withUnread ? { messages, unread } : messages))
@@ -481,13 +494,18 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
           try { deps.sessions.deregisterSession(parsed.name) } catch {}
         }
       }
+      const conversationId = typeof (parsed as { conversationId?: unknown }).conversationId === 'string'
+        ? (parsed as { conversationId: string }).conversationId
+        : ''
       handleRegister(ws, parsed.name, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
       if (ws.data.sessionName) {
+        if (conversationId) deps.conversations?.set(ws.data.sessionName, conversationId)
+        const cid = deps.conversations ? (deps.conversations.get(ws.data.sessionName) ?? null) : undefined
         if ((parsed as { mode?: string }).mode === 'pull') pullSessions.add(ws.data.sessionName)
         else {
           pullSessions.delete(ws.data.sessionName)
-          // Messages queued while this agent was offline: push them now.
-          for (const q of deps.inboxes?.drain(ws.data.sessionName) ?? []) deps.sessions.routeToSession(ws.data.sessionName, q.content, { ...q.meta, queued_at: q.at })
+          // Messages queued while this agent was offline. Approvals for another conversation stay queued.
+          for (const q of deps.inboxes?.drain(ws.data.sessionName, cid) ?? []) deps.sessions.routeToSession(ws.data.sessionName, q.content, { ...q.meta, queued_at: q.at })
         }
         sendRulesOnce(deps, ws.data.sessionName)
         deps.costs?.set(ws.data.sessionName, (parsed as { costClass?: unknown }).costClass)
@@ -1232,15 +1250,18 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
     else for (const n of ordered) send(n, text, { ...meta, ...replyMeta, to: 'all', all_mode: mode })
     return ordered
   }
-  const m = content.match(/^\s*@?([\w.@:/-]+?)[:,]?\s+([\s\S]*)$/)
-  if (m) {
-    const resolved = resolveExact(m[1], names)
+  // A bare first word is not an address. `@name` or `name:` is. "11: no" has a colon
+  // but matches nobody, so it falls through instead of becoming an error.
+  const m = content.match(/^\s*(@)?([\w.@:/-]+?)(:)?\s+([\s\S]*)$/)
+  if (m && (m[1] || m[3])) {
+    const token = m[2]
+    const resolved = resolveExact(token, names)
     if (resolved.ok) {
-      send(resolved.name, m[2], { ...meta, ...replyMeta, to: resolved.name })
+      send(resolved.name, m[4], { ...meta, ...replyMeta, to: resolved.name })
       return [resolved.name]
     }
-    const addressed = content.trim().startsWith('@') || names.some(n => n.startsWith(m[1]))
-    if (addressed) {
+    const prefix = names.some(n => n.startsWith(token))
+    if (m[1] || prefix) {
       deps?.onRoutingError?.(resolved.error)
       return []
     }

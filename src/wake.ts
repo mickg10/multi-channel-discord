@@ -86,6 +86,31 @@ export class HumanMail {
   }
 }
 
+/** Last conversation id a session registered with. Kept after disconnect so a held approval can be stamped. */
+export class Conversations {
+  private readonly ids = new Map<string, string>()
+  set(name: string, id: string): void {
+    if (id) this.ids.set(name, id)
+  }
+  get(name: string): string | undefined {
+    return this.ids.get(name)
+  }
+}
+
+/** One directed inbox line. question_id and in_reply_to stay visible so two short replies are not the same. */
+export function formatInboxLine(m: { content: string; meta: { [key: string]: string | undefined }; at: string }): string {
+  const from = m.meta.from ?? m.meta.user ?? 'unknown'
+  const where = m.meta.source === 'agent-bus'
+    ? `#${m.meta.channel ?? 'bus'} chat_id=${m.meta.chat_id ?? '?'}`
+    : `chat ${m.meta.chat_id ?? '?'}`
+  const ids = [
+    m.meta.message_id ? `msg=${m.meta.message_id}` : '',
+    m.meta.question_id ? `question_id=${m.meta.question_id}` : '',
+    m.meta.in_reply_to ? `in_reply_to=${m.meta.in_reply_to}` : '',
+  ].filter(Boolean).join(' ')
+  return `[${m.meta.ts ?? m.at}] (${where}) from ${from}${ids ? ` ${ids}` : ''}:\n${m.content}`
+}
+
 /** Last time a session posted. Separate from "connected" and from inbox depth. */
 export class Activity {
   private readonly posts = new Map<string, string>()

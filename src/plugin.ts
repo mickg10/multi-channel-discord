@@ -20,7 +20,7 @@ import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
-import { afterDrain, latchDecision } from './wake.js'
+import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
 
@@ -111,11 +111,13 @@ export interface ConnectToRouterOptions {
   readonly onMessage?: (content: string, meta: ChannelMeta) => void
   readonly pendingRequests?: Map<string, PendingRequest>
   readonly onPermissionVerdict?: (requestId: string, behavior: 'allow' | 'deny') => void
+  /** Stable conversation id. A later session that reuses the display name does not inherit held approvals. */
+  readonly conversationId?: string
 }
 
 /** Connect to the router via WebSocket and register. */
 export async function connectToRouter(opts: ConnectToRouterOptions): Promise<ConnectResult> {
-  const { wsPort, name, projectPath, onMessage, pendingRequests, onPermissionVerdict } = opts
+  const { wsPort, name, projectPath, onMessage, pendingRequests, onPermissionVerdict, conversationId } = opts
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(process.env.DISCORD_ROUTER_URL || `ws://localhost:${wsPort}`)
     const timeout = setTimeout(() => {
@@ -137,7 +139,7 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       const mode = process.env.DISCORD_MODE === 'pull' ? 'pull' : 'push'
       const costClass = process.env.DISCORD_COST_CLASS
       const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
-      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(secret && { secret }), ...(cost && { costClass: cost }) }))
+      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
     }
 
     ws.onmessage = (event) => {
@@ -408,6 +410,7 @@ export async function startPlugin(): Promise<void> {
     // Don't auto-spawn the router — it's a Discord bot that must be started manually.
     // The plugin just connects to it.
     try {
+      const conversationId = process.env.DISCORD_CONVERSATION_ID || claude?.sessionId
       const { ws, registeredName } = await connectToRouter({
         wsPort,
         name: currentName,
@@ -415,6 +418,7 @@ export async function startPlugin(): Promise<void> {
         onMessage,
         pendingRequests,
         onPermissionVerdict,
+        ...(conversationId && { conversationId }),
       })
       currentWs = ws
       currentName = registeredName
@@ -814,11 +818,7 @@ export async function startPlugin(): Promise<void> {
           if (!args.peek) ackWake()
           const passive = unread > 0 ? `${unread} passive message(s) since you last looked are in channel history (fetch_messages). They were not put in this inbox.` : ''
           if (items.length === 0) return { content: [{ type: 'text', text: passive || 'Inbox empty.' }] }
-          const text = items.map(m => {
-            const from = m.meta.from ?? m.meta.user ?? 'unknown'
-            const where = m.meta.source === 'agent-bus' ? `#${m.meta.channel ?? 'bus'} chat_id=${m.meta.chat_id ?? '?'}` : `chat ${m.meta.chat_id ?? '?'}`
-            return `[${m.meta.ts ?? m.at}] (${where}) from ${from}${m.meta.message_id ? ` msg=${m.meta.message_id}` : ''}:\n${m.content}`
-          }).join('\n\n')
+          const text = items.map(m => formatInboxLine(m)).join('\n\n')
           return { content: [{ type: 'text', text: passive ? `${text}\n\n${passive}` : text }] }
         }
         case 'react': {
