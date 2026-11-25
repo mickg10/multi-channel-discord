@@ -167,7 +167,7 @@ describe('node agents', () => {
     expect(msgs(nodeWs).some(m => m.type === 'wake')).toBe(true)
   })
 
-  test('a cold wake over budget becomes unread and does not wake', async () => {
+  test('a cold wake over budget preserves directed mail and does not wake', async () => {
     const unread = new Unread()
     const budget = new WakeBudget({ cheap: 100, standard: 1, premium: 1 })
     const h = createWsHandlers(deps({ unread, budget, busMaxPerMinute: 50 }))
@@ -178,8 +178,8 @@ describe('node agents', () => {
     expect(inboxes.count('codex@n:a')).toBe(1)
     h.message(a as any, JSON.stringify({ type: 'busPost', text: 'two', to: 'codex@n:a' }))
     await tick()
-    expect(inboxes.count('codex@n:a')).toBe(1)
-    expect(unread.count('codex@n:a')).toBe(1)
+    expect(inboxes.count('codex@n:a')).toBe(2)
+    expect(unread.count('codex@n:a')).toBe(0)
     expect(msgs(nodeWs).filter(m => m.type === 'wake')).toHaveLength(1)
   })
 })
@@ -298,14 +298,14 @@ describe('opencode kind', () => {
 })
 
 describe('agentStatus + resume last', () => {
-  test('agentStatus reports live push and hands queued mail over', () => {
+  test('agentStatus reports live push and only observes pending mail', () => {
     const h = createWsHandlers(deps())
     const nodeWs = regNode(h, 'n', ['codex@n:q'])
     const live = reg(h, 'codex@n:q')            // interactive session holds the name
     inboxes.push('codex@n:q', 'queued during a gap', {})
     h.message(nodeWs as any, JSON.stringify({ type: 'agentStatus', requestId: 's', agent: 'codex@n:q' }))
-    expect(JSON.parse(msgs(nodeWs).find(m => m.requestId === 's').data)).toMatchObject({ live: true, mode: 'push', pending: 0 })
-    expect(msgs(live).find(m => m.type === 'message' && m.content === 'queued during a gap')).toBeTruthy()
+    expect(JSON.parse(msgs(nodeWs).find(m => m.requestId === 's').data)).toMatchObject({ live: true, mode: 'push', pending: 1 })
+    expect(msgs(live).find(m => m.type === 'message' && m.content === 'queued during a gap')).toBeUndefined()
   })
   test('resume "last" maps to continue flags', () => {
     expect(buildCommand({ name: 'c', kind: 'claude' }, 'last', 'P', { claudePlugin: true }).args).toContain('--continue')

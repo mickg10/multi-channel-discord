@@ -291,6 +291,7 @@ export type RouterToPluginMessage =
   | WsError
   | WsToolResult
   | WsPermissionVerdict
+  | ({ type: 'published' } & PublishResult)
 
 // ============================================================
 // Session management
@@ -372,6 +373,7 @@ export interface PublishResult {
 export type GatewayToRouterMessage =
   | { type: 'registerGateway'; host: string; user: string; proto: 1; secret: string; requestId?: string }
   | { type: 'registerAgent'; kind: Kind; conv: string; alias: string; host?: string; requestId?: string }
+  | { type: 'agentStatus'; as: string; requestId: string }
   | { type: 'lease'; as: string; requestId: string; receipt?: string }
   | { type: 'ack'; as: string; requestId: string; leaseId: string; id: string; receipt: string }
   | { type: 'mark'; as: string; requestId: string; id: string; state: 'uncertain' }

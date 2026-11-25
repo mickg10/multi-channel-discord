@@ -30,7 +30,7 @@ export class SessionManager {
    *  If a session with the same instanceId already exists, adds this send callback
    *  to extraSends (dedup for multiple MCP spawns from the same Claude Code process).
    *  Different Claude Code instances on the same project get separate sessions with collision suffixes. */
-  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string): string {
+  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean): string {
     // Deduplicate: if same instanceId is already registered, add send callback to existing.
     // This handles Claude Code spawning multiple MCP plugin processes for one session.
     if (instanceId) {
@@ -42,7 +42,7 @@ export class SessionManager {
       }
     }
 
-    const actualName = this.resolveCollision(name)
+    const actualName = this.resolveCollision(name, reserved)
     this.sessions.set(actualName, {
       name: actualName,
       projectPath,
@@ -89,12 +89,12 @@ export class SessionManager {
   }
 
   /** Rename a session. Returns the actual new name. */
-  renameSession(oldName: string, newName: string): string {
+  renameSession(oldName: string, newName: string, reserved?: (name: string) => boolean): string {
     const slot = this.sessions.get(oldName)
     if (!slot) throw new SessionNotFoundError(oldName)
 
     this.sessions.delete(oldName)
-    const actualName = this.resolveCollision(newName)
+    const actualName = this.resolveCollision(newName, reserved)
     this.sessions.set(actualName, { ...slot, name: actualName })
 
     const buf = this.buffers.get(oldName)
@@ -227,10 +227,11 @@ export class SessionManager {
     }
   }
 
-  private resolveCollision(name: string): string {
-    if (!this.sessions.has(name)) return name
+  private resolveCollision(name: string, reserved?: (name: string) => boolean): string {
+    const inUse = (candidate: string) => this.sessions.has(candidate) || reserved?.(candidate)
+    if (!inUse(name)) return name
     let suffix = 2
-    while (this.sessions.has(`${name}-${suffix}`)) suffix++
+    while (inUse(`${name}-${suffix}`)) suffix++
     return `${name}-${suffix}`
   }
 }

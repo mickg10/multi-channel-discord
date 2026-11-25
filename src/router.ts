@@ -10,7 +10,7 @@
 import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './access.js'
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
-import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, deliver as deliverFn } from './ws.js'
+import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, inboxError, deliver as deliverFn } from './ws.js'
 import { Activity, Conversations, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
@@ -247,7 +247,6 @@ let routeError: string | undefined
 let routeNote: string | undefined
 const humanMail = new HumanMail()
 const conversations = new Conversations()
-function deliverTo(name: string, text: string, meta: ChannelMeta): boolean { return deliverFn(wsDepsRef, name, text, meta) }
 const wsHandlers = createWsHandlers(wsDepsRef = {
   sessions,
   history,
@@ -298,7 +297,7 @@ interface BunServerWebSocket {
 function toBunWsLike(ws: BunServerWebSocket): WsLike {
   return {
     data: ws.data,
-    send(msg: string) { ws.send(msg) },
+    send(msg: string) { if (ws.send(msg) === 0) throw new Error('WebSocket send failed') },
   }
 }
 
@@ -385,11 +384,15 @@ async function handleBusInbound(msg: Message): Promise<void> {
       const m = ref.author.id === client.user?.id ? ref.content.match(/^\*\*\[([^\]\s]+) →/) : null
       if (m) {
         const asker = m[1]
-        const held = deliverTo(asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id, question_id: ref.id })
+        const target = inboxes.approvalTarget(ref.id)
+        const held = deliverFn(wsDepsRef, asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id, question_id: ref.id }, target)
         if (held) delivered = [asker]
         else boundMiss = asker
       }
-    } catch {}
+    } catch (err) {
+      const code = inboxError(err)
+      if (code !== 'request_failed') { await msg.reply(code).catch(() => {}); return }
+    }
   }
   routeError = undefined
   routeNote = undefined
@@ -398,7 +401,12 @@ async function handleBusInbound(msg: Message): Promise<void> {
   } else if (delivered.length === 0) {
     const bound = msg.reference?.messageId ? { ...fullMeta, unbound_reply: msg.reference.messageId } : fullMeta
     const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
-    delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : subs.subscribers(msg.channelId), wsDepsRef)
+    try {
+      delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : subs.subscribers(msg.channelId), wsDepsRef)
+    } catch (err) {
+      await msg.reply(inboxError(err)).catch(() => {})
+      return
+    }
   }
   process.stderr.write(`discord: bus message from ${msg.author.username} -> ${delivered.join(',') || '(no sessions)'}\n`)
   if (delivered.length === 0) {

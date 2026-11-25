@@ -9,95 +9,15 @@
 
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import type { ChannelMeta } from './types.js'
 
-export interface QueuedMessage {
-  readonly content: string
-  readonly meta: ChannelMeta
-  readonly at: string
-}
+export { Inboxes } from './inboxes.js'
+export type { QueuedMessage } from './inboxes.js'
 
 export interface NodeAgent {
   readonly name: string
   readonly kind: string
   readonly cwd?: string
   readonly node: string
-}
-
-const INBOX_MAX = 500
-
-export class Inboxes {
-  private readonly map = new Map<string, QueuedMessage[]>()
-  private saveTimer: ReturnType<typeof setTimeout> | null = null
-
-  constructor(private readonly file?: string) {
-    if (!file) return
-    try {
-      const raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, QueuedMessage[]>
-      for (const [k, v] of Object.entries(raw)) if (Array.isArray(v) && v.length) this.map.set(k, v)
-    } catch {}
-  }
-
-  static inStateDir(dir: string): Inboxes {
-    return new Inboxes(join(dir, 'inboxes.json'))
-  }
-
-  push(name: string, content: string, meta: ChannelMeta): number {
-    const q = this.map.get(name) ?? []
-    q.push({ content, meta, at: new Date().toISOString() })
-    if (q.length > INBOX_MAX) q.splice(0, q.length - INBOX_MAX)
-    this.map.set(name, q)
-    this.save()
-    return q.length
-  }
-
-  count(name: string): number {
-    return this.map.get(name)?.length ?? 0
-  }
-
-  /**
-   * Pull this agent's queue.
-   * Omit `conversationId` to take everything (older callers).
-   * Pass a string to take mail for that conversation, or null when the session has none.
-   * A human approval stamped for a different conversation stays queued.
-   */
-  drain(name: string, conversationId?: string | null): QueuedMessage[] {
-    const q = this.map.get(name) ?? []
-    if (!q.length) return []
-    if (conversationId === undefined) {
-      this.map.delete(name)
-      this.save()
-      return q
-    }
-    const give: QueuedMessage[] = []
-    const hold: QueuedMessage[] = []
-    for (const item of q) {
-      const bound = item.meta.conversation_id
-      const approval = item.meta.from_human === 'true' && Boolean(item.meta.question_id)
-      if (approval && bound && bound !== conversationId) hold.push(item)
-      else give.push(item)
-    }
-    if (hold.length) this.map.set(name, hold)
-    else this.map.delete(name)
-    if (give.length || hold.length !== q.length) this.save()
-    return give
-  }
-
-  private save(): void {
-    if (!this.file || this.saveTimer) return
-    // Coalesce bursts; still durable within ~200ms.
-    this.saveTimer = setTimeout(() => {
-      this.saveTimer = null
-      try {
-        mkdirSync(dirname(this.file!), { recursive: true })
-        const tmp = `${this.file}.tmp`
-        writeFileSync(tmp, JSON.stringify(Object.fromEntries(this.map)))
-        renameSync(tmp, this.file!)
-      } catch (err: unknown) {
-        process.stderr.write(`discord channel: failed to save inboxes: ${err instanceof Error ? err.message : String(err)}\n`)
-      }
-    }, 200)
-  }
 }
 
 export class NodeRegistry {
