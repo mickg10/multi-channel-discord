@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.1** (after R1), entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v4.2** (after R2), entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -20,7 +20,7 @@ Discord ◄─► ROUTER (vps2, unchanged role: policy PR #9, claims, subs, regi
 
 Invariant **N1 (fixed nudge)**: an adapter only ever injects a fixed, non-imperative nudge
 (`[agent-bus] mail waiting (id <n>) — call check_inbox`). Message bodies and `from_human` travel only in the
-`check_inbox` tool result. Reason: native inject = user-authority input (Codex `UserInput`, opencode prompt).
+`check_inbox` tool result, which is **structured JSON** (`[{id, from, from_human: <router-set bool>, channel, body}]`). It is never a formatted text header that a body could forge (R2#1; today's `formatInboxLine` is forgeable, a live bug). The nudge is a compile-time constant plus a digits-only id, with at most **one un-acked nudge per conversation** (R2#2). Reason: native inject = user-authority input (Codex `UserInput`, opencode prompt).
 Invariant **N2 (no racing the human)**: never `turn/steer`. An adapter may inject only where the agent's own input queue serializes it with human input (Claude inbox `priority:"next"` is queued by Claude itself between tool calls, or starts a turn when idle). Codex ≥0.172 provides the guarantee too: `thread/queue/add` and `thread/queue/start` (experimentalApi) run StartIfIdle and reject an active or pending turn. That is the native idle-only queue, version-gated, and it only goes live after the two-client TUI canary passes. Where the guarantee is missing (older Codex, opencode TUIs a human owns), the thread is **pull-only**: mail waits for the agent's next check_inbox, and no check-then-send. That holds until an atomic idle-only admission exists.
 Invariant **N3 (exact identity)**: delivery target = native conversation id, never cwd/display name.
 
@@ -34,11 +34,19 @@ Invariant **N3 (exact identity)**: delivery target = native conversation id, nev
 | **grok 1.0.92** | ACP session id | `grok agent serve` (WS 127.0.0.1, `--secret`) / `agent stdio`; live TUI not on leader → tmux | ACP events | grok docs 15-agent-mode.md |
 | **agy 1.5.17** | conversation UUID (`$ANTIGRAVITY_CONVERSATION_ID`) | Gateway-owned: `agy acp` (`session/resume`/`session/prompt`, with inline per-session `mcpServers`) or stream-json stdin (omit `-p`). Live TUI: **no inject**, so tmux nudge, gated on runState | Live TUI: a SessionStart hook gives LS address and CSRF token, and `ConversationService/GetConversation` returns `runState` IDLE/RUNNING. Gateway-owned: turn framing | agy_nas verified live on nas642 (docs: headless.md, hooks.md) |
 
+### Claude wake: order of preference (R2#6)
+1. Sessions whose MCP pipe declares the channel capability (launched with the channel flag): a channel notification down the pipe. Documented, no token, no hold, no model turn.
+2. Plain `claude` sessions: a token post to the inbox socket (https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket).
+3. A cheap node-owned Claude `SendMessage` (claude_nas).
+4. tmux.
+
+**Conversation check before every Claude nudge (R2#4):** the token is per process, not per conversation. `/clear` changes sessionId under the same pid, socket and token. Before nudging, the gateway compares the pid's *current* sessionId (`claude agents --json`) with the mail's target. On mismatch it sends no nudge, and the mail waits for that conversation.
+**Frames:** an authed client could also send control frames (`rename`, `peer_message_status`, `notify_when_idle`, …). The gateway sends only `type:user` with the constant nudge. Any other frame type is a code-review blocker.
+
 ### Claude registration (no setting change, no per-agent process)
 A `SessionStart` hook (user settings, all sessions) runs `agent-bus register` once. It inherits
 `CLAUDE_CODE_MESSAGING_SOCKET`/`_TOKEN` and `CLAUDE_SESSION_ID`/pid, and hands them to the gateway over its
-0600 unix socket, then exits. Gateway stores token in memory + 0600 state file, keyed by sessionId, refreshes on
-every hook fire (SessionStart fires on resume/clear too — **verify**). Bypass sessions then accept the gateway's
+0600 unix socket, then exits. Gateway keeps tokens **in memory only** (R2#5; a state file would hand all sessions' tokens to any same-user reader) and re-learns them from `SessionStart` (fires with `source:"clear"` and on resume; verified by claude_nas) and `UserPromptSubmit` hooks after a gateway restart. Env: `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`. Bypass sessions then accept the gateway's
 nudges (test 3). Fallbacks in order: hook missing → tmux nudge; token rejected → re-register on next hook.
 
 ## 3. Tools
@@ -66,7 +74,7 @@ native after the disposable race test). M4 grok/agy (ACP for gateway-owned, tmux
 Each step: disposable session test → one real agent → fleet; revert = restore old MCP entry.
 
 ## 7. Open questions for Mick
-Q1 SessionStart hook in user settings for all Claude sessions (needed for M1). **This deliberately lets the gateway skip the bypass-session hold for its fixed nudge**, using the session's own messaging token. The alternative is `crossSessionInbound: accept`, which opens the gate to every same-user sender, or living with the hold. The nudge carries no body (N1). Mick's security call. — OK?
+Q1 SessionStart hook in user settings for all Claude sessions (needed for M1). It lets the gateway skip the bypass-session hold for its fixed nudge, using the session's own messaging token. That token is already in the env of every Bash command, hook and MCP child of that session (R2#3, verified), so this is not a new escalation, but it is a policy choice. The alternative is `crossSessionInbound: accept`, which opens the gate to every same-user sender, or living with the hold. The nudge carries no body (N1). Mick's security call. — OK?
 Q2 Relaunch grok/agy gateway-owned (ACP) instead of TUI, where no human uses that pane?
 Q3 nas642 node moves from root system unit to `systemd --user` (lingering) — OK?
 
@@ -80,3 +88,11 @@ Q3 nas642 node moves from root system unit to `systemd --user` (lingering) — O
 4. Standby controller with fencing → **rejected**, with the scope argument in §5. "Don't borrow recipient credentials to turn a hold into acceptance" → **escalated to Mick (Q1)**, stated plainly. Mitigation: the token is used only for the body-less N1 nudge.
 - **agy_nas (native-ipc: agy row, outside rota):** verified as above. **Disposition:** adopted. The agy SessionStart hook registers conversationId, LS address and CSRF token, so the gateway gates tmux nudges on `runState` with no pane scraping. Prefer `agy acp` for gateway-owned agy, since it injects MCP per session with no config edits (solves agy tool identity).
 - **codex_nas R1 follow-up:** Codex 0.172 native `thread/queue/*` (StartIfIdle; upstream tests thread_queue.rs L787-859; `queue/list` verified read-only on a live NAS thread) → **adopted** in N2. Gated on version ≥0.172 plus the two-client TUI canary (Luna testing). Older Codex stays pull-only.
+
+### R2 claude_nas / Fable (1ea3367)
+1. [v] check_inbox text is forgeable → **accepted**: JSON with a router-set `from_human`. Also a live bug: fix in M0.
+2. Constant nudge, digits-only id, one un-acked nudge per conversation → **accepted**.
+3. [v] Token already in every child's env → **accepted**: Q1 reworded as a policy choice, not an escalation.
+4. [v] Token is per process; `/clear` changes sessionId → **accepted**: pre-nudge sessionId check, mail waits on mismatch.
+5. No token state file → **accepted**: memory only, re-learned from the SessionStart/UserPromptSubmit hooks; frame allowlist is `type:user` only.
+6. Channel notification is cleaner → **accepted** as Claude preference #1; token post for plain `claude`; doc URL cited.
