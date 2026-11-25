@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.0 draft**, entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v4.1** (after R1), entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -21,7 +21,7 @@ Discord ◄─► ROUTER (vps2, unchanged role: policy PR #9, claims, subs, regi
 Invariant **N1 (fixed nudge)**: an adapter only ever injects a fixed, non-imperative nudge
 (`[agent-bus] mail waiting (id <n>) — call check_inbox`). Message bodies and `from_human` travel only in the
 `check_inbox` tool result. Reason: native inject = user-authority input (Codex `UserInput`, opencode prompt).
-Invariant **N2 (queue unless idle)**: never inject into a busy turn; never `turn/steer`. Busy → queue, nudge on idle.
+Invariant **N2 (no racing the human)**: never `turn/steer`. An adapter may inject only where the agent's own input queue serializes it with human input (Claude inbox `priority:"next"` is queued by Claude itself between tool calls, or starts a turn when idle). Where that guarantee is missing (Codex/opencode TUIs a human owns), the thread is **pull-only**: mail waits for the agent's next check_inbox, and no check-then-send. That holds until an atomic idle-only admission exists.
 Invariant **N3 (exact identity)**: delivery target = native conversation id, never cwd/display name.
 
 ## 2. Adapters — evidence
@@ -45,15 +45,17 @@ nudges (test 3). Fallbacks in order: hook missing → tmux nudge; token rejected
 
 Agents keep an MCP entry, but it points at the **gateway**, not the router:
 - Claude: logic-free stdio pipe `agent-bus-pipe` → gateway socket (channels need stdio; tools only — wake is the inbox socket).
-- Codex: same pipe, or gateway loopback HTTP; identity from `_meta.threadId`, reject missing/mismatched.
+- Codex: same pipe, or gateway loopback HTTP. Identity comes from authenticated transport plus per-call `_meta.threadId`; a call missing it or mismatched is rejected. Parent and child threads under one daemon each bind separately, since a child spawning a second client with the same alias must not retire the parent (R1#2).
 - opencode/grok/agy: pipe; identity from gateway's launch record (gateway-owned) or bus-launch token.
 Gateway stamps `(host,user,kind,conv-id)` on every call to the router; router rejects node-secret-only calls.
 
 ## 4. Durability (fixes live router bugs found by codex_nas)
+Three distinct states per message, one stable msg id across reconnects: **committed** (router fsync) → **woken** (gateway nudge sent; losing this ack only costs a nudge) → **accepted** (recipient's check_inbox returned it and acked). Mail stays readable until accepted.
 Commit-before-ack on enqueue; lease by msg id on drain; ack only after recipient accepted; overflow is an
 error to the sender, never silent oldest-drop; uncertain inject → "unresolved", reconciled, never replayed blindly.
 
 ## 5. Controller
+Scope: a gateway controls only its own host. If the host is lost, its agents are gone too, and the router's durable mail is the cross-host continuity, so there is no standby gateway (R1#4 considered and rejected). Upgrades work by drain, then exec, and KeepAlive restarts it.
 The gateway is the never-down controller (KeepAlive/systemd --user). It (a) restarts dead agents in tmux session 0
 with their own conversation id, (b) never restarts itself or the shared Codex daemon to fix its own state,
 (c) applies upgrades by draining, then exec. Migration operator (an agent): ops-upgrader, restarts last.
@@ -64,9 +66,15 @@ native after the disposable race test). M4 grok/agy (ACP for gateway-owned, tmux
 Each step: disposable session test → one real agent → fleet; revert = restore old MCP entry.
 
 ## 7. Open questions for Mick
-Q1 SessionStart hook in user settings for all Claude sessions (needed for M1) — OK?
+Q1 SessionStart hook in user settings for all Claude sessions (needed for M1). **This deliberately lets the gateway skip the bypass-session hold for its fixed nudge**, using the session's own messaging token. The alternative is `crossSessionInbound: accept`, which opens the gate to every same-user sender, or living with the hold. The nudge carries no body (N1). Mick's security call. — OK?
 Q2 Relaunch grok/agy gateway-owned (ACP) instead of TUI, where no human uses that pane?
 Q3 nas642 node moves from root system unit to `systemd --user` (lingering) — OK?
 
 ## Critique log (v4)
 - **claude_nas (native-ipc: claude row, nas642 2.1.332, outside rota):** a persistent node-owned headless Claude (`-p --input-format stream-json`) can `SendMessage` to any idle TUI, including plain `claude`, with a 2 s wake. But it costs one model turn per wake (~$0.006 Haiku), and delivery is gated by permission-mode class (bypass→auto was held). `claude agents --json` (supported CLI) returns pid, sessionId, name, cwd, status without a TTY. **Disposition:** adopt `claude agents --json` as the Claude registry source. It beats parsing session files, but the per-call re-read stays. Keep the token-post adapter as primary: zero model cost, and test 3 delivered into bypass. A Haiku-child SendMessage is fallback #2 for sessions with no hook registration, before tmux.
+
+### R1 codex@nas642 (8c6517a)
+1. [v] Codex `turn/start` can steer an active turn, and check-then-send races typing → **accepted**: N2 rewritten; human-owned Codex/opencode threads are pull-only.
+2. [v] A child thread spawned a second MCP client with the same alias and retired the parent → **accepted**: bind on transport + `_meta.threadId`; parent/child plus same-cwd tests.
+3. [v] Enqueue lost on exit, removed before receipt → **accepted**: committed/woken/accepted states, stable id.
+4. Standby controller with fencing → **rejected**, with the scope argument in §5. "Don't borrow recipient credentials to turn a hold into acceptance" → **escalated to Mick (Q1)**, stated plainly. Mitigation: the token is used only for the body-less N1 nudge.
