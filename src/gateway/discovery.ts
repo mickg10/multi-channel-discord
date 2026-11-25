@@ -1,9 +1,12 @@
 import { constants } from 'node:fs'
-import { open } from 'node:fs/promises'
+import { open, realpath } from 'node:fs/promises'
+import { createConnection } from 'node:net'
 import { isAbsolute } from 'node:path'
-import { connectCodexUnix, supportedVersion } from './adapters/codex.js'
+import { connectCodexUnix, inspectSocket, sameSocket, supportedVersion } from './adapters/codex.js'
 import { openOpencodeListing, type OpencodeListingFetch } from './adapters/opencode.js'
 import type { Gateway } from './gateway.js'
+import { setCodexControlSocket } from './host.js'
+import { processIdentity, readPeer, type ProcessIdentity } from './peer-cred.js'
 import type { AgentRec } from './registry.js'
 import { assertAlias, identityKey } from './types.js'
 
@@ -19,7 +22,7 @@ export interface DiscoveryBinding {
 export type DiscoverySource = {
   id: string
 } & (
-  | { kind: 'codex'; controlSocket: string; pid: number }
+  | { kind: 'codex'; controlSocket: string; /** @deprecated Ignored. */ pid?: number }
   | { kind: 'opencode'; servicePath: string }
 )
 
@@ -36,6 +39,9 @@ export interface DiscoveryOptions {
   bindingsPath: string
   readConfig(signal: AbortSignal): DiscoveryConfig | Promise<DiscoveryConfig>
   connectCodex?: typeof connectCodexUnix
+  processIdentity?: typeof processIdentity
+  resolveCodexPeer?(path: string, signal: AbortSignal): ProcessIdentity | undefined | Promise<ProcessIdentity | undefined>
+  publishCodexSocket?: typeof setCodexControlSocket
   fetchOpencode?: OpencodeListingFetch
   intervalMs?: number
   deadlineMs?: number
@@ -102,9 +108,9 @@ function snapshot(value: unknown) {
         (kind !== 'codex' && kind !== 'opencode') || Object.hasOwn(source, 'bindings')) throw new Error()
     ids.add(id)
     if (kind === 'codex') {
-      const { controlSocket, pid } = source
-      if (!validPath(controlSocket) || !validPid(pid)) throw new Error()
-      return { id, kind, controlSocket, pid }
+      const { controlSocket } = source
+      if (!validPath(controlSocket)) throw new Error()
+      return { id, kind, controlSocket }
     }
     if (!validPath(source.servicePath)) throw new Error()
     return { id, kind, servicePath: source.servicePath }
@@ -231,6 +237,45 @@ async function readPage(response: Response, signal: AbortSignal, budget: { remai
   }
 }
 
+function requireIdentity(expected: ProcessIdentity, current: ProcessIdentity | undefined): void {
+  if (!current || expected.pid !== current.pid || expected.started !== current.started ||
+      expected.exe !== current.exe) throw new ListingFailure('unavailable')
+}
+
+async function resolveCodexPeer(path: string, signal: AbortSignal): Promise<ProcessIdentity | undefined> {
+  const before = await inspectSocket(path)
+  signal.throwIfAborted()
+  const socket = createConnection({ path: before.path })
+  const abort = () => socket.destroy()
+  signal.addEventListener('abort', abort, { once: true })
+  try {
+    const peer = await new Promise<ProcessIdentity | undefined>((resolve, reject) => {
+      socket.once('connect', () => {
+        try { resolve(readPeer(socket)) } catch (error) { reject(error) }
+      })
+      socket.once('error', reject)
+      socket.once('close', () => resolve(undefined))
+    })
+    signal.throwIfAborted()
+    if (!peer) return
+    const exe = await realpath(peer.exe)
+    const after = await inspectSocket(path)
+    signal.throwIfAborted()
+    if (socket.destroyed || !sameSocket(before, after)) return
+    return { pid: peer.pid, started: peer.started, exe }
+  } finally {
+    signal.removeEventListener('abort', abort)
+    socket.destroy()
+  }
+}
+
+type Inventory = {
+  source: DiscoverySource
+  result: SourceResult
+  process: ProcessIdentity
+  recheck(): Promise<void>
+}
+
 /** Serial discovery with a fresh config and native connection on each pass. */
 export class NativeDiscovery {
   private running = false
@@ -322,19 +367,23 @@ export class NativeDiscovery {
 
     const sources: SourceResult[] = []
     const incomplete = new Set<DiscoveryKind>()
-    const inventories = new Map<DiscoveryKind, Map<string, { pid: number; result: SourceResult } | null>>()
+    const inventories = new Map<DiscoveryKind, Map<string, Inventory | null>>()
+    const complete: Inventory[] = []
     const budget = { remaining: MAX_HTTP_BYTES }
     for (const source of config.sources) {
       check()
       try {
-        const { ids, pid } = await this.list(source, signal, budget)
+        const listing = await this.list(source, signal, budget)
+        const { ids } = listing
         check()
         const result: SourceResult = { sourceId: source.id, status: 'complete', unmapped: ids.size }
         sources.push(result)
+        const entry = { process: listing.process, recheck: listing.recheck, source, result }
+        complete.push(entry)
         const inventory = inventories.get(source.kind) ?? new Map()
         inventories.set(source.kind, inventory)
         for (const conv of ids) {
-          inventory.set(conv, inventory.has(conv) ? null : { pid, result })
+          inventory.set(conv, inventory.has(conv) ? null : entry)
         }
       } catch (error) {
         check()
@@ -343,18 +392,28 @@ export class NativeDiscovery {
       }
     }
 
+    // Recheck the inventories that establish both positive matches and uniqueness.
+    // Finish all asynchronous checks before the final process sweep and registry writes.
+    const candidateKinds = new Set(configuredBindings
+      .filter(({ kind, conv }) => !incomplete.has(kind) && inventories.get(kind)?.get(conv))
+      .map(({ kind }) => kind))
+    const candidates = complete.filter(({ source }) => candidateKinds.has(source.kind))
+    const checked = await Promise.allSettled(candidates.map(entry => entry.recheck()))
+    check()
+    const staleKinds = new Set<AgentRec['kind']>()
+
     // Preflight the entire pass before mutating the registry. A retained alias
     // owns its identity even if its binding or source disappeared.
     const existing = new Map(gateway.registry.list().map(rec => [identityKey(rec), rec]))
     const plan = configuredBindings.map(({ alias, kind, conv, pid: explicitPid }): {
-      outcome: BindingResult; registration?: AgentRec
+      outcome: BindingResult; target?: AgentRec; controlSocket?: string
     } => {
       const outcome = (status: BindingResult['status']) => ({ outcome: { alias, status } })
       const match = inventories.get(kind)?.get(conv)
       const current = gateway.registry.byAlias(alias)
       const identity = identityKey({ kind, host, user, alias, conv })
       const owner = existing.get(identity)
-      if (match === null || (match && explicitPid !== undefined && explicitPid !== match.pid) ||
+      if (match === null || (match && explicitPid !== undefined && explicitPid !== match.process.pid) ||
           (owner && owner.alias !== alias) ||
           (current && (current.kind !== kind || current.host !== host || current.user !== user))) {
         return outcome('conflict')
@@ -363,37 +422,86 @@ export class NativeDiscovery {
       if (!match) return outcome('not_listed')
       match.result.unmapped--
       const transport = kind === 'codex' ? 'codex-queue' : 'opencode-queue'
-      if (current && identityKey(current) === identity && current.pid === match.pid && current.transport === transport) {
-        return outcome('unchanged')
+      const { pid, started } = match.process
+      const target: AgentRec = { alias, conv, kind, host, user, pid, started, transport }
+      const controlSocket = match.source.kind === 'codex' ? match.source.controlSocket : undefined
+      if (current && identityKey(current) === identity && current.pid === pid &&
+          current.started === started && current.transport === transport) {
+        return { ...outcome('unchanged'), target, controlSocket }
       }
       return {
         ...outcome('blocked'),
-        registration: { alias, conv, kind, host, user, pid: match.pid, transport },
+        target,
+        controlSocket,
       }
     })
     check()
-    const conflict = plan.some(({ outcome }) => outcome.status === 'conflict')
-    const bindings = plan.map(({ outcome, registration }): BindingResult => {
-      if (!registration || conflict) return outcome
-      check()
+    for (const [index, entry] of candidates.entries()) {
       try {
-        gateway.registerAgent(registration)
-        return { alias: outcome.alias, status: 'registered' }
+        if (checked[index].status === 'rejected') throw new ListingFailure('unavailable')
+        requireIdentity(entry.process, this.lookupProcess(entry.process.pid))
       } catch {
-        return { alias: outcome.alias, status: 'registration_failed' }
+        staleKinds.add(entry.source.kind)
+        entry.result.status = 'unavailable'
+        entry.result.unmapped = 0
       }
+    }
+    check()
+    const conflict = plan.some(({ outcome }) => outcome.status === 'conflict')
+    const publish = this.options.publishCodexSocket ?? setCodexControlSocket
+    const bindings = plan.map(({ outcome, target, controlSocket }): BindingResult => {
+      if (!target) return outcome
+      if (staleKinds.has(target.kind)) return { alias: outcome.alias, status: 'incomplete' }
+      if (conflict || staleKinds.size > 0) return outcome
+      if (outcome.status === 'blocked') {
+        try {
+          gateway.registerAgent(target)
+          outcome = { alias: outcome.alias, status: 'registered' }
+        } catch {
+          return { alias: outcome.alias, status: 'registration_failed' }
+        }
+      }
+      const current = gateway.registry.byAlias(outcome.alias)
+      if (controlSocket && current && identityKey(current) === identityKey(target) &&
+          current.pid === target.pid && current.started === target.started && current.transport === target.transport) {
+        publish(target.conv, controlSocket)
+      }
+      return outcome
     })
     return { status: 'finished', sources, bindings }
+  }
+
+  private lookupProcess(pid: number): ProcessIdentity | undefined {
+    if (!validPid(pid)) return
+    const identity = (this.options.processIdentity ?? processIdentity)(pid)
+    if (identity?.pid === pid && identity.started && isAbsolute(identity.exe)) return { ...identity }
   }
 
   private async list(source: DiscoverySource, signal: AbortSignal, budget: { remaining: number }) {
     if (source.kind === 'opencode') {
       const listing = await openOpencodeListing(source.servicePath, signal, this.options.fetchOpencode)
       if (!listing) throw new ListingFailure('unavailable')
+      const process = this.lookupProcess(listing.pid)
+      if (!process) throw new ListingFailure('unavailable')
+      const recheck = async () => {
+        if (!await listing.isCurrent()) throw new ListingFailure('unavailable')
+        requireIdentity(process, this.lookupProcess(process.pid))
+      }
       const ids = await listPages(source.kind, async cursor => readPage(await listing.page(cursor), signal, budget),
         signal, this.maxPages)
-      return { ids, pid: listing.pid }
+      await recheck()
+      return { ids, process, recheck }
     }
+    const probe = async () => {
+      const peer = await (this.options.resolveCodexPeer ?? resolveCodexPeer)(source.controlSocket, signal)
+      signal.throwIfAborted()
+      const identity = peer && this.lookupProcess(peer.pid)
+      if (!peer || !identity) throw new ListingFailure('unavailable')
+      requireIdentity(peer, identity)
+      return identity
+    }
+    const process = await probe()
+    const recheck = async () => requireIdentity(process, await probe())
     const connect = this.options.connectCodex ?? connectCodexUnix
     const rpc = await connect(source.controlSocket, signal)
     let closed = false
@@ -414,7 +522,8 @@ export class NativeDiscovery {
       const ids = await listPages(source.kind, cursor => rpc.request('thread/loaded/list', {
         limit: 50, ...(cursor === undefined ? {} : { cursor }),
       }), signal, this.maxPages)
-      return { ids, pid: source.pid }
+      await recheck()
+      return { ids, process, recheck }
     } finally {
       signal.removeEventListener('abort', close)
       close()

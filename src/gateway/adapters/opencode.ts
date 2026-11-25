@@ -60,6 +60,12 @@ export async function openOpencodeListing(path: string, signal: AbortSignal, fet
   if (!service || typeof service.pid !== 'number' || !Number.isSafeInteger(service.pid) || service.pid <= 0) return
   return {
     pid: service.pid,
+    async isCurrent() {
+      const current = await readService(path)
+      signal.throwIfAborted()
+      return current !== undefined && current.pid === service.pid && current.origin === service.origin &&
+        current.authorization === service.authorization
+    },
     page(cursor?: string) {
       signal.throwIfAborted()
       const url = new URL('/api/session', service.origin)
