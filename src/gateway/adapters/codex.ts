@@ -32,6 +32,7 @@ class ProtocolError extends Error {}
 
 const DEADLINE_MS = 5_000;
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+// Exceeding these read budgets leaves recovery uncertain; the gateway retains mail.
 const MAX_SESSION_BYTES = 4 * MAX_MESSAGE_BYTES;
 const MAX_PAGES = 128;
 const PAGE_SIZE = 50;
