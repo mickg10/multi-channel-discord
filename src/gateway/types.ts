@@ -42,9 +42,16 @@ export function redactFrame(frame: GatewayToRouterMessage): GatewayToRouterMessa
   return frame
 }
 
-const ALIAS = /^[a-z0-9_-]+@[a-z0-9.-]+:[a-z0-9_.-]+$/i
+/** Router `registerAgent` charset. `-` is literal at the start of the class. */
+const ALIAS = /^[-\w.@:/]+$/
 
-/** Same shape the router accepts: `<kind>@<host>:<suffix>`. */
-export function assertAlias(kind: Kind, host: string, alias: string): void {
-  if (!ALIAS.test(alias) || !alias.startsWith(`${kind}@${host}:`)) throw new Error('invalid alias')
+/**
+ * Same alias predicate as router `registerAgent`.
+ * Fleet names are kept verbatim: `codex@nas642` has no conv suffix, and
+ * `opencode_nas642_glm53_abli` has no `@`. When `@` is present, the host
+ * before `:` must be this gateway. `kind` is not encoded in those names.
+ */
+export function assertAlias(_kind: Kind, host: string, alias: string): void {
+  if (!ALIAS.test(alias)) throw new Error('invalid alias')
+  if (alias.includes('@') && alias.split('@')[1]?.split(':')[0] !== host) throw new Error('invalid alias')
 }

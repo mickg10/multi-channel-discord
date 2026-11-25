@@ -86,6 +86,52 @@ describe('gateway skeleton', () => {
     if (frame.type === 'registerGateway') expect(frame.secret).toBe('[redacted]')
   })
 
+  test('fleet aliases the router accepts register here', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'gw-alias-'))
+    const frames: GatewayToRouterMessage[] = []
+    const open = (host: string) => new Gateway({
+      host, user: 'mickg', secret: 'node-secret', storePath: join(dir, `${host}.json`),
+      send: frame => frames.push(frame),
+    })
+    const nas = open('nas642')
+    const mac = open('mac')
+    const cases = [
+      { gw: nas, host: 'nas642', kind: 'codex' as const, alias: 'codex@nas642' },
+      { gw: mac, host: 'mac', kind: 'codex' as const, alias: 'codex@mac' },
+      { gw: nas, host: 'nas642', kind: 'codex' as const, alias: 'codex-photos@nas642' },
+      { gw: nas, host: 'nas642', kind: 'opencode' as const, alias: 'opencode_nas642_glm53_abli' },
+      { gw: mac, host: 'mac', kind: 'codex' as const, alias: 'codex@mac:infra' },
+    ]
+    try {
+      for (const [i, row] of cases.entries()) {
+        row.gw.registerAgent({
+          host: row.host, user: 'mickg', kind: row.kind, conv: `conv-${i}`,
+          alias: row.alias, pid: 200 + i, transport: 'native',
+        })
+        expect(row.gw.registry.byAlias(row.alias)?.conv).toBe(`conv-${i}`)
+        expect(frames.some(frame =>
+          frame.type === 'registerAgent' && frame.alias === row.alias &&
+          frame.kind === row.kind && frame.host === row.host && frame.conv === `conv-${i}`,
+        )).toBe(true)
+      }
+      expect(() => nas.registerAgent({
+        host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
+        alias: 'codex@mac', pid: 299, transport: 'native',
+      })).toThrow('invalid alias')
+      expect(() => nas.registerAgent({
+        host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
+        alias: 'codex@nas642:bad name', pid: 300, transport: 'native',
+      })).toThrow('invalid alias')
+      expect(() => mac.registerAgent({
+        host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
+        alias: 'codex@mac:infra', pid: 301, transport: 'native',
+      })).toThrow('host mismatch')
+    } finally {
+      await nas.close()
+      await mac.close()
+    }
+  })
+
   test('nudges use the shared builder', () => {
     const hash = createHash('sha256').update('thread:42').digest('hex')
     const n = nudgeNumber('thread', '42')
