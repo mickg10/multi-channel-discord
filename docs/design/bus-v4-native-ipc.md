@@ -1,7 +1,7 @@
 # Agent bus v4: native IPC, one gateway per host
 
 Owner/leader: claude@mac:ops-tmux-fixer (Opus 5.5). Baseline: v3 + critique log in `bus-v3-critique-log-ops-upgrader.md`.
-Status: **v4.4** (after R4), entering 10 critique rounds (#bus-v3). Nothing built.
+Status: **v4.5** (after R5), entering 10 critique rounds (#bus-v3). Nothing built.
 Goal (Mick 2026-11-25 16:12): use each agent's *native* IPC wherever possible; tmux only as fallback; one always-up controller.
 
 ## 1. Shape
@@ -59,7 +59,7 @@ Agents keep an MCP entry, but it points at the **gateway**, not the router:
 Gateway stamps `(host,user,kind,conv-id)` on every call to the router; router rejects node-secret-only calls.
 
 ## 4. Durability (fixes live router bugs found by codex_nas)
-Three distinct states per message, one stable msg id across reconnects: **committed** (router fsync) → **woken** (gateway nudge sent; losing this ack only costs a nudge) → **accepted** (recipient's check_inbox returned it and acked). Mail stays readable until accepted.
+Per message, one stable msg id across reconnects: **committed** (router fsync, synchronous) → **woken** (a native ack such as Codex queue/add or opencode prompt means the *adapter's nudge was admitted*, not that mail was read) → **accepted** (the recipient's `check_inbox` returned it and acked). Terminal side-states: **held / refused / uncertain**, operator-visible, mail still readable, no fallback (N4). Implementation is a **focused Inboxes and protocol refactor**, not a router rewrite (R5#3). It needs a synchronous atomic commit, entries with id, state and lease, a lease/ACK on drain, wake attempt and ACK records, restart recovery, and overflow surfaced to the sender instead of dropping at 501.
 Commit-before-ack on enqueue; lease by msg id on drain; ack only after recipient accepted; overflow is an
 error to the sender, never silent oldest-drop; uncertain inject → "unresolved", reconciled, never replayed blindly.
 
@@ -70,8 +70,11 @@ The gateway is the never-down controller (KeepAlive/systemd --user). It (a) rest
 with their own conversation id, (b) never restarts itself or the shared Codex daemon to fix its own state,
 (c) applies upgrades by draining, then exec. Migration operator (an agent): ops-upgrader, restarts last.
 
+## 5b. Codex RPC contract (pinned, R5#2)
+`initialize{capabilities.experimentalApi:true}` → version and capability allowlist (≥0.170; `thread/queue/add` present) → `thread/queue/add{threadId, input:[fixed nudge], clientUserMessageId}` and **nothing else**. Reconcile with `thread/queue/list` plus `thread/read{includeTurns:true, itemsView:"full"}`, paged to `nextCursor:null`, matching `clientUserMessageId` / `userMessage.clientId`. `clientUserMessageId` = hash(recipient threadId, bus msg id), immutable. The control socket must be owned by the user (stat check), mode 0600.
+
 ## 6. Migration (per kind, old client stopped in the same step its adapter goes live)
-M0 gateway + durability + JSON check_inbox, no adapters, **no tmux restarts**. M1 Claude (hook + inbox socket). M2 opencode. M3 Codex (queue+nudge first,
+M0 gateway + Inboxes refactor + JSON check_inbox, no adapters, **no tmux restarts**. Build order (R5#5): M0, then **Codex (Mac) and opencode in parallel**, since both have passing canaries and opencode's tmux wake is broken today. Then Claude (after Q1), then agy/grok. No generic adapter framework or status UI: a minimal `Adapter{probe, wake, reconcile}` interface only. M1 Claude (hook + inbox socket). M2 opencode. M3 Codex (queue+nudge first,
 native after the disposable race test). M4 grok/agy: ACP for gateway-owned. Live grok TUIs are pull-only (tmux repeats the stuck-composer bug) until a disposable leader-mode test passes. Live agy TUIs use the tmux nudge gated on runState. CFD sessions are excluded throughout. Gates: M1 needs Q1, The M2 identity gate has passed. The idempotency and busy-ordering gate has also **passed** (codex_nas 16:48, isolated 2.0.18). The same caller `msg_…` id gives one pending item that is never merged into the busy turn, dispatches once, and is still deduped after dispatch and after a service restart. **Caution:** a changed body that reuses an id returns success but keeps the original, so the id is derived from an immutable (recipient, nudge) pair and success is never read as "this text accepted". Remaining M2 gate: visual rendering in an attached TUI. M5 retire plugin.ts ws client.
 Each step: disposable session test → one real agent → fleet; revert = restore old MCP entry.
 
@@ -120,3 +123,10 @@ GLM may still post R3 critique; it will be appended.
 - **codex_nas:** opencode visual-TUI canary blocked on nas642 by inotify ENOSPC. Leader found the cause: the live opencode service (pid 2218368, `serve --service` under the GLM TUI) holds **65,147 of the user's 65,536 inotify watches**, since it watches the whole `~/src` tree. **Disposition:** run the visual canary on the Mac. Deployment note for M2: the gateway must not depend on file watches, and opencode's watch use is a host-capacity risk (Mick: raise `fs.inotify.max_user_watches` or scope opencode's root).
 - **codex_nas:** held/refused must stop the fallback chain → **adopted** as N4. If Mick declines Q1, the Claude transport is the gateway's own sender identity (subject to the hold) or the configured channel.
 - **codex_nas opencode permission test (2.0.18, disposable):** a consent-gated tool request triggered by a queued prompt reached only the addressed session, not its same-directory neighbour. Zero executions before or after the owner rejected it. **Adopted:** the opencode adapter is enqueue plus read-only reconcile only. It never calls `/permission/*/reply`, `/shell`, `/command` or `/synthetic` (code-review blocker, same as the Claude frame allowlist).
+
+### R5 codex@mac:infra (26adb9e+)
+1. [v] Codex path buildable on 0.172 → confirmed.
+2. Pin the RPC contract → **accepted**: §5b.
+3. [v] Current Inboxes can't represent the states → **accepted**: focused refactor, scoped in §4.
+4. Define "accepted" → **accepted**: native ack = woken; accepted = recipient check_inbox ack.
+5. Fastest path → **partly accepted**: no generic framework or UI. Codex and opencode run in parallel rather than Codex alone, because opencode is equally proven and broken in production today.
