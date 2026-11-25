@@ -1,4 +1,5 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { buildNudge, type Target } from "../types.js";
@@ -306,8 +307,8 @@ async function canListenOnUnix() {
   }
 }
 
-test.skipIf(!(await canListenOnUnix()))("disposable WebSocket supports managed links and rejects unsafe sockets and links", async () => {
-  const dir = await mkdtemp("/tmp/codex-adapter-");
+test.skipIf(!(await canListenOnUnix()))("disposable WebSocket supports managed links when socket realpath is unsupported", async () => {
+  const dir = await fs.realpath(await mkdtemp("/tmp/codex-adapter-"));
   const path = join(dir, "rpc.sock");
   const registration = join(dir, "registration");
   const seen: string[] = [];
@@ -370,7 +371,27 @@ test.skipIf(!(await canListenOnUnix()))("disposable WebSocket supports managed l
     expect(await adapter.wake(target, nudge)).toEqual({ s: "unavailable" });
     expect(seen).toEqual([]);
     mode = "success";
-    expect(await linkAdapter.wake(target, nudge)).toEqual({ s: "woken", nativeId: "queued" });
+    const filesystem: { realpath(path: string): Promise<string> } = fs;
+    const originalRealpath = filesystem.realpath;
+    const realpathSpy = spyOn(filesystem, "realpath").mockImplementation(async candidate => {
+      if (candidate === path || candidate === link) {
+        throw Object.assign(new Error("socket realpath is unsupported"), { code: "EOPNOTSUPP" });
+      }
+      return originalRealpath(candidate);
+    });
+    try {
+      await expect(fs.realpath(path)).rejects.toMatchObject({ code: "EOPNOTSUPP" });
+      realpathSpy.mockClear();
+      expect(await linkAdapter.probe(target)).toEqual({ ok: true });
+      const inspection = [registration, dir, dir];
+      expect(realpathSpy.mock.calls.map(([candidate]) => candidate)).toEqual([...inspection, ...inspection]);
+      expect(await linkAdapter.wake(target, nudge)).toEqual({ s: "woken", nativeId: "queued" });
+      realpathSpy.mockClear();
+      expect(await linkAdapter.wake(target, { ...nudge, text: "forged notice" })).toEqual({ s: "refused" });
+      expect(realpathSpy).not.toHaveBeenCalled();
+    } finally {
+      realpathSpy.mockRestore();
+    }
     expect(await adapter.wake(target, nudge)).toEqual({ s: "woken", nativeId: "queued" });
     mode = "malformed";
     expect(await adapter.wake(target, nudge)).toEqual({ s: "uncertain" });
@@ -381,7 +402,7 @@ test.skipIf(!(await canListenOnUnix()))("disposable WebSocket supports managed l
     mode = "disconnect";
     expect(await adapter.wake(target, nudge)).toEqual({ s: "uncertain" });
     const exchange = ["initialize", "initialized", "thread/queue/list", "thread/queue/add"];
-    expect(seen).toEqual([...exchange, ...exchange, ...exchange, ...exchange, ...exchange, ...exchange]);
+    expect(seen).toEqual([...exchange.slice(0, 3), ...exchange, ...exchange, ...exchange, ...exchange, ...exchange, ...exchange]);
   } finally {
     await server.stop(true);
     await rm(dir, { recursive: true, force: true });

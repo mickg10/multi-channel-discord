@@ -1,5 +1,5 @@
 import { lstat, readlink, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, normalize, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import type { Adapter, Target, Nudge, WakeResult } from "../../types.js";
 
 // The gateway/router owns durable single-flight and attempt persistence.
@@ -87,9 +87,11 @@ async function inspectSocket(registeredPath: string) {
   }
 
   // Prevent address truncation and reject any further symlink in the resolved path.
+  // Bun on macOS cannot realpath the socket itself.
   const pathLimit = process.platform === "linux" ? 107 : 103;
   if (Buffer.byteLength(path) > pathLimit || !socket.isSocket() || socket.uid !== BigInt(uid) ||
-      (socket.mode & 0o7777n) !== 0o600n || await realpath(path) !== path) {
+      (socket.mode & 0o7777n) !== 0o600n ||
+      join(await realpath(dirname(path)), basename(path)) !== path) {
     throw new Unavailable();
   }
   return { path, identities: [registrationParent, entry, socketParent, socket] };
