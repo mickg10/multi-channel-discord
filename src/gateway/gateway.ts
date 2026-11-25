@@ -257,11 +257,11 @@ function toWake(row: Attempt): WakeResult {
   return { s: 'uncertain' }
 }
 
-/** Create the socket directory at 0700 when this process owns it. Never chmod a directory owned by someone else. */
+/** Create the socket directory at 0700. A directory owned by another user refuses startup and is not chmod'd. */
 function privateDir(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 })
-  if (process.getuid === undefined) return
-  if (statSync(path).uid !== process.getuid()) return
+  if (process.getuid === undefined) throw new Error('no uid')
+  if (statSync(path).uid !== process.getuid()) throw new Error('directory is owned by another user')
   chmodSync(path, 0o700)
 }
 

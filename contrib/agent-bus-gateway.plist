@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- User agent. Install in ~/Library/LaunchAgents. Do not install from a draft PR.
-     KeepAlive restarts it. Core 0 is ulimit -c 0. No UserName: a LaunchAgent runs as the login user. -->
+     KeepAlive restarts it. Core 0 is ulimit -c 0. No UserName: a LaunchAgent runs as the login user.
+     Install the compiled pipe at ~/.local/libexec/agent-bus/agent-bus-pipe. That directory is
+     mode 0700 and owned by the user. pipePath in gateway.json points at that file. Do not put
+     the pipe in a directory other users can write, such as /tmp or /usr/local/bin. -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
