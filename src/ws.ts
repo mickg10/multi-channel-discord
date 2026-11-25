@@ -19,8 +19,8 @@ import type { WsMcpOp, PluginToRouterMessage, WsRegistered, WsRenamed, WsError, 
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
-import { identityKey, type Inboxes, type InboxEntry } from './inboxes.js'
-import { nudgeText, type GatewayToRouterMessage, type Kind, type PublishResult, type Target, type WakeResult } from './types.js'
+import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
+import type { GatewayToRouterMessage, Kind, PublishResult, Target, WakeResult } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
 import { orderByCost, resolveExact, type Activity, type Conversations, type CostClasses, type HumanMail, type Unread, type WakeBudget, type WakeLog } from './wake.js'
@@ -171,9 +171,10 @@ function admission(deps: Readonly<WsDeps>, name: string, meta: ChannelMeta): Cha
   const conv = target?.conv ?? deps.conversations?.get(name) ?? (!live ? deps.inboxes?.conversation(name) : undefined)
   if (!target && !live && !node && !conv) return undefined
   if (meta.conversation_id && target && meta.conversation_id !== target.conv) return undefined
-  return conv ? { ...meta, conversation_id: conv } : meta
+  return conv && (target || (meta.from_human === 'true' && meta.question_id)) ? { ...meta, conversation_id: conv } : meta
 }
 
+// Legacy push has no recipient receipt. A successful transport send is its acceptance point.
 function pushLegacy(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): void {
   try {
     if (!deps.sessions.routeToSession(name, entry.content, { ...entry.meta, queued_at: entry.at, bus_msg_id: entry.id })) return
@@ -192,12 +193,11 @@ function wakeNative(deps: Readonly<WsDeps>, target: Target, entry: InboxEntry, r
   const ws = nativeConnection(inboxes, target)
   if (!ws || identityKey(target) !== entry.key) return
   if (reconcile ? entry.state !== 'uncertain' : entry.state !== 'committed') return
-  if (!reconcile) inboxes.mark(entry.key, entry.id, { s: 'uncertain' })
-  const hash = createHash('sha256').update(target.conv + ':' + entry.id).digest('hex')
-  const clientId = target.kind === 'opencode' ? 'msg_bus' + hash.slice(0, 24) : 'bus-' + hash.slice(0, 32)
+  const attempt = entry.nudgeNumber === undefined
+    ? inboxes.mark(entry.key, entry.id, { s: 'uncertain' }) : entry
   try {
     ws.send(JSON.stringify({
-      type: 'wake', as: target.alias, nudge: { msgId: entry.id, text: nudgeText(Number.parseInt(hash.slice(0, 13), 16)), clientId },
+      type: 'wake', as: target.alias, msgId: entry.id, n: attempt.nudgeNumber,
       ...(reconcile && { reconcile: true }),
     }))
   } catch {
@@ -217,13 +217,14 @@ function transport(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): voi
   const cold = !!target || !live
   if (target) {
     if (!nativeConnection(deps.inboxes!, target) || entry.state !== 'committed' ||
-        deps.inboxes!.list(entry.key).some(message => message.state === 'uncertain' || message.state === 'woken')) return
+        deps.inboxes!.wakePending(entry.key)) return
   } else if (!live && !deps.nodes?.get(name)) return
   if (cold && !allowsWake(deps, name, entry.meta)) return
   const pending = deps.inboxes?.count(name) ?? 0
   if (target) wakeNative(deps, target, entry)
   else if (live && !pullSessions.has(name)) {
-    if (entry.meta.conversation_id && entry.meta.conversation_id !== deps.conversations?.get(name)) return
+    if (entry.meta.from_human === 'true' && entry.meta.question_id && entry.meta.conversation_id &&
+        entry.meta.conversation_id !== deps.conversations?.get(name)) return
     pushLegacy(deps, name, entry)
   } else if (!live) deps.nodes?.wake(name, pending)
   deps.wakeLog?.record({ name, messageId: entry.meta.message_id, pending, cold, at: Date.now() })
@@ -234,8 +235,22 @@ export function deliver(deps: Readonly<WsDeps>, name: string, text: string, meta
   if (!stamped) return false
   if (!deps.inboxes) return deps.sessions.routeToSession(name, text, stamped)
   const [entry] = deps.inboxes.commit([{ name, content: text, meta: stamped, ...(target && { target }) }])
+  logCommit(deps, name, entry!)
   transport(deps, name, entry!)
   return true
+}
+
+function logCommit(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): void {
+  const target = deps.inboxes?.target(name)
+  let path = 'inbox'
+  if (target) {
+    if (identityKey(target) === entry.key && nativeConnection(deps.inboxes!, target)) path = 'node'
+  } else if (liveSession(deps, name)) {
+    if (!pullSessions.has(name)) path = 'push'
+  } else if (deps.nodes?.get(name)) path = 'node'
+  const safe = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, '?')
+  const from = entry.meta.from ?? entry.meta.user ?? 'unknown'
+  process.stderr.write(`deliver ${entry.id} ${safe(from)} -> ${safe(entry.key)} state=${entry.state} path=${path}\n`)
 }
 
 function sendRulesOnce(deps: Readonly<WsDeps>, name: string): void {
@@ -295,6 +310,7 @@ function forwardMcpExec(ws: WsLike, clientRequestId: string, decl: McpServerDecl
 export interface WsLike {
   data: WsData
   send(msg: string): void
+  close?(): void
 }
 
 export interface WsHandlers {
@@ -311,7 +327,7 @@ async function fetchTextChannelOrNull(client: Client, channelId: string): Promis
 }
 
 export function inboxError(err: unknown): string {
-  return err instanceof Error && /^(inbox_full|inbox_commit_failed|invalid_receipt|unknown_message|invalid_wake_transition|wake_already_pending)$/.test(err.message)
+  return err instanceof Error && /^(inbox_full|inbox_commit_failed|invalid_receipt|unknown_message|invalid_wake_transition|wake_already_pending|publish_payload_mismatch)$/.test(err.message)
     ? err.message : 'request_failed'
 }
 
@@ -421,7 +437,13 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     }
     ws.data.nodeName = frame.host
     ws.data.gateway = { user: frame.user, agents: new Map() }
+    const previous = hosts.get(frame.host)
     hosts.set(frame.host, ws)
+    if (previous) {
+      try { previous.send(JSON.stringify({ type: 'replaced', name: frame.host })) } catch {}
+      try { previous.close?.() } catch {}
+      process.stderr.write(`Replaced gateway connection for ${frame.host}\n`)
+    }
     ws.send(JSON.stringify({ type: 'gatewayRegistered', host: frame.host, user: frame.user, proto: 1 }))
     reply(true, '{}')
     return
@@ -432,8 +454,9 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
   if (frame.type === 'registerAgent') {
     if (!GATEWAY_KINDS.has(frame.kind) || typeof frame.conv !== 'string' || !frame.conv.trim() ||
         typeof frame.alias !== 'string' || (frame.host !== undefined && frame.host !== host) ||
-        !/^[a-z0-9_-]+@[a-z0-9.-]+:[a-z0-9_.-]+$/i.test(frame.alias) ||
-        !frame.alias.startsWith(`${frame.kind}@${host}:`)) {
+        !/^[-\w.@:/]+$/.test(frame.alias) ||
+        (frame.alias.includes('@') && frame.alias.split('@')[1]?.split(':')[0] !== host) ||
+        (deps.nodes?.get(frame.alias) && deps.nodes.get(frame.alias)?.node !== host)) {
       reply(false, 'invalid_agent_registration')
       return
     }
@@ -460,6 +483,18 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
       else if (entry.state === 'committed' && (!entry.lease || entry.lease.until <= Date.now())) transport(deps, frame.alias, entry)
     }
     sendRulesOnce(deps, frame.alias)
+    deps.onSessionChange?.()
+    return
+  }
+  if (frame.type === 'releaseAgent') {
+    const target = typeof frame.alias === 'string' ? inboxes.target(frame.alias) : undefined
+    if (target?.host !== host || target.user !== gateway.user) { reply(false, 'invalid_as'); return }
+    inboxes.release(frame.alias)
+    gateway.agents.delete(frame.alias)
+    deps.conversations?.set(frame.alias, '')
+    ws.send(JSON.stringify({ type: 'agentReleased', alias: frame.alias }))
+    reply(true, '{}')
+    deps.onSessionChange?.()
     return
   }
   const target = 'as' in frame && typeof frame.as === 'string' ? gateway.agents.get(frame.as) : undefined
@@ -528,7 +563,7 @@ function agentStatus(deps: Readonly<WsDeps>, name: string) {
 }
 
 function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readonly<WsDeps>): void {
-  if (ws.data.gateway || ['registerGateway', 'registerAgent', 'lease', 'ack', 'mark', 'wakeResult'].includes(parsed.type)) {
+  if (ws.data.gateway || ['registerGateway', 'registerAgent', 'releaseAgent', 'lease', 'ack', 'mark', 'wakeResult'].includes(parsed.type)) {
     handleGateway(ws, parsed as GatewayToRouterMessage, deps)
     return
   }
@@ -613,8 +648,9 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       if (!who) { sendToolResult(ws, parsed.requestId, false, 'not registered'); return }
       if (parsed.type === 'inboxCount') sendToolResult(ws, parsed.requestId, true, String(deps.inboxes?.count(who) ?? 0))
       else {
-        // Directed mail only. Old clients get a bare array. withUnread adds a count of
-        // passive chatter and never the bodies.
+        // Legacy check_inbox keeps its bare array or {messages, unread} format and
+        // accepts mail on a successful push or pull result. Gateway aliases use
+        // structured leases and an echoed receipt instead.
         const bound = deps.conversations ? (deps.conversations.get(who) ?? null) : undefined
         const entries = deps.inboxes?.legacy(who, bound) ?? []
         const messages = entries.map(({ content, meta, at }) => ({ content, meta, at }))
@@ -915,11 +951,11 @@ function handleReact(chatId: string, messageId: string, emoji: string, deps: Rea
   })()
 }
 
-async function sendToDiscordAwait(client: Client, chatId: string, text: string, files?: readonly DiscordFile[]): Promise<string | undefined> {
+async function sendToDiscordAwait(client: Client, chatId: string, text: string, files?: readonly DiscordFile[], nonce?: string): Promise<string | undefined> {
   try {
     const ch = await fetchTextChannelOrNull(client, chatId)
     if (!ch || !('send' in ch)) return undefined
-    const sent = await ch.send({ content: text, ...(files?.length ? { files: [...files] } : {}) })
+    const sent = await ch.send({ content: text, ...(files?.length && { files: [...files] }), ...(nonce && { nonce, enforceNonce: true }) })
     noteSent(sent.id)
     return sent.id
   } catch {
@@ -1305,23 +1341,82 @@ async function handleChannelPost(ws: WsLike, ref: string, text: string, to: stri
   postToChannel(ws, ch.id, ch.name, text, to, deps, files)
 }
 
+const mirrorAttempts = new WeakMap<Inboxes, Map<string, {
+  fingerprint: string
+  result: Promise<string | undefined>
+}>>()
+
+function mirrorFingerprint(text: string, files?: readonly DiscordFile[]): string {
+  const hash = createHash('sha256').update(JSON.stringify([text, (files ?? []).map(file => [file.name, file.attachment.length])]))
+  for (const file of files ?? []) hash.update(file.attachment)
+  return hash.digest('hex')
+}
+
+function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: string, files: DiscordFile[] | undefined, attemptKey: string): Promise<string | undefined> {
+  const inboxes = deps.inboxes
+  let attempts = inboxes ? mirrorAttempts.get(inboxes) : undefined
+  if (inboxes && !attempts) { attempts = new Map(); mirrorAttempts.set(inboxes, attempts) }
+  const inFlight = attempts?.get(attemptKey)
+  if (inFlight) {
+    if (inFlight.fingerprint !== plan.fingerprint) return Promise.reject(new Error('publish_payload_mismatch'))
+    return inFlight.result
+  }
+  let expired = false
+  let deadline: number | ReturnType<typeof setTimeout>
+  const timeout = new Promise<undefined>(resolve => {
+    deadline = setTimeout(() => { expired = true; resolve(undefined) }, 2_000)
+  })
+  const chunks = chunk(`**[${plan.from} → ${plan.label}]**${plan.origin} ${text}`, deps.chunkLimit, deps.chunkMode)
+  const send = async () => {
+    let first: string | undefined
+    for (const [index, content] of chunks.entries()) {
+      if (expired) return undefined
+      const nonce = createHash('sha256').update(JSON.stringify([attemptKey, index])).digest('hex').slice(0, 25)
+      const messageId = await sendToDiscordAwait(deps.client, plan.where, content, index === 0 ? files : undefined, nonce)
+      if (!messageId) return undefined
+      first ??= messageId
+    }
+    return first
+  }
+  const attempt = Promise.race([send(), timeout]).finally(() => {
+    clearTimeout(deadline)
+    attempts?.delete(attemptKey)
+  })
+  attempts?.set(attemptKey, { fingerprint: plan.fingerprint, result: attempt })
+  return attempt
+}
+
 function postToChannel(ws: WsLike, channelId: string, channelName: string | undefined, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[], publish?: { requestId?: string; publish_id?: string }, sender?: Target): void {
   const from = ws.data.sessionName!
   const requestId = typeof publish?.requestId === 'string' ? publish.requestId : undefined
   const reply = (ok: boolean, data: string) => {
-    if (requestId) sendToolResult(ws, requestId, ok, data)
-    else if (!ok) sendError(ws, data)
-    else if (publish) ws.send(JSON.stringify({ type: 'published', ...JSON.parse(data) }))
+    try {
+      if (requestId) sendToolResult(ws, requestId, ok, data)
+      else if (!ok) sendError(ws, data)
+      else if (publish) ws.send(JSON.stringify({ type: 'published', ...JSON.parse(data) }))
+    } catch { /* A caller can retry with the same publish id. */ }
   }
   if (to !== undefined && typeof to !== 'string') { reply(false, 'invalid_target'); return }
-  const id = publish?.publish_id === undefined ? randomUUID() : publish.publish_id
+  const now = Date.now()
+  const id = publish?.publish_id === undefined ? `pub_${now}_${randomUUID()}` : publish.publish_id
   if (typeof id !== 'string' || !id || id.length > 256) { reply(false, 'invalid_publish_id'); return }
   const key = JSON.stringify([sender ? identityKey(sender) : [from, deps.conversations?.get(from)], id])
-  const retry = deps.inboxes?.publish(key)
-  if (retry) { reply(true, JSON.stringify(retry)); return }
+  const inboxes = deps.inboxes
+  const retry = inboxes?.publish(key, now)
+  if (retry) {
+    if (!retry.mirror) { reply(true, JSON.stringify(retry.result)); return }
+    if (retry.mirror.fingerprint !== mirrorFingerprint(text, files)) {
+      reply(false, 'publish_payload_mismatch')
+      return
+    }
+    void tryPublishMirror(deps, retry.mirror, text, files, JSON.stringify([key, retry.at])).then(messageId => {
+      if (messageId) inboxes!.publishMirrored(key, retry.at, messageId)
+      reply(true, JSON.stringify(messageId ? retry.result : { ...retry.result, mirror: 'failed' }))
+    }).catch(err => reply(false, inboxError(err)))
+    return
+  }
 
   // Loop guard: cap posts per session per minute.
-  const now = Date.now()
   const limit = deps.busMaxPerMinute ?? 12
   const times = (busPostTimes.get(from) ?? []).filter(t => now - t < 60_000)
   if (times.length >= limit) {
@@ -1360,39 +1455,41 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     ts: new Date(now).toISOString(),
   }
 
-  const chunks = chunk(`**[${from} → ${toLabel}]**${origin} ${text}`, deps.chunkLimit, deps.chunkMode)
   const body = allMode === 'synthesis' ? `${text}\n\n(synthesis: read this channel for earlier replies before adding anything)` : text
   const result: PublishResult = { publish_id: id, committed: targets }
-  const inboxes = deps.inboxes
+  const mirror: PublishMirror = { where, label: toLabel, origin, from, fingerprint: mirrorFingerprint(text, files), sender }
   const messages = targets.map(name => {
     const stamped = admission(deps, name, meta)
     if (!stamped) throw new Error('unknown_target')
     return { name, content: body, meta: stamped }
   })
-  const entries = inboxes?.commit(messages, publish && (targets.length || publish.publish_id !== undefined || requestId) ? { key, result } : undefined) ?? []
-  // Discord supplies a message reference when it is reachable. The durable
-  // publish and its retry path are independent of this best-effort mirror.
-  const mirror = sendToDiscordAwait(deps.client, where, chunks[0], files?.length ? files : undefined)
-  void mirror.then(messageId => {
-    if (messageId) inboxes?.setMirror(entries.map(entry => entry.id), messageId, toLabel === 'human' ? sender : undefined)
-    chunks.slice(1).forEach(c => sendToDiscord(deps.client, where, c))
-  }).catch(() => { /* The publish is already committed. */ })
-  if (targets.length) {
-    let deadline: number | ReturnType<typeof setTimeout>
-    const timeout = new Promise<undefined>(resolve => { deadline = setTimeout(resolve, 2_000) })
-    void Promise.race([mirror, timeout]).then(messageId => {
-      clearTimeout(deadline)
-      if (!inboxes) {
-        deliverNamed(targets, body, { ...meta, ...(messageId && { message_id: messageId }) }, deps)
-        return
+  const record = publish && targets.length ? { key, result, at: now, mirror } : undefined
+  const entries = inboxes?.commit(messages, record) ?? []
+  entries.forEach((entry, index) => logCommit(deps, targets[index]!, entry))
+  // Prefer a Discord message reference when available, with bounded waiting
+  // before delivery to agents. A mirror retry never replays agent transport.
+  const attemptKey = JSON.stringify([key, record ? now : 'uncommitted'])
+  void tryPublishMirror(deps, mirror, text, files, attemptKey).then(messageId => {
+    if (messageId) {
+      if (record) inboxes?.publishMirrored(key, now, messageId)
+      else {
+        inboxes?.setMirror(entries.map(entry => entry.id), messageId, sender)
+        if (publish && (publish.publish_id !== undefined || requestId) && !inboxes?.publish(key)) {
+          inboxes?.commit([], { key, result, at: now })
+        }
       }
+    }
+    if (!inboxes) {
+      deliverNamed(targets, body, { ...meta, ...(messageId && { message_id: messageId }) }, deps)
+    } else {
       entries.forEach((entry, index) => {
         const pending = inboxes.get(entry.id)
         if (pending) scheduleTransport(deps, targets[index]!, pending)
       })
-    }).catch(() => { /* Mail remains committed if transport bookkeeping fails. */ })
-  }
-  reply(true, JSON.stringify(result))
+    }
+    if (!messageId && toLabel === 'human') { reply(false, 'discord_unavailable'); return }
+    reply(true, JSON.stringify(!messageId && targets.length ? { ...result, mirror: 'failed' } : result))
+  }).catch(err => reply(false, inboxError(err)))
 
 }
 
@@ -1429,7 +1526,11 @@ function deliverNamed(names: readonly string[], text: string, meta: ChannelMeta,
     return stamped ? [{ name, content: text, meta: stamped }] : []
   })
   const entries = inboxes.commit(messages)
-  entries.forEach((entry, index) => scheduleTransport(deps, messages[index]!.name, entry))
+  entries.forEach((entry, index) => {
+    const name = messages[index]!.name
+    logCommit(deps, name, entry)
+    scheduleTransport(deps, name, entry)
+  })
 }
 
 function transportDelay(deps: Readonly<WsDeps>, name: string, meta: ChannelMeta): number {

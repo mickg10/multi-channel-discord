@@ -358,7 +358,7 @@ export interface Adapter {
   reconcile(t: Target, n: Nudge): Promise<WakeResult>
 }
 
-export type WakeState = 'committed' | WakeResult['s']
+export type WakeState = 'committed' | 'leased' | WakeResult['s']
 
 export interface LeasedMessage {
   readonly id: string
@@ -380,6 +380,7 @@ export interface LeaseResult {
 export interface PublishResult {
   readonly publish_id: string
   readonly committed: readonly string[]
+  readonly mirror?: 'failed'
 }
 
 export type GatewayToRouterMessage =
