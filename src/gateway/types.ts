@@ -46,12 +46,18 @@ export function redactFrame(frame: GatewayToRouterMessage): GatewayToRouterMessa
 const ALIAS = /^[-\w.@:/]+$/
 
 /**
- * Same alias predicate as router `registerAgent`.
- * Fleet names are kept verbatim: `codex@nas642` has no conv suffix, and
- * `opencode_nas642_glm53_abli` has no `@`. When `@` is present, the host
- * before `:` must be this gateway. `kind` is not encoded in those names.
+ * Routing targets, not sessions. Case-insensitive.
+ * `human`/`admin`/`user`/`me` are HUMAN_TARGETS. `all` and its synthesis
+ * and independent forms fan out. `@all*` is the same fan-out with a prefix.
  */
-export function assertAlias(_kind: Kind, host: string, alias: string): void {
-  if (!ALIAS.test(alias)) throw new Error('invalid alias')
-  if (alias.includes('@') && alias.split('@')[1]?.split(':')[0] !== host) throw new Error('invalid alias')
+const RESERVED_ALIAS = /^(?:human|admin|user|me|router|all(?::(?:synthesis|independent))?|@all.*)$/i
+
+/**
+ * Non-empty alias in the router charset, excluding reserved names.
+ * Host and identity come from the authenticated gateway. The router binds
+ * the alias to that host, so this does not parse a host out of the name.
+ * Fleet names such as `codex@nas642` and `opencode_nas642_glm53_abli` pass.
+ */
+export function assertAlias(_kind: Kind, _host: string, alias: string): void {
+  if (!ALIAS.test(alias) || RESERVED_ALIAS.test(alias)) throw new Error('invalid alias')
 }

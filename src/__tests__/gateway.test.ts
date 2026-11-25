@@ -114,14 +114,21 @@ describe('gateway skeleton', () => {
           frame.kind === row.kind && frame.host === row.host && frame.conv === `conv-${i}`,
         )).toBe(true)
       }
-      expect(() => nas.registerAgent({
-        host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
+      // A foreign-looking name is not parsed. The record's host is the gateway's.
+      nas.registerAgent({
+        host: 'nas642', user: 'mickg', kind: 'codex', conv: 'foreign-shape',
         alias: 'codex@mac', pid: 299, transport: 'native',
-      })).toThrow('invalid alias')
-      expect(() => nas.registerAgent({
-        host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
-        alias: 'codex@nas642:bad name', pid: 300, transport: 'native',
-      })).toThrow('invalid alias')
+      })
+      expect(nas.registry.byAlias('codex@mac')?.host).toBe('nas642')
+      expect(frames.some(frame =>
+        frame.type === 'registerAgent' && frame.alias === 'codex@mac' && frame.host === 'nas642',
+      )).toBe(true)
+      for (const alias of ['', 'codex@nas642:bad name', 'human', 'admin', 'user', 'me', 'all', 'all:synthesis', 'router', '@all', '@all:independent', 'Human']) {
+        expect(() => nas.registerAgent({
+          host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
+          alias, pid: 300, transport: 'native',
+        })).toThrow('invalid alias')
+      }
       expect(() => mac.registerAgent({
         host: 'nas642', user: 'mickg', kind: 'codex', conv: 'nope',
         alias: 'codex@mac:infra', pid: 301, transport: 'native',
