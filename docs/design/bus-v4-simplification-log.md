@@ -16,3 +16,4 @@ Rotation: R1 Astra · R2 Fable · R3 Neon · R4 Astra · R5 Fable · R6 Neon · 
 ## Ledger
 | # | Critic | Proposals | Ruling |
 |---|---|---|---|
+| R1 | Astra (cut) | 7 cuts, [r1-astra.md](simplification/r1-astra.md): (1) master assigns via one dispatch op with term, no claim+post pair; (2) drop the Claude recipient-token route (answers Q1); (3) drop gateway `mark`/client `ack` (v1 handlers kept during rollout); (4) single registry map per host; (5) no adapter-factory registry or optional loader; (6) shared peer-cred decoding per OS; (7) one router-reply table (also fixes a leaked waiter). Est. ~100-150 LOC plus ~30 avoided. | **Provisionally accepted, all 7**; each preserves the named regression tests. #2 needs Mick (it is Q1). #6 is subject to the ops-upgrader veto. Fable contests in R2. |
