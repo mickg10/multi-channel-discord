@@ -489,3 +489,31 @@ test('rename cannot claim reserved owner aliases or preserve legacy admin privil
   subscribe('after')
   expect(msgs(reconnected).find(frame => frame.requestId === 'after')).toMatchObject({ success: false })
 })
+
+test('bare pinned aliases accept takeover only from the recorded agent kind', () => {
+  const h = createWsHandlers(deps())
+  const name = 'opencode_nas642_glm53_abli'
+  const register = (agent: string, instanceId: string, takeover = false) => {
+    const ws = makeWs()
+    h.message(ws, JSON.stringify({ type: 'register', name, agent, projectPath: '/', instanceId, takeover }))
+    return ws
+  }
+  const incumbent = register('opencode', 'first')
+  const stranger = register('agy', 'second', true)
+  expect(msgs(stranger).at(-1)).toEqual({ type: 'error', message: 'takeover_refused' })
+  expect(incumbent.data.sessionName).toBe(name)
+  const replacement = register('opencode', 'third', true)
+  expect(msgs(replacement).at(-1)).toMatchObject({ type: 'registered', name })
+  expect(msgs(incumbent).at(-1)).toEqual({ type: 'replaced', name })
+})
+
+test('a Codex takeover of a different conversation supersedes the old client instead of allowing reclaim', () => {
+  const h = createWsHandlers(deps())
+  const name = 'codex@mac:work'
+  const incumbent = makeWs(), successor = makeWs()
+  const registration = { type: 'register', name, agent: 'codex', projectPath: '/', takeover: true }
+  h.message(incumbent, JSON.stringify({ ...registration, instanceId: 'first', conversationId: 'abandoned-thread' }))
+  h.message(successor, JSON.stringify({ ...registration, instanceId: 'second', conversationId: 'new-thread' }))
+  expect(msgs(incumbent).at(-1)).toEqual({ type: 'replaced', name, reclaim: false })
+  expect(msgs(successor).at(-1)).toMatchObject({ type: 'registered', name })
+})

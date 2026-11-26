@@ -74,7 +74,7 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
   const reclaimClock = join(stateDir, 'reclaim-clock.js')
   writeFileSync(reclaimClock, `const schedule = globalThis.setTimeout;
 globalThis.setTimeout = (cb, ms, ...args) => schedule(cb, ms === 60000 ? 100 : ms, ...args);`)
-  async function plugin(name = original, host = 'nas642', instanceId?: string) {
+  async function plugin(name = original, host = 'nas642', instanceId?: string, agent = 'agy') {
     const client = new Client({ name: 'rename-fixture', version: '1' })
     clients.push(client)
     await client.connect(new StdioClientTransport({
@@ -84,7 +84,7 @@ globalThis.setTimeout = (cb, ms, ...args) => schedule(cb, ms === 60000 ? 100 : m
       env: {
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: stateDir,
-        DISCORD_AGENT: 'agy',
+        DISCORD_AGENT: agent,
         DISCORD_HOST_LABEL: host,
         ...((instanceId || host !== 'nas642') && { DISCORD_INSTANCE_ID: instanceId ?? 'invalid-host-fixture' }),
         DISCORD_PARENT_PID: String(process.pid),
@@ -169,9 +169,28 @@ globalThis.setTimeout = (cb, ms, ...args) => schedule(cb, ms === 60000 ? 100 : m
     expect(deps.sessions.getSessions().some(session => session.name.startsWith(pinned + '-'))).toBe(false)
     handlers.close(taker.ws)
     await waitFor(() => deps.sessions.isSameInstance(pinned, 'pinned-holder'))
-    const restored = await holder.callTool({ name: 'bus_sessions', arguments: {} })
-    expect(restored.isError).not.toBe(true)
-    expect(JSON.stringify(restored.content)).toContain(pinned + '  (you)')
+    await waitFor(async () => {
+      const restored = await holder.callTool({ name: 'bus_sessions', arguments: {} })
+      return !restored.isError && JSON.stringify(restored.content).includes(pinned + '  (you)')
+    })
+
+    const codexName = 'codex@nas642:abandoned'
+    const abandoned = await plugin(codexName, 'nas642', 'old-codex-instance', 'codex')
+    await waitFor(() => registrations.includes(codexName))
+    const successor = makePeer()
+    handlers.message(successor.ws, JSON.stringify({
+      type: 'register', agent: 'codex', name: codexName, projectPath: '/', instanceId: 'new-codex-instance',
+      takeover: true, conversationId: 'new-codex-thread',
+    }))
+    await waitFor(async () => {
+      const status = await abandoned.callTool({ name: 'bus_sessions', arguments: {} })
+      return status.isError === true && JSON.stringify(status.content).includes('superseded')
+    })
+    handlers.close(successor.ws)
+    const count = registrations.length
+    await new Promise(resolve => setTimeout(resolve, 250))
+    expect(registrations.length).toBe(count)
+    expect(deps.sessions.registeredIdentity(codexName)).toBeUndefined()
   } finally {
     await Promise.allSettled(clients.map(client => client.close()))
     await fixture.stop(true)
@@ -188,9 +207,9 @@ function makePeer() {
   return { ws, frames }
 }
 
-async function waitFor(condition: () => boolean): Promise<void> {
+async function waitFor(condition: () => boolean | Promise<boolean>): Promise<void> {
   const deadline = Date.now() + 5_000
-  while (!condition()) {
+  while (!await condition()) {
     if (Date.now() >= deadline) throw new Error('Timed out waiting for plugin registration')
     await new Promise(resolve => setTimeout(resolve, 10))
   }

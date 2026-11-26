@@ -120,7 +120,7 @@ export interface ConnectToRouterOptions {
   readonly pendingRequests?: Map<string, PendingRequest>
   readonly onPermissionVerdict?: (requestId: string, behavior: 'allow' | 'deny') => void
   /** The router gave our name to a newer connection. */
-  readonly onReplaced?: (name: string) => void
+  readonly onReplaced?: (name: string, reclaim: boolean) => void
   /** Stable conversation id. A later session that reuses the display name does not inherit held approvals. */
   readonly conversationId?: string
 }
@@ -179,7 +179,7 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
           else pending.reject(new Error(msg.data))
         }
       } else if (msg.type === 'replaced') {
-        onReplaced?.(msg.name)
+        onReplaced?.(msg.name, msg.reclaim !== false)
         if (!registered) {
           clearTimeout(timeout)
           ws.close()
@@ -398,6 +398,7 @@ export async function startPlugin(): Promise<void> {
   let shuttingDown = false
   let retired = false
   let routerSupportsReclaim = false
+  let reclaimAllowed = true
   const pendingRequests = new Map<string, PendingRequest>()
 
   function onMessage(content: string, meta: ChannelMeta): void {
@@ -461,8 +462,9 @@ export async function startPlugin(): Promise<void> {
         onMessage,
         pendingRequests,
         onPermissionVerdict,
-        onReplaced: (n: string) => {
-          process.stderr.write(`discord plugin: name "${n}" taken over; waiting for it to become free\n`)
+        onReplaced: (n: string, reclaim: boolean) => {
+          reclaimAllowed = reclaim
+          process.stderr.write(`discord plugin: name "${n}" taken over${reclaim ? '; waiting for it to become free' : '; conversation superseded'}\n`)
           retired = true
           ackWake()
           try { currentWs?.close() } catch {}
@@ -473,6 +475,7 @@ export async function startPlugin(): Promise<void> {
       routerSupportsReclaim = canReclaim
       currentName = registeredName
       retired = false
+      reclaimAllowed = true
       if (explicitAlias.name && configuredName && explicitAlias.name !== configuredName) {
         process.stderr.write(`discord plugin: using saved bus alias "${registeredName}" (overrides DISCORD_SESSION_NAME)\n`)
       }
@@ -536,7 +539,7 @@ export async function startPlugin(): Promise<void> {
   }
 
   function scheduleReconnect(): void {
-    if (reconnectTimer || shuttingDown || (retired && !routerSupportsReclaim)) return
+    if (reconnectTimer || shuttingDown || (retired && (!routerSupportsReclaim || !reclaimAllowed))) return
     const delay = retired ? 60_000 : computeBackoff(reconnectAttempt++)
     process.stderr.write(`discord plugin: reconnecting in ${delay}ms\n`)
     reconnectTimer = setTimeout(() => {
@@ -795,7 +798,9 @@ export async function startPlugin(): Promise<void> {
       return { content: [{ type: 'text', text: registrationError }], isError: true }
     }
     if (retired) {
-      return { content: [{ type: 'text', text: routerSupportsReclaim
+      return { content: [{ type: 'text', text: !reclaimAllowed
+        ? `A newer conversation superseded the bus name "${currentName}".`
+        : routerSupportsReclaim
         ? `Waiting to reclaim the bus name "${currentName}". Discord tools are unavailable until the active holder disconnects.`
         : `A newer session took over the bus name "${currentName}". This router does not support automatic reclaim.` }], isError: true }
     }

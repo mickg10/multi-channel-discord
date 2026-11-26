@@ -295,6 +295,8 @@ export interface WsPermissionVerdict {
 export interface WsReplaced {
   readonly type: 'replaced'
   readonly name: string
+  /** The displaced conversation was superseded and must not auto-reclaim the name. */
+  readonly reclaim?: false
 }
 
 export type RouterToPluginMessage =
