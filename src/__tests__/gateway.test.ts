@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
+import { once } from 'node:events'
 import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { mkdtemp, stat } from 'node:fs/promises'
 import { connect } from 'node:net'
@@ -36,7 +37,6 @@ async function gateway(agents: Array<typeof parent> = [parent, child]) {
   const audit: GatewayToRouterMessage[] = []
   const mail = new Map<string, LeaseResult>(agents.map(agent => [agent.alias, leased(agent.conv + '-SECRET', agent.pid.toString())]))
   let peer: PeerInfo | undefined
-  let allowAck = (_frame: Extract<GatewayToRouterMessage, { type: 'ack' }>) => true
   let gw!: Gateway
   const send = (frame: GatewayToRouterMessage) => {
     frames.push(frame)
@@ -44,15 +44,17 @@ async function gateway(agents: Array<typeof parent> = [parent, child]) {
       gw.router.receive({ type: 'toolResult', requestId: frame.requestId, success: true, data: '{}' })
       return
     }
-    if (frame.type !== 'lease' && frame.type !== 'ack') return
+    if (frame.type === 'gatewayOp' || frame.type === 'busPost') {
+      gw.router.receive({ type: 'toolResult', requestId: frame.requestId!, success: true, data: '{"publish_id":"pub-fixture","committed":[]}' })
+      return
+    }
+    if (frame.type !== 'lease') return
     const requestId = frame.requestId
     if (frame.type === 'lease') {
       const data = mail.get(frame.as) ?? { messages: [], unread: 0 }
       gw.router.receive({ type: 'toolResult', requestId, success: true, data: JSON.stringify(data) })
       return
     }
-    const ok = allowAck(frame)
-    gw.router.receive({ type: 'toolResult', requestId, success: ok, data: ok ? '{}' : 'invalid_receipt' })
   }
   gw = new Gateway({
     host: 'nas642', user: 'mickg', secret: 'node-secret',
@@ -66,11 +68,23 @@ async function gateway(agents: Array<typeof parent> = [parent, child]) {
   return {
     gw, dir, sock, frames, audit, mail,
     setPeer: (next: PeerInfo | undefined) => { peer = next },
-    setAllowAck: (next: typeof allowAck) => { allowAck = next },
   }
 }
 
-function rpc(sock: string, setPeer: (peer: PeerInfo | undefined) => void, who: PeerInfo | undefined, line: unknown): Promise<Record<string, unknown>> {
+function mcpCall(line: { op: string; conv?: string; cwd?: string; [key: string]: unknown }) {
+  const { op, conv, cwd: _cwd, ...args } = line
+  return { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: op, arguments: args, _meta: { threadId: conv } } }
+}
+
+function mcpResult(line: string): Record<string, unknown> {
+  const response = JSON.parse(line)
+  if (response.ok === false) return response
+  const text = response.result?.content?.[0]?.text
+  if (response.result?.isError) return { ok: false, error: text }
+  return { ok: true, ...JSON.parse(text) }
+}
+
+function rpc(sock: string, setPeer: (peer: PeerInfo | undefined) => void, who: PeerInfo | undefined, line: Parameters<typeof mcpCall>[0]): Promise<Record<string, unknown>> {
   setPeer(who)
   return new Promise((resolve, reject) => {
     const socket = connect(sock)
@@ -79,9 +93,9 @@ function rpc(sock: string, setPeer: (peer: PeerInfo | undefined) => void, who: P
     socket.on('data', data => {
       buf += data.toString()
       const nl = buf.indexOf('\n')
-      if (nl >= 0) { socket.end(); resolve(JSON.parse(buf.slice(0, nl)) as Record<string, unknown>) }
+      if (nl >= 0) { socket.end(); resolve(mcpResult(buf.slice(0, nl))) }
     })
-    socket.write(JSON.stringify(line) + '\n')
+    socket.write(JSON.stringify(mcpCall(line)) + '\n')
   })
 }
 
@@ -184,10 +198,9 @@ describe('gateway skeleton', () => {
       const wrongConv = await rpc(g.sock, g.setPeer, childPipe, { op: 'ack', conv: parent.conv, receipt: 'rcpt-10', leaseId: 'lease-10', id: '10' })
       expect(wrongConv.ok).toBe(false)
       expect(g.frames.length).toBe(beforeAck)
-      g.setAllowAck(frame => frame.as === child.alias && frame.id === '11')
       const stolen = await rpc(g.sock, g.setPeer, childPipe, { op: 'ack', conv: child.conv, receipt: 'rcpt-10', leaseId: 'lease-10', id: '10' })
       expect(stolen.ok).toBe(false)
-      expect(g.frames.filter(frame => frame.type === 'ack').every(frame => frame.as === child.alias)).toBe(true)
+      expect(g.frames.length).toBe(beforeAck)
 
       const stranger = await rpc(g.sock, g.setPeer, { pid: 9, exe: '/bin/bash', ppid: child.pid, started: 'linux:2', parentStarted: 'linux:1' }, { op: 'check_inbox', conv: child.conv })
       expect(stranger.ok).toBe(false)
@@ -223,7 +236,7 @@ describe('gateway skeleton', () => {
       g.mail.set(sharedB.alias, leased('BETA', 'b'))
       const who = pipe(42)
       const missing = await rpc(g.sock, g.setPeer, who, { op: 'check_inbox', cwd: '/work/src' })
-      expect(missing).toMatchObject({ ok: false, error: 'conv required' })
+      expect(missing).toMatchObject({ ok: false, error: 'Conversation identity is missing, mismatched, or stale' })
       const alpha = await rpc(g.sock, g.setPeer, who, { op: 'check_inbox', conv: 'alpha', cwd: '/other' })
       expect(JSON.stringify(alpha)).toContain('ALPHA')
       expect(JSON.stringify(alpha)).not.toContain('BETA')
@@ -232,7 +245,22 @@ describe('gateway skeleton', () => {
       expect(JSON.stringify(beta)).toContain('BETA')
       expect(JSON.stringify(beta)).not.toContain('ALPHA')
       const foreign = await rpc(g.sock, g.setPeer, who, { op: 'check_inbox', conv: parent.conv })
-      expect(foreign).toMatchObject({ ok: false, error: 'conv not registered' })
+      expect(foreign).toMatchObject({ ok: false, error: 'Conversation identity is missing, mismatched, or stale' })
+    } finally { await g.gw.close() }
+  })
+
+  test('MCP forwards allowlisted fields under the verified alias', async () => {
+    const g = await gateway()
+    try {
+      const who = pipe(child.pid)
+      const post = { op: 'bus_post', conv: child.conv, text: 'hello', to: 'human' }
+      const count = g.frames.length
+      expect((await rpc(g.sock, g.setPeer, who, { ...post, as: parent.alias })).ok).toBe(false)
+      expect(g.frames).toHaveLength(count)
+      expect(await rpc(g.sock, g.setPeer, who, post)).toMatchObject({ publish_id: 'pub-fixture', committed: [] })
+      expect(g.frames.at(-1)).toMatchObject({ type: 'busPost', as: child.alias, text: 'hello', to: 'human' })
+      await rpc(g.sock, g.setPeer, who, { op: 'reply', conv: child.conv, text: 'hello', chat_id: '1', reply_to: '2' })
+      expect(g.frames.at(-1)).toMatchObject({ type: 'gatewayOp', op: 'reply', as: child.alias, chatId: '1', replyTo: '2' })
     } finally { await g.gw.close() }
   })
 
@@ -440,7 +468,7 @@ describe('gateway skeleton', () => {
     } finally { await first.close() }
   })
 
-  test('a pipe captured before rebind cannot address the new conversation', async () => {
+  test('a verified pipe resolves a rebound conversation on its next call', async () => {
     const g = await gateway()
     try {
       g.setPeer(pipe(parent.pid))
@@ -453,33 +481,55 @@ describe('gateway skeleton', () => {
           const nl = buf.indexOf('\n')
           if (nl < 0) return
           socket.off('data', onData)
-          resolve(JSON.parse(buf.slice(0, nl)) as Record<string, unknown>)
+          resolve(mcpResult(buf.slice(0, nl)))
         }
         socket.on('data', onData)
         socket.on('error', reject)
       })
-      socket.write(JSON.stringify({ op: 'check_inbox', conv: parent.conv }) + '\n')
+      socket.write(JSON.stringify(mcpCall({ op: 'check_inbox', conv: parent.conv })) + '\n')
       expect((await read()).ok).toBe(true)
       const before = g.frames.filter(frame => frame.type === 'lease').length
       g.gw.registerAgent({ ...parent, conv: 'moved' })
-      socket.write(JSON.stringify({ op: 'check_inbox', conv: parent.conv }) + '\n')
-      expect(await read()).toMatchObject({ ok: false, error: 'alias rebound' })
+      socket.write(JSON.stringify(mcpCall({ op: 'check_inbox', conv: parent.conv })) + '\n')
+      expect(await read()).toMatchObject({ ok: false, error: 'Conversation identity is missing, mismatched, or stale' })
       expect(g.frames.filter(frame => frame.type === 'lease')).toHaveLength(before)
+      socket.write(JSON.stringify(mcpCall({ op: 'check_inbox', conv: 'moved' })) + '\n')
+      expect((await read()).ok).toBe(true)
+      expect(g.frames.filter(frame => frame.type === 'lease')).toHaveLength(before + 1)
+      g.gw.registerAgent({ ...parent, conv: 'replacement', started: 'linux:3' })
+      socket.write(JSON.stringify(mcpCall({ op: 'check_inbox', conv: 'replacement' })) + '\n')
+      expect(await read()).toMatchObject({ ok: false, error: 'Conversation identity is missing, mismatched, or stale' })
+      expect(g.frames.filter(frame => frame.type === 'lease')).toHaveLength(before + 1)
       socket.end()
     } finally { await g.gw.close() }
   })
 
-  test('a line over 1 MiB closes the socket and does not lease', async () => {
+  test('MCP permits multiple frames and disconnects on an oversized partial frame', async () => {
     const g = await gateway()
     try {
       g.setPeer(pipe(parent.pid))
       const socket = connect(g.sock)
-      socket.on('error', () => {})
-      await new Promise<void>((resolve, reject) => { socket.once('connect', () => resolve()); socket.once('error', reject) })
-      const closed = new Promise<void>(resolve => socket.once('close', () => resolve()))
-      socket.write(Buffer.alloc(1024 * 1024 + 1, 0x61))
+      await once(socket, 'connect')
+      const request = JSON.stringify(mcpCall({ op: 'check_inbox', conv: parent.conv }))
+      const frames = new Promise<void>(resolve => {
+        let replies = ''
+        socket.on('data', chunk => {
+          replies += chunk.toString()
+          if (replies.split('\n').length >= 3) resolve()
+        })
+      })
+      const padding = ' '.repeat(600 * 1024)
+      socket.write(request + padding + '\n' + request + padding + '\n')
+      await frames
+      const before = g.frames.length
+      const closed = new Promise<void>(resolve => { socket.once('close', () => resolve()) })
+      socket.on('error', (error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ECONNRESET' && error.code !== 'EPIPE') throw error
+      })
+      socket.write(padding)
+      socket.write(padding)
       await closed
-      expect(g.frames.some(frame => frame.type === 'lease')).toBe(false)
+      expect(g.frames).toHaveLength(before)
     } finally { await g.gw.close() }
   })
 

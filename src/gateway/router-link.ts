@@ -4,7 +4,7 @@ import {
   type GatewayToRouterMessage, type LeaseResult, type RouterToGatewayMessage, type Target, type WakeResult,
 } from './types.js'
 
-type Waiter = { resolve: (value: unknown) => void; reject: (err: Error) => void }
+type Waiter = { resolve: (value: unknown) => void; reject: (err: Error) => void; raw: boolean }
 
 export class RouterLink {
   private pending = new Map<string, Waiter>()
@@ -51,6 +51,14 @@ export class RouterLink {
     return this.call(requestId, frame)
   }
 
+  tool(alias: string, op: string, fields: Record<string, unknown>): Promise<string> {
+    const requestId = this.nextId()
+    const frame: GatewayToRouterMessage = op === 'busPost'
+      ? { text: String(fields.text), ...fields, type: 'busPost', as: alias, requestId }
+      : { ...fields, type: 'gatewayOp', as: alias, requestId, op }
+    return this.call(requestId, frame, true)
+  }
+
   ack(alias: string, leaseId: string, id: string, receipt: string): Promise<void> {
     const requestId = this.nextId()
     return this.call(requestId, { type: 'ack', as: alias, requestId, leaseId, id, receipt }).then(() => undefined)
@@ -75,7 +83,7 @@ export class RouterLink {
       if (!waiter) return
       this.pending.delete(msg.requestId)
       if (!msg.success) { waiter.reject(new Error(msg.data)); return }
-      try { waiter.resolve(msg.data ? JSON.parse(msg.data) : {}) }
+      try { waiter.resolve(waiter.raw ? msg.data : msg.data ? JSON.parse(msg.data) : {}) }
       catch { waiter.reject(new Error('bad router payload')) }
       return
     }
@@ -83,12 +91,22 @@ export class RouterLink {
     if (msg.type === 'agentReleased') this.onReleased?.(msg.alias)
   }
 
-  private call<T>(requestId: string, frame: GatewayToRouterMessage): Promise<T> {
+  private call<T>(requestId: string, frame: GatewayToRouterMessage, raw = false): Promise<T> {
     return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve: value => resolve(value as T), reject })
+      const timer = setTimeout(() => {
+        this.pending.delete(requestId)
+        reject(new Error('Router tool request timed out'))
+      }, 30_000)
+      timer.unref()
+      this.pending.set(requestId, {
+        raw,
+        resolve: value => { clearTimeout(timer); resolve(value as T) },
+        reject: err => { clearTimeout(timer); reject(err) },
+      })
       try { this.emit(frame) }
       catch (err) {
         this.pending.delete(requestId)
+        clearTimeout(timer)
         reject(err instanceof Error ? err : new Error(String(err)))
       }
     })
