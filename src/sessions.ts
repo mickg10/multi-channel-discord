@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import type { SessionEntry, BufferedMessage, WsMessage, ProjectHistoryEntry, ChannelMeta } from './types.js'
 import { SessionNotFoundError } from './errors.js'
 import { getStateDir } from './access.js'
+import { BUS_ALIAS_MAX } from './bus-alias.js'
 
 interface SessionSlot {
   readonly name: string
@@ -237,8 +238,12 @@ export class SessionManager {
     const inUse = (candidate: string) => (candidate !== previous && this.sessions.has(candidate)) || reserved?.(candidate)
     if (!inUse(name)) return name
     let suffix = 2
-    while (inUse(`${name}-${suffix}`)) suffix++
-    return `${name}-${suffix}`
+    let candidate: string
+    do {
+      const ending = `-${suffix++}`
+      candidate = name.slice(0, BUS_ALIAS_MAX - ending.length) + ending
+    } while (inUse(candidate))
+    return candidate
   }
 }
 

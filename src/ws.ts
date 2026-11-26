@@ -809,7 +809,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       const normalized = parsed.name.trim()
       const host = ws.data.legacyHost ?? parsed.host ?? qualifiedAliasHost(normalized)
       if ((parsed.host !== undefined && (typeof parsed.host !== 'string' || !/^[a-z0-9][a-z0-9.-]*$/i.test(parsed.host) || parsed.host !== host)) ||
-          !aliasAllowedOnHost(normalized, host)) {
+          !isBusAlias(normalized) || !aliasAllowedOnHost(normalized, host)) {
         sendError(ws, 'register rejected: invalid_bus_alias')
         return
       }
@@ -823,18 +823,18 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         // Headless turns (pull mode) re-register the same name each turn; replace the stale
         // slot instead of creating "name-2" that nobody reads.
         const p = parsed as { mode?: string; takeover?: boolean; instanceId?: string }
-        const stale = deps.sessions.getSessions().find(s => s.name === parsed.name)
+        const stale = deps.sessions.getSessions().find(s => s.name === normalized)
         if (stale && (p.takeover || p.mode === 'pull')) {
           // Tell the old holder it lost the name so it retires instead of lingering (a stale
           // Codex-daemon thread kept the name and swallowed the live thread's mail and nudges).
-          deps.sessions.notifySession(parsed.name, JSON.stringify({ type: 'replaced', name: parsed.name }))
-          try { deps.sessions.deregisterSession(parsed.name) } catch {}
+          deps.sessions.notifySession(normalized, JSON.stringify({ type: 'replaced', name: normalized }))
+          try { deps.sessions.deregisterSession(normalized) } catch {}
         }
       }
       const conversationId = typeof (parsed as { conversationId?: unknown }).conversationId === 'string'
         ? (parsed as { conversationId: string }).conversationId
         : ''
-      handleRegister(ws, parsed.name, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
+      handleRegister(ws, normalized, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
       if (ws.data.sessionName) {
         deps.conversations?.set(ws.data.sessionName, conversationId)
         if (conversationId) deps.inboxes?.remember(ws.data.sessionName, conversationId)
@@ -854,13 +854,13 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       break
     case 'rename': {
       const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
-      if (!hasString(parsed, 'name') || (requestId && !isBusAlias(parsed.name)) ||
-          !aliasAllowedOnHost(parsed.name.trim(), ws.data.legacyHost)) {
+      const name = typeof parsed.name === 'string' ? parsed.name.trim() : undefined
+      if (!isBusAlias(name) || !aliasAllowedOnHost(name, ws.data.legacyHost)) {
         sendOperationError(ws, requestId, 'invalid_bus_alias')
         return
       }
-      if (deps.inboxes?.target(parsed.name.trim())) { sendOperationError(ws, requestId, 'alias already registered'); return }
-      handleRename(ws, parsed.name, deps, requestId)
+      if (deps.inboxes?.target(name)) { sendOperationError(ws, requestId, 'alias already registered'); return }
+      handleRename(ws, name, deps, requestId)
       break
     }
     case 'reply': {

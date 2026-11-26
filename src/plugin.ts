@@ -124,7 +124,8 @@ export interface ConnectToRouterOptions {
 
 function clientInstanceId(agentKind = process.env.DISCORD_AGENT || 'claude'): string {
   const parent = process.env.DISCORD_PARENT_PID || String(process.ppid)
-  return process.env.DISCORD_INSTANCE_ID || (agentKind === 'claude' ? parent : `${parent}-${process.env.DISCORD_SUPERVISOR_PID || process.pid}`)
+  const supervisor = process.env.DISCORD_SUPERVISOR_PID || (process.env.DISCORD_PARENT_PID ? process.ppid : process.pid)
+  return process.env.DISCORD_INSTANCE_ID || (agentKind === 'claude' ? parent : `${parent}-${supervisor}`)
 }
 
 /** Connect to the router via WebSocket and register. */
@@ -288,9 +289,10 @@ export async function startPlugin(): Promise<void> {
   // Claude: the session's /name alias (in ~/.claude/sessions/<pid>.json) names it, and is followed live.
   const claudeAlias = (): string | undefined => claude && sessionAlias(readClaudeSession(claude.pid))
   const alias = claudeAlias()
+  const generatedName = (suffix: string) => `${agent}@${hostLabel}:${suffix.replace(/[^-\w./:]/g, '-')}`.slice(0, BUS_ALIAS_MAX)
   const instanceId = clientInstanceId(agent)
   const explicitAlias = new BusAlias(getStateDir(), instanceId)
-  const sessionName = explicitAlias.name || (!inChatGPT && process.env.DISCORD_SESSION_NAME) || `${agent}@${hostLabel}:${alias ?? namingCtx.dirName}`
+  const sessionName = explicitAlias.name || (!inChatGPT && process.env.DISCORD_SESSION_NAME) || generatedName(alias ?? namingCtx.dirName)
 
   // Inbox: every inbound message is also queued here so clients without channel push
   // (Codex, agy) can read them with the check_inbox tool.
@@ -503,7 +505,7 @@ export async function startPlugin(): Promise<void> {
       explicitAlias.restore()
       if (explicitAlias.name) { clearInterval(aliasTimer!); aliasTimer = null; return }
       const a = claudeAlias()
-      const want = `${agent}@${hostLabel}:${a ?? namingCtx.dirName}`
+      const want = generatedName(a ?? namingCtx.dirName)
       if (!renamePending && want !== currentName && currentWs && currentWs.readyState === WebSocket.OPEN) {
         process.stderr.write(`discord plugin: /name changed -> ${want}\n`)
         currentWs.send(JSON.stringify({ type: 'rename', name: want }))

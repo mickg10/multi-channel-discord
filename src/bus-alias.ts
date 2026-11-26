@@ -24,8 +24,7 @@ export class BusAlias {
     if (this.name) return
     try {
       const saved = readFileSync(this.path, 'utf8')
-      // The router may append a collision suffix to a maximum-length request.
-      if (saved.length <= BUS_ALIAS_MAX + 17 && BUS_ALIAS_PATTERN.test(saved)) this.name = saved
+      if (isBusAlias(saved)) this.name = saved
     } catch {}
   }
 

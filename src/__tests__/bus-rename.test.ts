@@ -42,7 +42,7 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
   })
   const existing: WsLike = { data: { sessionName: null, sendCallback: null }, send() {} }
   handlers.message(existing, JSON.stringify({ type: 'register', name: 'cfd-injection-smart', projectPath: stateDir }))
-  for (const name of ['human', 'all:synthesis', 'claude@otherhost:x']) {
+  for (const name of ['human', 'all:synthesis', 'claude@otherhost:x', 'has spaces', 'x'.repeat(129)]) {
     const responses: { type: string; message: string }[] = []
     const candidate: WsLike = {
       data: { sessionName: null, sendCallback: null },
@@ -53,6 +53,23 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
     expect(candidate.data.sessionName).toBeNull()
   }
 
+
+  const rawReplies: { type: string; message?: string; newName?: string }[] = []
+  const raw: WsLike = {
+    data: { sessionName: null, sendCallback: null },
+    send(frame) { rawReplies.push(JSON.parse(frame)) },
+  }
+  handlers.message(raw, JSON.stringify({ type: 'register', name: 'unqualified-legacy', projectPath: stateDir }))
+  for (const name of ['has spaces', 'x'.repeat(129), 'HUMAN', 'Router', '@All', 'x@nas642:y']) {
+    handlers.message(raw, JSON.stringify({ type: 'rename', name }))
+    expect(rawReplies.at(-1)).toEqual({ type: 'error', message: 'invalid_bus_alias' })
+    expect(raw.data.sessionName).toBe('unqualified-legacy')
+  }
+  const longName = 'a'.repeat(128)
+  handlers.message(existing, JSON.stringify({ type: 'rename', name: longName }))
+  handlers.message(raw, JSON.stringify({ type: 'rename', name: longName }))
+  expect(rawReplies.at(-1)?.newName).toBe('a'.repeat(126) + '-2')
+  handlers.message(existing, JSON.stringify({ type: 'rename', name: 'cfd-injection-smart' }))
 
   async function plugin(name = original, host = 'nas642') {
     const client = new Client({ name: 'rename-fixture', version: '1' })
@@ -66,7 +83,7 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
         HOME: stateDir,
         DISCORD_AGENT: 'agy',
         DISCORD_HOST_LABEL: host,
-        DISCORD_SUPERVISOR_PID: 'fixture-supervisor-' + host,
+        ...(host !== 'nas642' && { DISCORD_INSTANCE_ID: 'invalid-host-fixture' }),
         DISCORD_PARENT_PID: String(process.pid),
         DISCORD_CONVERSATION_ID: 'injection-conversation',
         DISCORD_STATE_DIR: stateDir,
