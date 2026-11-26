@@ -7,17 +7,21 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
+export type ChannelOwner = { name: string; instanceId?: string } | { identity: string }
+
 interface SubscriptionState {
   version: 1
   legacy: Record<string, string[]>
   native: Record<string, string[]>
   owners: Record<string, string>
+  channelOwners?: Record<string, ChannelOwner>
 }
 
 export class Subscriptions {
   private readonly map = new Map<string, Set<string>>()
   private readonly native = new Map<string, Set<string>>()
   private readonly owners = new Map<string, string>()
+  private readonly channelOwners = new Map<string, ChannelOwner>()
   private unversioned = false
 
   constructor(private readonly file?: string) {
@@ -29,6 +33,7 @@ export class Subscriptions {
         for (const [name, channels] of Object.entries(state.legacy)) this.map.set(name, new Set(channels))
         for (const [key, channels] of Object.entries(state.native)) this.native.set(key, new Set(channels))
         for (const [name, instance] of Object.entries(state.owners)) this.owners.set(name, instance)
+        for (const [channel, owner] of Object.entries(state.channelOwners ?? {})) this.channelOwners.set(channel, owner)
       } else {
         this.unversioned = true
         for (const [name, channels] of Object.entries(raw)) this.map.set(name, new Set(channels))
@@ -78,10 +83,40 @@ export class Subscriptions {
     return [...this.native].filter(([, channels]) => channels.has(channelId)).map(([key]) => key)
   }
 
+  recordChannelOwner(channel: string, owner: ChannelOwner): void {
+    if (this.channelOwners.has(channel)) return
+    this.channelOwners.set(channel, owner)
+    this.save()
+  }
+
+  isChannelOwner(channel: string, caller: ChannelOwner): boolean {
+    const owner = this.channelOwners.get(channel)
+    if (!owner) return false
+    if ('identity' in owner) return 'identity' in caller && owner.identity === caller.identity
+    return 'name' in caller && owner.name === caller.name &&
+      (owner.instanceId === undefined || owner.instanceId === caller.instanceId)
+  }
+
+  private moveChannelOwnership(name: string, destination: ChannelOwner): boolean {
+    let changed = false
+    const instanceId = this.owners.get(name)
+    for (const [channel, owner] of this.channelOwners) {
+      if (!('name' in owner) || owner.name !== name ||
+          (owner.instanceId !== undefined && owner.instanceId !== instanceId)) continue
+      this.channelOwners.set(channel, destination)
+      changed = true
+    }
+    return changed
+  }
+
   reclaim(name: string, instanceId?: string): void {
     if (this.owners.get(name) === instanceId) return
     const old = instanceId && [...this.owners].find(([, owner]) => owner === instanceId)?.[0]
-    if (old) { this.move(this.map, old, name); this.owners.delete(old) }
+    if (old) {
+      this.move(this.map, old, name)
+      this.moveChannelOwnership(old, { name, instanceId })
+      this.owners.delete(old)
+    }
     if (instanceId) this.owners.set(name, instanceId)
     else this.owners.delete(name)
     this.save()
@@ -91,6 +126,7 @@ export class Subscriptions {
     if (oldName === name) return
     this.move(this.map, oldName, name)
     const owner = this.owners.get(oldName)
+    this.moveChannelOwnership(oldName, { name, instanceId: owner })
     this.owners.delete(oldName)
     if (owner) this.owners.set(name, owner)
     else this.owners.delete(name)
@@ -98,7 +134,8 @@ export class Subscriptions {
   }
 
   migrateToNative(name: string, identity: string): void {
-    if (!this.map.has(name)) return
+    const movedOwner = this.moveChannelOwnership(name, { identity })
+    if (!this.map.has(name) && !movedOwner) return
     this.move(this.native, name, identity)
     this.owners.delete(name)
     this.save()
@@ -145,6 +182,7 @@ export class Subscriptions {
       const serialize = (map: Map<string, Set<string>>) => Object.fromEntries([...map].map(([key, channels]) => [key, [...channels]]))
       const state: SubscriptionState = {
         version: 1, legacy: serialize(this.map), native: serialize(this.native), owners: Object.fromEntries(this.owners),
+        channelOwners: Object.fromEntries(this.channelOwners),
       }
       writeFileSync(tmp, JSON.stringify(state, null, 2))
       renameSync(tmp, this.file)

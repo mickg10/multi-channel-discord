@@ -238,6 +238,14 @@ const channelOps: ChannelOps = {
     })
     return { id: ch.id, name: ch.name }
   },
+  async setTopic(id, topic, reason) {
+    const guild = await busGuild()
+    const ch = guild.channels.cache.get(id) ?? await guild.channels.fetch(id)
+    if (!ch || ch.type !== ChannelType.GuildText) throw new Error('channel not found or not a guild text channel')
+    const updated = await ch.setTopic(topic || null, reason)
+    guild.channels.cache.set(id, updated)
+    return { id: updated.id, name: updated.name, topic: updated.topic }
+  },
   async archive(id: string, topic: string) {
     const guild = await busGuild()
     const catInfo = (await guildChannels(guild)).find(c => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === 'archive')

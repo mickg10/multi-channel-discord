@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, mock } from 'bun:test'
 import { createWsHandlers, resetBusRateLimit, routeHumanBusMessage } from '../ws.js'
 import { CostClasses, HumanMail, Unread } from '../wake.js'
+import { Subscriptions } from '../subscriptions.js'
 import { NodeRegistry } from '../nodes.js'
 import type { WsData, WsDeps } from '../ws.js'
 import { SessionManager, ProjectHistory } from '../sessions.js'
@@ -407,4 +408,63 @@ describe('channels', () => {
     const s1 = Subscriptions.inStateDir(dir); s1.add('x', 'c9')
     expect(Subscriptions.inStateDir(dir).subscribers('c9')).toEqual(['x'])
   })
+})
+
+test('channel_set_topic allows only the creator or an admin and exposes the updated topic', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'channel-owner-'))
+  const subs = Subscriptions.inStateDir(dir)
+  const channels = new Map<string, { id: string; name: string; topic: string | null }>()
+  const edited: { id: string; topic: string; reason: string }[] = []
+  const d = deps({
+    subs, admins: new Set(['admin@mac']),
+    channelOps: {
+      resolve: async ref => channels.get(ref) ?? null,
+      list: async () => [...channels.values()],
+      create: async (name, topic) => {
+        const result = { id: name, name, topic: topic ?? null }
+        channels.set(name, result)
+        return result
+      },
+      setTopic: async (id, topic, reason) => {
+        edited.push({ id, topic, reason })
+        const result = { ...channels.get(id)!, topic: topic || null }
+        channels.set(id, result)
+        return result
+      },
+    },
+  })
+  const h = createWsHandlers(d)
+  const owner = makeWs()
+  h.message(owner, JSON.stringify({ type: 'register', name: 'owner@mac', projectPath: '/', instanceId: 'owner-instance' }))
+  const outsider = register(h, 'outsider@mac')
+  const admin = register(h, 'admin@mac')
+  let request = 0
+  async function call(ws: MockWs, type: string, fields: object = {}) {
+    const requestId = 'topic-' + ++request
+    h.message(ws, JSON.stringify({ type, requestId, ...fields }))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    return msgs(ws).find(frame => frame.requestId === requestId)
+  }
+  expect(await call(owner, 'channelCreate', { name: 'cfd-injection', topic: '17 species' })).toMatchObject({ success: true })
+  expect(await call(outsider, 'channelCreate', { name: 'cfd-injection' })).toMatchObject({ success: true })
+  expect(await call(outsider, 'channelSetTopic', { channel: 'cfd-injection', topic: 'takeover' })).toMatchObject({
+    success: false, data: 'not_channel_owner',
+  })
+  expect(await call(owner, 'channelSetTopic', { channel: 'cfd-injection', topic: 'x'.repeat(1025) })).toMatchObject({
+    success: false, data: 'invalid_channel_topic',
+  })
+  expect(edited).toEqual([])
+  expect(await call(owner, 'channelSetTopic', { channel: 'cfd-injection', topic: '13 species' })).toMatchObject({ success: true })
+  const list = await call(outsider, 'channelList')
+  expect(JSON.parse(list.data)).toMatchObject([{ id: 'cfd-injection', topic: '13 species' }])
+  expect(await call(admin, 'channelSetTopic', { channel: 'cfd-injection', topic: '' })).toMatchObject({ success: true })
+  expect(edited).toEqual([
+    { id: 'cfd-injection', topic: '13 species', reason: expect.stringContaining('owner@mac') },
+    { id: 'cfd-injection', topic: '', reason: expect.stringContaining('admin@mac') },
+  ])
+
+  h.message(owner, JSON.stringify({ type: 'rename', name: 'renamed@mac' }))
+  const persisted = Subscriptions.inStateDir(dir)
+  expect(persisted.isChannelOwner('cfd-injection', { name: 'renamed@mac', instanceId: 'owner-instance' })).toBe(true)
+  expect(persisted.isChannelOwner('cfd-injection', { name: 'renamed@mac', instanceId: 'replacement' })).toBe(false)
 })

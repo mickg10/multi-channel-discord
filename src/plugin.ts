@@ -19,6 +19,7 @@ import { getStateDir, loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { spawn as spawnProc } from 'node:child_process'
+import { CHANNEL_TOPIC_MAX } from './types.js'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
 import { BUS_ALIAS_MAX, BusAlias, isBusAlias } from './bus-alias.js'
 import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
@@ -642,6 +643,18 @@ export async function startPlugin(): Promise<void> {
         },
       },
       {
+        name: 'channel_set_topic',
+        description: 'Set a channel’s Discord topic. Only the channel owner or a bus admin can edit it. Use an empty topic to clear it.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            channel: { type: 'string', description: 'Channel ID or name' },
+            topic: { type: 'string', maxLength: CHANNEL_TOPIC_MAX },
+          },
+          required: ['channel', 'topic'],
+        },
+      },
+      {
         name: 'channel_archive',
         description: 'Archive a channel (moved to the "archive" category, topic points to the replacement). Its subscribers are moved to the replacement. Use for duplicates: archive the NEWER one.',
         inputSchema: {
@@ -855,6 +868,10 @@ export async function startPlugin(): Promise<void> {
             ...(args.grant ? { grant: args.grant as string } : {}),
           })
           return { content: [{ type: 'text', text: r }] }
+        }
+        case 'channel_set_topic': {
+          const result = await sendToolRequest({ type: 'channelSetTopic', channel: args.channel, topic: args.topic })
+          return { content: [{ type: 'text', text: result }] }
         }
         case 'channel_archive': {
           const r = await sendToolRequest({ type: 'channelArchive', channel: args.channel as string, ...(args.replacement ? { replacement: args.replacement as string } : {}) })

@@ -17,10 +17,11 @@
 
 import type { WsMcpOp, PluginToRouterMessage, WsRegistered, WsRenamed, WsError, WsToolResult, WsPermissionVerdict, WsAskUser, WsRegisterSkills, ChannelMeta } from './types.js'
 import type { SessionManager, ProjectHistory } from './sessions.js'
-import type { Subscriptions } from './subscriptions.js'
+import type { ChannelOwner, Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
 import { isBusAlias } from './bus-alias.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
+import { CHANNEL_TOPIC_MAX } from './types.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
@@ -34,6 +35,7 @@ export interface ChannelOps {
   create(name: string, topic?: string): Promise<{ id: string; name: string }>
   /** Move to the "archive" category and set its topic (optional: not all routers support it). */
   archive?(id: string, topic: string): Promise<void>
+  setTopic?(id: string, topic: string, reason: string): Promise<{ id: string; name: string; topic: string | null }>
 }
 import { chunk } from './discord.js'
 import { noteSent, getStateDir } from './access.js'
@@ -452,6 +454,7 @@ const GATEWAY_TOOL_HANDLERS = {
   mcpDescribe: 'mcpDescribe',
   mcpCall: 'mcpCall',
   channelList: 'channelList',
+  channelSetTopic: 'channelSetTopic',
   channelSubscribe: 'channelSubscribe',
 } as const satisfies Record<GatewayToolCall['op'], PluginToRouterMessage['type']>
 
@@ -750,6 +753,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       break
     }
     case 'channelList':
+    case 'channelSetTopic':
     case 'channelCreate':
     case 'channelSubscribe':
     case 'channelUnsubscribe':
@@ -1818,8 +1822,41 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       if (!msg.name) { sendToolResult(ws, msg.requestId, false, 'channel_create requires name'); return }
       const existing = await ops.resolve(msg.name)
       const ch = existing ?? await ops.create(msg.name, msg.topic)
+      if (!existing) {
+        const creator: ChannelOwner = sender ? { identity: identityKey(sender) } : { name: ws.data.sessionName!, instanceId: ws.data.instanceId }
+        subs.recordChannelOwner(ch.id, creator)
+      }
       subs.add(me, ch.id, identity)
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, created: !existing, subscribed: true }))
+      return
+    }
+    if (msg.type === 'channelSetTopic') {
+      if (typeof msg.channel !== 'string' || !msg.channel.trim()) {
+        sendToolResult(ws, msg.requestId, false, 'channel_set_topic requires channel')
+        return
+      }
+      if (typeof msg.topic !== 'string' || msg.topic.length > CHANNEL_TOPIC_MAX) {
+        sendToolResult(ws, msg.requestId, false, 'invalid_channel_topic')
+        return
+      }
+      const channel = await ops.resolve(msg.channel)
+      if (!channel) { sendToolResult(ws, msg.requestId, false, 'unknown_channel'); return }
+      const caller = ws.data.sessionName
+      const current = caller && (sender
+        ? deps.inboxes && nativeConnection(deps.inboxes, sender) && deps.inboxes.key(caller) === identityKey(sender)
+        : ws.data.sendCallback && deps.sessions.ownsSender(caller, ws.data.sendCallback))
+      if (!caller || !current) {
+        sendToolResult(ws, msg.requestId, false, 'not_channel_owner')
+        return
+      }
+      const actor: ChannelOwner = sender ? { identity: identityKey(sender) } : { name: caller, instanceId: ws.data.instanceId }
+      if (!deps.admins?.has(caller) && deps.channelOwners?.get(channel.id) !== caller && !subs.isChannelOwner(channel.id, actor)) {
+        sendToolResult(ws, msg.requestId, false, 'not_channel_owner')
+        return
+      }
+      if (!ops.setTopic) { sendToolResult(ws, msg.requestId, false, 'channel_topic_edit_unavailable'); return }
+      const updated = await ops.setTopic(channel.id, msg.topic, `agent-bus channel_set_topic requested by ${caller}`)
+      sendToolResult(ws, msg.requestId, true, JSON.stringify(updated))
       return
     }
     const ch = msg.channel ? await ops.resolve(msg.channel) : null
