@@ -18,9 +18,10 @@ import { discoverSkills } from './skills.js'
 import { getStateDir, loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
-import { spawn as spawnProc } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
 import { BUS_ALIAS_MAX, BusAlias, isBusAlias } from './bus-alias.js'
+import { wakeTmux } from './tmux-wake.js'
 import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
@@ -110,6 +111,7 @@ export interface ConnectToRouterOptions {
   readonly name: string
   readonly projectPath: string
   readonly instanceId?: string
+  readonly host?: string
   readonly takeover?: boolean
   readonly onRenamed?: (name: string) => void
   readonly onMessage?: (content: string, meta: ChannelMeta) => void
@@ -150,7 +152,7 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       const takeover = opts.takeover ?? !!process.env.DISCORD_SESSION_NAME
       const costClass = process.env.DISCORD_COST_CLASS
       const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
-      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(takeover && { takeover }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
+      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(opts.host && { host: opts.host }), ...(takeover && { takeover }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
     }
 
     ws.onmessage = (event) => {
@@ -328,31 +330,21 @@ export async function startPlugin(): Promise<void> {
       wakeTimer = null
       void flushWake(gen)
     }, 2000)
-    // Recheck the inbox immediately before typing. A drain during the debounce, or a
-    // failed tmux send, must not start an empty turn or leave the latch stuck.
-    async function flushWake(gen: number): Promise<void> {
-      const run = (args: string[]) => new Promise<boolean>(res => {
-        if (gen !== wakeGen || inbox.length === 0) { res(false); return }
-        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
-        p.on('error', () => res(false))
-        p.on('close', code => res(code === 0))
-      })
-      const typed = await run(['send-keys', '-t', wakePane!, '-l', wakeText])
-      if (gen !== wakeGen) return
-      if (!typed) {
-        wakeInFlight = false
-        if (inbox.length > 0) considerWake()
-        return
-      }
-      await new Promise(r => setTimeout(r, 300))
-      if (gen !== wakeGen) return
-      const entered = await run(['send-keys', '-t', wakePane!, 'Enter'])
-      if (gen !== wakeGen) return
-      if (!entered) {
-        wakeInFlight = false
-        if (inbox.length > 0) considerWake()
-      }
-    }
+  }
+  async function flushWake(gen: number): Promise<void> {
+    const pane = wakePane
+    if (!pane) return
+    const isCurrent = () => !retired && !shuttingDown && gen === wakeGen && inbox.length > 0
+    const outcome = await wakeTmux({
+      pane, text: wakeText, isCurrent,
+      run: args => new Promise(resolve => {
+        execFile(tmuxBin, args, { timeout: 5_000, maxBuffer: 128 * 1024 }, (err, stdout) => resolve(err ? undefined : stdout))
+      }),
+    })
+    if (outcome !== 'failed' || !isCurrent()) return
+    process.stderr.write('discord plugin: tmux wake was not confirmed after two attempts; releasing wake latch\n')
+    wakeInFlight = false
+    if (flightTimer) { clearTimeout(flightTimer); flightTimer = null }
   }
   function ackWake(): void {
     const remaining = inbox.length
@@ -434,6 +426,7 @@ export async function startPlugin(): Promise<void> {
         name: explicitAlias.name ?? currentName,
         projectPath: cwd,
         instanceId,
+        host: hostLabel,
         ...(explicitAlias.name && { takeover: false }),
         onRenamed: name => { currentName = name },
         onMessage,
@@ -452,6 +445,10 @@ export async function startPlugin(): Promise<void> {
       })
       currentWs = ws
       currentName = registeredName
+      const configuredName = !inChatGPT && process.env.DISCORD_SESSION_NAME
+      if (explicitAlias.name && configuredName && explicitAlias.name !== configuredName) {
+        process.stderr.write(`discord plugin: using saved bus alias "${registeredName}" (overrides DISCORD_SESSION_NAME)\n`)
+      }
       if (explicitAlias.name && explicitAlias.name !== registeredName) {
         try { explicitAlias.save(registeredName) } catch { process.stderr.write('discord plugin: could not save the registered bus alias\n') }
       }
@@ -521,7 +518,7 @@ export async function startPlugin(): Promise<void> {
     tools: [
       {
         name: 'bus_rename',
-        description: 'Rename this session on the agent bus. Call this after the user renames you (e.g. agy /rename) so the bus name matches.',
+        description: 'Rename this session on the agent bus. Call this after the user renames you (e.g. agy /rename) so the bus name matches. The alias survives supervisor updates. For non-Claude agents without DISCORD_INSTANCE_ID, it lasts until the agent process restarts.',
         inputSchema: {
           type: 'object' as const,
           properties: { name: { type: 'string', description: 'The new exact bus alias', maxLength: BUS_ALIAS_MAX } },

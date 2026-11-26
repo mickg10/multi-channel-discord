@@ -20,6 +20,8 @@ export type ChannelMeta = Readonly<Record<string, string | undefined>> & {
 export interface WsRegister {
   readonly type: 'register'
   readonly name: string
+  /** Declared local host label, pinned for renames in this legacy connection. */
+  readonly host?: string
   readonly projectPath: string
   /** Parent PID of the Claude Code process. Used to dedup multiple MCP spawns
    *  from the same instance while keeping separate instances as separate sessions. */

@@ -42,6 +42,17 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
   })
   const existing: WsLike = { data: { sessionName: null, sendCallback: null }, send() {} }
   handlers.message(existing, JSON.stringify({ type: 'register', name: 'cfd-injection-smart', projectPath: stateDir }))
+  for (const name of ['human', 'all:synthesis', 'claude@otherhost:x']) {
+    const responses: { type: string; message: string }[] = []
+    const candidate: WsLike = {
+      data: { sessionName: null, sendCallback: null },
+      send(raw) { responses.push(JSON.parse(raw)) },
+    }
+    handlers.message(candidate, JSON.stringify({ type: 'register', host: 'nas642', name, projectPath: stateDir }))
+    expect(responses).toEqual([{ type: 'error', message: 'register rejected: invalid_bus_alias' }])
+    expect(candidate.data.sessionName).toBeNull()
+  }
+
 
   async function plugin() {
     const client = new Client({ name: 'rename-fixture', version: '1' })
@@ -54,6 +65,7 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: stateDir,
         DISCORD_AGENT: 'agy',
+        DISCORD_HOST_LABEL: 'nas642',
         DISCORD_SUPERVISOR_PID: 'fixture-supervisor',
         DISCORD_PARENT_PID: String(process.pid),
         DISCORD_CONVERSATION_ID: 'injection-conversation',
@@ -81,6 +93,11 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
     for (const name of ['has spaces', '', 'x'.repeat(129)]) {
       const invalid = await first.callTool({ name: 'bus_rename', arguments: { name } })
       expect(invalid.isError).toBe(true)
+    }
+    for (const name of ['human', 'router', 'all:synthesis', 'claude@otherhost:x']) {
+      const denied = await first.callTool({ name: 'bus_rename', arguments: { name } })
+      expect(denied.isError).toBe(true)
+      expect(JSON.stringify(denied.content)).toContain('invalid_bus_alias')
     }
     const result = await first.callTool({ name: 'bus_rename', arguments: { name: 'cfd-injection-smart' } })
     expect(result.content).toEqual([{ type: 'text', text: renamed }])

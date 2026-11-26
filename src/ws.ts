@@ -58,6 +58,7 @@ export interface WsData {
   authed?: boolean
   /** Set when this connection is a node daemon. */
   nodeName?: string
+  legacyHost?: string
   gateway?: { user: string; agents: Map<string, Target> }
   /** Register-time instance id of the client connection (grant binding). */
   instanceId?: string
@@ -421,13 +422,20 @@ function matchesSecret(secret: unknown, hash: string | undefined): boolean {
     timingSafeEqual(createHash('sha256').update(secret).digest(), Buffer.from(hash, 'hex'))
 }
 
-function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
+function qualifiedAliasHost(alias: string): string | undefined {
+  return /^[-\w./]+@([a-z0-9.-]+)(?::[^@]+)?$/i.exec(alias)?.[1]
+}
+
+function aliasAllowedOnHost(alias: string, host?: string): boolean {
   const lower = alias.toLowerCase()
-  if (!/^[-\w.@:/]+$/.test(alias) || HUMAN_TARGETS.has(lower) ||
-      lower === 'router' || /^all(?::(?:synthesis|independent))?$/.test(lower) || lower.startsWith('@all')) return false
-  const qualified = /^[-\w./]+@([a-z0-9.-]+)(?::[-\w./:]+)?$/i.exec(alias)
-  if (qualified) return qualified[1] === host
-  if (alias.includes('@')) return false
+  if (!alias || HUMAN_TARGETS.has(lower) || lower === 'router' ||
+      /^all(?::(?:synthesis|independent))?$/.test(lower) || lower.startsWith('@all')) return false
+  return !alias.includes('@') || (!!host && qualifiedAliasHost(alias) === host)
+}
+
+function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
+  if (!/^[-\w.@:/]+$/.test(alias) || !aliasAllowedOnHost(alias, host)) return false
+  if (qualifiedAliasHost(alias)) return true
   const owners = deps.gatewayAliasHosts?.()
   return !!owners && Object.hasOwn(owners, alias) && owners[alias] === host
 }
@@ -799,11 +807,18 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         return
       }
       const normalized = parsed.name.trim()
+      const host = ws.data.legacyHost ?? parsed.host ?? qualifiedAliasHost(normalized)
+      if ((parsed.host !== undefined && (typeof parsed.host !== 'string' || !/^[a-z0-9][a-z0-9.-]*$/i.test(parsed.host) || parsed.host !== host)) ||
+          !aliasAllowedOnHost(normalized, host)) {
+        sendError(ws, 'register rejected: invalid_bus_alias')
+        return
+      }
       if (deps.inboxes?.target(normalized)) {
         ws.send(JSON.stringify({ type: 'replaced', name: normalized }))
         return
       }
       ws.data.authed = true
+      ws.data.legacyHost = host
       {
         // Headless turns (pull mode) re-register the same name each turn; replace the stale
         // slot instead of creating "name-2" that nobody reads.
@@ -839,7 +854,8 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       break
     case 'rename': {
       const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
-      if (!hasString(parsed, 'name') || (requestId && !isBusAlias(parsed.name))) {
+      if (!hasString(parsed, 'name') || (requestId && !isBusAlias(parsed.name)) ||
+          !aliasAllowedOnHost(parsed.name.trim(), ws.data.legacyHost)) {
         sendOperationError(ws, requestId, 'invalid_bus_alias')
         return
       }
