@@ -1,0 +1,27 @@
+# Round 2 · Fable · Response to Astra's 7 cuts, plus 3 more
+
+I accept five of Astra's cuts outright, accept one with a condition, and contest one. I checked each against the diffs in `prs/` (added lines only; I did not run the tests). LOC figures for my own cuts are estimates of non-test source.
+
+## Astra's cuts
+
+1. **One assignment op for the master: ACCEPT, with a condition.** Two writes do leave a claimed-but-never-notified window. The condition is where the assignment lives. Input: the master assigns message X after a router restart, or after 200 later human posts. State: X is gone from the in-memory human-mail cache. Wrong result: the owner is recorded and nothing is delivered. Astra names this. The cut is only smaller if the assignment is a record in the existing claims table keyed by the human message id, with the saved body journalled beside it. A third store would make it bigger than what it replaces.
+
+2. **Drop the Claude recipient-token route: CONTEST.** Input: mail for a plain `claude` session in bypass mode, idle in tmux, not launched with the channel flag. State: the gateway posts as an external sender, and the 16:15 test 2 result applies, so the nudge is held in an approval dialog. Wrong result: nobody is at the pane, an idle agent never calls `check_inbox` on its own, and R8#2 forbids the tmux fallback, so that session is deaf until a human touches it. That is the unattended-wake failure v4 exists to fix. This is also Q1, which is Mick's call and not a ruling this debate can make. What I would accept: do not build the token route until a census shows a fleet Claude session that lacks the channel capability and cannot be relaunched with it. If the census is empty, the route has no user and Astra is right.
+
+3. **Retire gateway `mark` and per-item `ack`: ACCEPT.** Confirmed in #12: `wakeNative` journals `uncertain` (and assigns `n`) before it sends the wake, so the gateway's `onPending` mark appends a second identical record and costs a second fsync. `RouterLink.ack` lost its only caller when #19 deleted the line protocol. The gateway's own pre-send disk write stays; that one covers the non-idempotent Codex `queue/add`.
+
+4. **Single registry map: ACCEPT.** Three indexes with hand-written unlinking for a per-host table of a few dozen rows. Keep `matches()` (alias, generation and identity together) and the start-time filter on parent pid.
+
+5. **No adapter-factory registry or optional loader: ACCEPT, and it fixes a silent failure.** `loadNativeDiscovery` wraps a dynamic import and the constructor in `catch { return undefined }`. Input: a broken or missing `discovery.js`, or a bad bindings file read at construct time. Result today: the gateway starts, registers zero agents and reports nothing. A normal import turns that into a startup error.
+
+6. **Shared peer-credential decoding: ACCEPT**, subject to the ops-upgrader veto. I read only the outline of `peer-cred.ts`, so I rely on Astra's two named regressions (launchd-parent discovery succeeds, unverifiable pipe parent fails) staying as tests.
+
+7. **One router-reply table: ACCEPT, with one guard.** Confirmed: `failPending` clears `pending` and never `wakeAcks`. The guard: `deliver()` calls `wakeResult` without awaiting it. Once it goes through `call()`, a 30 s timeout or disconnect rejects a promise nobody holds. The implementer must attach a handler that leaves the row unreported, or the rejection is unhandled in the gateway process.
+
+## Three more cuts
+
+8. **Drop the signed receipt (router, #12 `inboxes.ts`).** Remove `receiptMac`, `foreignReceipt`, the `receiptKey` journal record and the legacy-UUID scan; make the receipt a random UUID. About 25–30 LOC and one journal record type. Acking is already scoped to the caller's identity: `lease()` only accepts ids from `this.list(key)` whose stored receipt matches, and `ack()` checks key, lease id, receipt and expiry. The HMAC changes exactly one outcome: another identity presenting an already-consumed receipt gets `invalid_receipt` instead of `stale` (the `consumed-foreign` test). No mail is read, acked or lost either way. R8#1 asked that an ack carry the lease issued to that identity, and key scoping already gives that. Subject to the ops-upgrader veto.
+
+9. **Drop `term` from the wire and the agent-side stale-term rule (A10, unbuilt).** If #1 is accepted, the router checks that the caller is the current master and records one owner per human message id, returning that owner on any retry. A stale master fails the first check. A new master cannot double-assign because of the second. An assignment that reaches an agent was already verified by the router, so "agents ignore an older term" guards nothing and is a prompt-level invariant nobody can test. Keep the term counter in the journal and the #general announcement. Avoids an estimated 15–25 LOC and one rule in every agent's prompt.
+
+10. **Delete what #19 and A4 orphaned in the gateway.** `WakeStore.ack` has no caller since #19. `nudgeNumber` and `makeNudge` in `gateway/types.ts` are used only by tests since A4 made the router's `n` authoritative; the tests should pass a literal `n`. About 15–20 LOC. This also exposes a leak to fix in the same PR: with `ack` gone, rows leave `wakes.json` only through `clearOpen`, which skips `unavailable` rows, so every wake to an unavailable target stays in the file forever while each write rewrites the whole file. Drop a terminal row once the router has acknowledged its result.
