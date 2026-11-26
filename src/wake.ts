@@ -91,6 +91,7 @@ export class Conversations {
   private readonly ids = new Map<string, string>()
   set(name: string, id: string): void {
     if (id) this.ids.set(name, id)
+    else this.ids.delete(name)
   }
   get(name: string): string | undefined {
     return this.ids.get(name)

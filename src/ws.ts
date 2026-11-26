@@ -18,7 +18,9 @@
 import type { WsMcpOp, PluginToRouterMessage, WsRegistered, WsRenamed, WsError, WsToolResult, WsPermissionVerdict, WsAskUser, WsRegisterSkills, ChannelMeta } from './types.js'
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
-import type { Inboxes, NodeRegistry, Claims } from './nodes.js'
+import type { NodeRegistry, Claims } from './nodes.js'
+import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
+import type { GatewayToRouterMessage, Kind, PublishResult, Target, WakeResult } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
 import { orderByCost, resolveExact, type Activity, type Conversations, type CostClasses, type HumanMail, type Unread, type WakeBudget, type WakeLog } from './wake.js'
@@ -44,7 +46,7 @@ import {
   type TextBasedChannel,
 } from 'discord.js'
 import { writeFile, mkdir } from 'node:fs/promises'
-import { createHash, timingSafeEqual } from 'node:crypto'
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { join, basename } from 'node:path'
 
 export interface WsData {
@@ -55,6 +57,7 @@ export interface WsData {
   authed?: boolean
   /** Set when this connection is a node daemon. */
   nodeName?: string
+  gateway?: { user: string; agents: Map<string, Target> }
   /** Register-time instance id of the client connection (grant binding). */
   instanceId?: string
 }
@@ -91,6 +94,8 @@ export interface WsDeps {
    * secret; unlisted nodes are rejected when `require` is set (else accepted with a warning).
    */
   readonly nodeSecrets?: () => { readonly hashes: Readonly<Record<string, string>>; readonly require: boolean }
+  /** Router-controlled ownership of legacy gateway aliases without a host suffix. */
+  readonly gatewayAliasHosts?: () => Readonly<Record<string, string>>
   /** Sessions allowed to manage other sessions' subscriptions (DISCORD_ADMIN_SESSIONS). */
   readonly admins?: ReadonlySet<string>
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
@@ -151,51 +156,111 @@ const pullSessions = new Set<string>()
 function allNames(deps: Readonly<WsDeps>): string[] {
   const out = new Set(deps.sessions.getSessions().map(s => s.name))
   for (const a of deps.nodes?.list() ?? []) out.add(a.name)
+  for (const name of deps.inboxes?.names() ?? []) out.add(name)
   return [...out]
 }
 
-/**
- * Deliver one message to one agent: push to a live push-mode session; otherwise queue it in the
- * durable inbox and, if a node owns the agent, ask the node to run a turn.
- */
-export function deliver(deps: Readonly<WsDeps>, name: string, text: string, meta: ChannelMeta): boolean {
-  const live = deps.sessions.getSessions().some(s => s.name === name)
-  const cold = !live
-  // Human mail and the router's own rules always wake. Other cold wakes are budgeted.
-  const exempt = meta.from_human === 'true' || meta.from === 'router'
-  if (cold && !exempt && deps.budget && !deps.budget.allow(name, deps.costs?.get(name) ?? 'standard')) {
-    deps.unread?.bump([name])
-    return false
+const gateways = new WeakMap<Inboxes, Map<string, WsLike>>()
+
+function liveSession(deps: Readonly<WsDeps>, name: string): boolean {
+  return deps.sessions.getSessions().some(session => session.name === name)
+}
+
+function admission(deps: Readonly<WsDeps>, name: string, meta: ChannelMeta): ChannelMeta | undefined {
+  const target = deps.inboxes?.target(name)
+  const live = liveSession(deps, name)
+  const node = deps.nodes?.get(name)
+  const conv = target?.conv ?? deps.conversations?.get(name) ?? (!live ? deps.inboxes?.conversation(name) : undefined)
+  if (!target && !live && !node && !conv) return undefined
+  if (meta.conversation_id && target && meta.conversation_id !== target.conv) return undefined
+  return conv && (target || (meta.from_human === 'true' && meta.question_id)) ? { ...meta, conversation_id: conv } : meta
+}
+
+// Legacy push has no recipient receipt. A successful transport send is its acceptance point.
+function pushLegacy(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): void {
+  try {
+    if (!deps.sessions.routeToSession(name, entry.content, { ...entry.meta, queued_at: entry.at, bus_msg_id: entry.id })) return
+  } catch { return }
+  deps.inboxes?.accept([entry.id])
+}
+
+function nativeConnection(inboxes: Inboxes, target: Target): WsLike | undefined {
+  const ws = gateways.get(inboxes)?.get(target.host)
+  const registered = ws?.data.gateway?.agents.get(target.alias)
+  return registered && identityKey(registered) === identityKey(target) ? ws : undefined
+}
+
+function wakeNative(deps: Readonly<WsDeps>, target: Target, entry: InboxEntry, reconcile = false): void {
+  const inboxes = deps.inboxes!
+  const ws = nativeConnection(inboxes, target)
+  if (!ws || identityKey(target) !== entry.key) return
+  if (reconcile ? entry.state !== 'uncertain' : entry.state !== 'committed') return
+  const attempt = entry.nudgeNumber === undefined
+    ? inboxes.mark(entry.key, entry.id, { s: 'uncertain' }) : entry
+  try {
+    ws.send(JSON.stringify({
+      type: 'wake', as: target.alias, msgId: entry.id, n: attempt.nudgeNumber,
+      ...(reconcile && { reconcile: true }),
+    }))
+  } catch {
+    // The attempt is durable and will be reconciled on register.
   }
-  let ok = false
-  let pending = deps.inboxes?.count(name) ?? 0
-  const known = meta.conversation_id ?? (meta.from_human === 'true' && meta.question_id ? deps.conversations?.get(name) : undefined)
-  const stamped: ChannelMeta = known ? { ...meta, conversation_id: known } : meta
-  // An approval for an offline session is held only when that conversation has checked in before.
-  // Otherwise it would sit on a display name the next conversation could inherit.
-  if (!live && !deps.nodes?.get(name) && meta.from_human === 'true' && meta.question_id && !known) return false
-  if (live && !pullSessions.has(name)) ok = deps.sessions.routeToSession(name, text, stamped)
-  else if (!deps.inboxes) ok = live ? deps.sessions.routeToSession(name, text, stamped) : false
-  else if (!live && !deps.nodes?.get(name)) {
-    if (stamped.conversation_id && meta.from_human === 'true' && meta.question_id) {
-      pending = deps.inboxes.push(name, text, stamped)
-      ok = true
-    }
-  } else {
-    pending = deps.inboxes.push(name, text, stamped)
-    // A live pull session is mid-turn and will check_inbox; the node re-checks after the turn.
-    if (!live) deps.nodes?.wake(name, pending)
-    ok = true
-  }
-  if (ok) deps.wakeLog?.record({ name, messageId: stamped.message_id, pending, cold, at: Date.now() })
-  return ok
+}
+
+function allowsWake(deps: Readonly<WsDeps>, name: string, meta: ChannelMeta): boolean {
+  return meta.from_human === 'true' || meta.from === 'router' ||
+    (deps.budget?.allow(name, deps.costs?.get(name) ?? 'standard') ?? true)
+}
+
+function transport(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): void {
+  const target = deps.inboxes?.target(name)
+  if (target ? identityKey(target) !== entry.key : entry.key !== name) return
+  const live = liveSession(deps, name)
+  const cold = !!target || !live
+  if (target) {
+    if (!nativeConnection(deps.inboxes!, target) || entry.state !== 'committed' ||
+        deps.inboxes!.wakePending(entry.key)) return
+  } else if (!live && !deps.nodes?.get(name)) return
+  if (cold && !allowsWake(deps, name, entry.meta)) return
+  const pending = deps.inboxes?.count(name) ?? 0
+  if (target) wakeNative(deps, target, entry)
+  else if (live && !pullSessions.has(name)) {
+    if (entry.meta.from_human === 'true' && entry.meta.question_id && entry.meta.conversation_id &&
+        entry.meta.conversation_id !== deps.conversations?.get(name)) return
+    pushLegacy(deps, name, entry)
+  } else if (!live) deps.nodes?.wake(name, pending)
+  deps.wakeLog?.record({ name, messageId: entry.meta.message_id, pending, cold, at: Date.now() })
+}
+
+export function deliver(deps: Readonly<WsDeps>, name: string, text: string, meta: ChannelMeta, target?: Target): boolean {
+  const stamped = target ? { ...meta, conversation_id: target.conv } : admission(deps, name, meta)
+  if (!stamped) return false
+  if (!deps.inboxes) return deps.sessions.routeToSession(name, text, stamped)
+  const [entry] = deps.inboxes.commit([{ name, content: text, meta: stamped, ...(target && { target }) }])
+  logCommit(deps, name, entry!)
+  transport(deps, name, entry!)
+  return true
+}
+
+function logCommit(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): void {
+  const target = deps.inboxes?.target(name)
+  let path = 'inbox'
+  if (target) {
+    if (identityKey(target) === entry.key && nativeConnection(deps.inboxes!, target)) path = 'node'
+  } else if (liveSession(deps, name)) {
+    if (!pullSessions.has(name)) path = 'push'
+  } else if (deps.nodes?.get(name)) path = 'node'
+  const safe = (value: string) => value.replace(/[\x00-\x1f\x7f-\x9f]/g, '?')
+  const from = entry.meta.from ?? entry.meta.user ?? 'unknown'
+  process.stderr.write(`deliver ${entry.id} ${safe(from)} -> ${safe(entry.key)} state=${entry.state} path=${path}\n`)
 }
 
 function sendRulesOnce(deps: Readonly<WsDeps>, name: string): void {
   const r = deps.rules?.()
   if (!r || r.seen(name)) return
-  r.markSeen(name)
-  deliver(deps, name, r.text, { source: 'agent-bus', from: 'router', user: 'router', to: name, channel: 'rules', chat_id: deps.busChannelId })
+  if (deliver(deps, name, r.text, { source: 'agent-bus', from: 'router', user: 'router', to: name, channel: 'rules', chat_id: deps.busChannelId })) {
+    r.markSeen(name)
+  }
 }
 
 /** Remote MCP over the bus: mcp_list / mcp_describe / mcp_call (see src/mcp.ts). */
@@ -247,6 +312,7 @@ function forwardMcpExec(ws: WsLike, clientRequestId: string, decl: McpServerDecl
 export interface WsLike {
   data: WsData
   send(msg: string): void
+  close?(): void
 }
 
 export interface WsHandlers {
@@ -260,6 +326,11 @@ async function fetchTextChannelOrNull(client: Client, channelId: string): Promis
   const ch = await client.channels.fetch(channelId)
   if (!ch || !ch.isTextBased()) return null
   return ch as TextBasedChannel
+}
+
+export function inboxError(err: unknown): string {
+  return err instanceof Error && /^(inbox_full|inbox_commit_failed|invalid_receipt|unknown_message|invalid_wake_transition|wake_already_pending|publish_payload_mismatch)$/.test(err.message)
+    ? err.message : 'request_failed'
 }
 
 export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
@@ -277,10 +348,28 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
         return
       }
 
-      dispatchMessage(ws, parsed, deps)
+      if (!parsed || typeof parsed !== 'object') { sendError(ws, 'Invalid frame'); return }
+      try {
+        dispatchMessage(ws, parsed, deps)
+      } catch (err) {
+        const code = inboxError(err)
+        const requestId = (parsed as { requestId?: unknown }).requestId
+        try {
+          if (typeof requestId === 'string') sendToolResult(ws, requestId, false, code)
+          else sendError(ws, code)
+        } catch { /* The connection may have closed while sending a result. */ }
+      }
     },
 
     close(ws: WsLike): void {
+      if (ws.data.gateway && ws.data.nodeName && deps.inboxes) {
+        const hosts = gateways.get(deps.inboxes)
+        if (hosts?.get(ws.data.nodeName)?.data === ws.data) hosts.delete(ws.data.nodeName)
+        ws.data.gateway = undefined
+        ws.data.nodeName = undefined
+        ws.data.authed = false
+        return
+      }
       if (ws.data.nodeName && ws.data.sendCallback) {
         deps.nodes?.unregister(ws.data.nodeName, ws.data.sendCallback)
         deps.onSessionChange?.()
@@ -320,24 +409,196 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
   }
 }
 
+const GATEWAY_KINDS: ReadonlySet<Kind> = new Set(['claude', 'codex', 'opencode', 'grok', 'agy'])
+
+function matchesSecret(secret: unknown, hash: string | undefined): boolean {
+  return typeof secret === 'string' && secret.length > 0 && typeof hash === 'string' && /^[a-f0-9]{64}$/i.test(hash) &&
+    timingSafeEqual(createHash('sha256').update(secret).digest(), Buffer.from(hash, 'hex'))
+}
+
+function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
+  const lower = alias.toLowerCase()
+  if (!/^[-\w.@:/]+$/.test(alias) || HUMAN_TARGETS.has(lower) ||
+      lower === 'router' || /^all(?::(?:synthesis|independent))?$/.test(lower) || lower.startsWith('@all')) return false
+  const qualified = /^[-\w./]+@([a-z0-9.-]+)(?::[-\w./:]+)?$/i.exec(alias)
+  if (qualified) return qualified[1] === host
+  if (alias.includes('@')) return false
+  const owners = deps.gatewayAliasHosts?.()
+  return !!owners && Object.hasOwn(owners, alias) && owners[alias] === host
+}
+
+function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly<WsDeps>): void {
+  const inboxes = deps.inboxes
+  const reply = (ok: boolean, data: string) => {
+    if (typeof frame.requestId === 'string') sendToolResult(ws, frame.requestId, ok, data)
+    else if (!ok) sendError(ws, data)
+  }
+  if (!inboxes) { reply(false, 'gateway_disabled'); return }
+  let hosts = gateways.get(inboxes)
+  if (!hosts) { hosts = new Map(); gateways.set(inboxes, hosts) }
+  if (frame.type === 'registerGateway') {
+    if (ws.data.nodeName || ws.data.sessionName || frame.proto !== 1 ||
+        typeof frame.host !== 'string' || !/^[a-z0-9][a-z0-9.-]*$/i.test(frame.host) ||
+        typeof frame.user !== 'string' || !/^[a-z0-9_][a-z0-9_.-]*$/i.test(frame.user)) {
+      reply(false, 'invalid_gateway_registration')
+      return
+    }
+    const hashes = deps.nodeSecrets?.().hashes
+    if (!hashes || !Object.hasOwn(hashes, frame.host) || !matchesSecret(frame.secret, hashes[frame.host])) {
+      reply(false, 'invalid_gateway_secret')
+      return
+    }
+    ws.data.nodeName = frame.host
+    ws.data.gateway = { user: frame.user, agents: new Map() }
+    const previous = hosts.get(frame.host)
+    hosts.set(frame.host, ws)
+    if (previous) {
+      try { previous.send(JSON.stringify({ type: 'replaced', name: frame.host })) } catch {}
+      try { previous.close?.() } catch {}
+      process.stderr.write(`Replaced gateway connection for ${frame.host}\n`)
+    }
+    ws.send(JSON.stringify({ type: 'gatewayRegistered', host: frame.host, user: frame.user, proto: 1 }))
+    reply(true, '{}')
+    return
+  }
+  const host = ws.data.nodeName
+  const gateway = ws.data.gateway
+  if (!host || !gateway || hosts.get(host)?.data !== ws.data) { reply(false, 'gateway_not_registered'); return }
+  if (frame.type === 'registerAgent') {
+    if (!GATEWAY_KINDS.has(frame.kind) || typeof frame.conv !== 'string' || !frame.conv.trim() ||
+        typeof frame.alias !== 'string' || (frame.host !== undefined && frame.host !== host) ||
+        !gatewayAliasAllowed(deps, frame.alias, host) ||
+        (deps.nodes?.get(frame.alias) && deps.nodes.get(frame.alias)?.node !== host)) {
+      reply(false, 'invalid_agent_registration')
+      return
+    }
+    const existing = inboxes.target(frame.alias)
+    if (existing && (existing.host !== host || existing.user !== gateway.user || existing.kind !== frame.kind)) {
+      reply(false, 'alias_already_registered')
+      return
+    }
+    const target: Target = { host, user: gateway.user, kind: frame.kind, conv: frame.conv, alias: frame.alias }
+    const alreadyRegistered = [...gateway.agents.values()].some(agent => identityKey(agent) === identityKey(target))
+    inboxes.bind(target)
+    gateway.agents.set(frame.alias, target)
+    deps.conversations?.set(frame.alias, frame.conv)
+    if (liveSession(deps, frame.alias)) {
+      deps.sessions.notifySession(frame.alias, JSON.stringify({ type: 'replaced', name: frame.alias }))
+      deps.sessions.deregisterSession(frame.alias)
+      pullSessions.delete(frame.alias)
+    }
+    ws.send(JSON.stringify({ type: 'agentRegistered', as: frame.alias, target }))
+    reply(true, JSON.stringify({ as: frame.alias, target }))
+    if (alreadyRegistered) return
+    for (const entry of inboxes.list(identityKey(target))) {
+      if (entry.state === 'uncertain') wakeNative(deps, target, entry, true)
+      else if (entry.state === 'committed' && (!entry.lease || entry.lease.until <= Date.now())) transport(deps, frame.alias, entry)
+    }
+    sendRulesOnce(deps, frame.alias)
+    deps.onSessionChange?.()
+    return
+  }
+  if (frame.type === 'releaseAgent') {
+    const target = typeof frame.alias === 'string' ? inboxes.target(frame.alias) : undefined
+    if (target?.host !== host || target.user !== gateway.user) { reply(false, 'invalid_as'); return }
+    inboxes.release(frame.alias)
+    gateway.agents.delete(frame.alias)
+    deps.conversations?.set(frame.alias, '')
+    ws.send(JSON.stringify({ type: 'agentReleased', alias: frame.alias }))
+    reply(true, '{}')
+    deps.onSessionChange?.()
+    return
+  }
+  const target = 'as' in frame && typeof frame.as === 'string' ? gateway.agents.get(frame.as) : undefined
+  const bound = target && inboxes.target(target.alias)
+  if (!target || !bound || identityKey(target) !== identityKey(bound)) { reply(false, 'invalid_as'); return }
+  if (typeof frame.requestId !== 'string' || !frame.requestId) { sendError(ws, 'requestId required'); return }
+  const key = identityKey(target)
+  switch (frame.type) {
+    case 'agentStatus':
+      reply(true, JSON.stringify(agentStatus(deps, target.alias)))
+      break
+    case 'lease': {
+      if (frame.receipt !== undefined && typeof frame.receipt !== 'string') { reply(false, 'invalid_receipt'); return }
+      const result = inboxes.lease(key, frame.receipt)
+      reply(true, JSON.stringify({ ...result, unread: deps.unread?.take(target.alias) ?? 0 }))
+      break
+    }
+    case 'ack':
+      if (typeof frame.leaseId !== 'string' || typeof frame.id !== 'string' || typeof frame.receipt !== 'string') {
+        reply(false, 'invalid_receipt'); return
+      }
+      inboxes.ack(key, frame.leaseId, frame.id, frame.receipt)
+      reply(true, '{}')
+      break
+    case 'mark':
+      if (typeof frame.id !== 'string' || frame.state !== 'uncertain') { reply(false, 'invalid_wake_transition'); return }
+      inboxes.mark(key, frame.id, { s: 'uncertain' })
+      reply(true, '{}')
+      break
+    case 'wakeResult': {
+      const result = frame.result
+      if (typeof frame.id !== 'string' || !result || !['woken', 'held', 'refused', 'uncertain', 'unavailable'].includes(result.s) ||
+          (result.s === 'woken' && (typeof result.nativeId !== 'string' || !result.nativeId))) {
+        reply(false, 'invalid_wake_transition')
+        return
+      }
+      // Persist only the typed fields, never the rest of the incoming frame.
+      inboxes.mark(key, frame.id, result.s === 'woken' ? { s: 'woken', nativeId: result.nativeId } : { s: result.s })
+      reply(true, '{}')
+      break
+    }
+    case 'busPost': {
+      if (typeof frame.text !== 'string') { reply(false, 'busPost requires text'); return }
+      const sender: WsLike = { data: { sessionName: target.alias, sendCallback: null }, send: message => ws.send(message) }
+      handleBusPost(sender, frame.text, frame.to, deps, [], frame, target)
+      break
+    }
+    default:
+      reply(false, 'unsupported_gateway_operation')
+  }
+}
+
+function agentStatus(deps: Readonly<WsDeps>, name: string) {
+  const target = deps.inboxes?.target(name)
+  const live = target && deps.inboxes
+    ? !!nativeConnection(deps.inboxes, target)
+    : liveSession(deps, name)
+  const states: Partial<Record<InboxEntry['state'], number>> = {}
+  if (target) for (const entry of deps.inboxes!.list(identityKey(target))) {
+    states[entry.state] = (states[entry.state] ?? 0) + 1
+  }
+  return {
+    live, mode: live ? (target || pullSessions.has(name) ? 'pull' : 'push') : null,
+    pending: deps.inboxes?.count(name) ?? 0, ...(target && { states }),
+  }
+}
+
 function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readonly<WsDeps>): void {
+  if (ws.data.gateway || ['registerGateway', 'registerAgent', 'releaseAgent', 'lease', 'ack', 'mark', 'wakeResult'].includes(parsed.type)) {
+    handleGateway(ws, parsed as GatewayToRouterMessage, deps)
+    return
+  }
+  if (ws.data.sessionName && deps.inboxes?.target(ws.data.sessionName)) {
+    ws.send(JSON.stringify({ type: 'replaced', name: ws.data.sessionName }))
+    return
+  }
   if (deps.secret && parsed.type !== 'register' && parsed.type !== 'registerNode' && !ws.data.authed) {
     sendError(ws, 'Not authenticated: register with the router secret first')
     return
   }
   switch (parsed.type) {
     case 'registerNode': {
-      if (deps.secret && parsed.secret !== deps.secret) { sendError(ws, 'register rejected: bad or missing router secret'); return }
+      if (deps.secret && !matchesSecret(parsed.secret, createHash('sha256').update(deps.secret).digest('hex'))) { sendError(ws, 'register rejected: bad or missing router secret'); return }
       if (!deps.nodes || !hasString(parsed, 'node') || !Array.isArray(parsed.agents)) { sendError(ws, 'registerNode requires node and agents (and a router with nodes enabled)'); return }
       {
         // The shared router secret only proves "some client of this bus". Node names own wakes
         // and MCP execution, so each node proves its identity with its own secret.
         const ns = deps.nodeSecrets?.()
-        const want = ns?.hashes[parsed.node]
+        const want = ns?.hashes && Object.hasOwn(ns.hashes, parsed.node) ? ns.hashes[parsed.node] : undefined
         const got = (parsed as { nodeSecret?: string }).nodeSecret
         if (want) {
-          const h = got ? createHash('sha256').update(got).digest('hex') : ''
-          if (!h || !timingSafeEqual(Buffer.from(h), Buffer.from(want))) { sendError(ws, `register rejected: bad or missing node secret for "${parsed.node}"`); return }
+          if (!matchesSecret(got, want)) { sendError(ws, `register rejected: bad or missing node secret for "${parsed.node}"`); return }
         } else if (ns?.require) {
           sendError(ws, `register rejected: node "${parsed.node}" has no node secret on the router`); return
         } else if (ns) {
@@ -386,14 +647,10 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
     }
     case 'agentStatus': {
       // For nodes: is an interactive (push) session holding this name? Then the node must not run
-      // a headless turn on the same conversation; any queued mail is handed to the live session.
+      // a headless turn on the same conversation.
       const p = parsed as { requestId?: string; agent?: string }
       if (!p.requestId || !p.agent) { sendError(ws, 'agentStatus requires requestId and agent'); return }
-      const live = deps.sessions.getSessions().some(s => s.name === p.agent)
-      const push = live && !pullSessions.has(p.agent)
-      const cid = deps.conversations ? (deps.conversations.get(p.agent) ?? null) : undefined
-      if (push) for (const q of deps.inboxes?.drain(p.agent, cid) ?? []) deps.sessions.routeToSession(p.agent, q.content, { ...q.meta, queued_at: q.at })
-      sendToolResult(ws, p.requestId, true, JSON.stringify({ live, mode: live ? (push ? 'push' : 'pull') : null, pending: deps.inboxes?.count(p.agent) ?? 0 }))
+      sendToolResult(ws, p.requestId, true, JSON.stringify(agentStatus(deps, p.agent)))
       break
     }
     case 'inboxPull':
@@ -403,13 +660,16 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       if (!who) { sendToolResult(ws, parsed.requestId, false, 'not registered'); return }
       if (parsed.type === 'inboxCount') sendToolResult(ws, parsed.requestId, true, String(deps.inboxes?.count(who) ?? 0))
       else {
-        // Directed mail only. Old clients get a bare array. withUnread adds a count of
-        // passive chatter and never the bodies.
+        // Legacy check_inbox keeps its bare array or {messages, unread} format and
+        // accepts mail on a successful push or pull result. Gateway aliases use
+        // structured leases and an echoed receipt instead.
         const bound = deps.conversations ? (deps.conversations.get(who) ?? null) : undefined
-        const messages = deps.inboxes?.drain(who, bound) ?? []
+        const entries = deps.inboxes?.legacy(who, bound) ?? []
+        const messages = entries.map(({ content, meta, at }) => ({ content, meta, at }))
         const withUnread = (parsed as { withUnread?: boolean }).withUnread === true
         const unread = withUnread ? (deps.unread?.take(who) ?? 0) : 0
         sendToolResult(ws, parsed.requestId, true, JSON.stringify(withUnread ? { messages, unread } : messages))
+        deps.inboxes?.accept(entries.map(entry => entry.id))
       }
       break
     }
@@ -424,7 +684,7 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       {
         const { files, errors } = decodeFiles((parsed as { files?: unknown }).files)
         for (const e of errors) sendError(ws, e)
-        handleBusPost(ws, parsed.text, parsed.to, deps, files)
+        handleBusPost(ws, parsed.text, parsed.to, deps, files, parsed)
       }
       break
     case 'channelPost':
@@ -435,7 +695,7 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
       {
         const { files, errors } = decodeFiles((parsed as { files?: unknown }).files)
         for (const e of errors) sendError(ws, e)
-        void handleChannelPost(ws, parsed.channel, parsed.text, parsed.to, deps, files)
+        void handleChannelPost(ws, parsed.channel, parsed.text, parsed.to, deps, files).catch(err => sendError(ws, inboxError(err)))
       }
       break
     case 'channelList':
@@ -484,6 +744,11 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         sendError(ws, 'register rejected: bad or missing router secret')
         return
       }
+      const normalized = parsed.name.trim()
+      if (deps.inboxes?.target(normalized)) {
+        ws.send(JSON.stringify({ type: 'replaced', name: normalized }))
+        return
+      }
       ws.data.authed = true
       {
         // Headless turns (pull mode) re-register the same name each turn; replace the stale
@@ -502,13 +767,14 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         : ''
       handleRegister(ws, parsed.name, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
       if (ws.data.sessionName) {
-        if (conversationId) deps.conversations?.set(ws.data.sessionName, conversationId)
+        deps.conversations?.set(ws.data.sessionName, conversationId)
+        if (conversationId) deps.inboxes?.remember(ws.data.sessionName, conversationId)
         const cid = deps.conversations ? (deps.conversations.get(ws.data.sessionName) ?? null) : undefined
         if ((parsed as { mode?: string }).mode === 'pull') pullSessions.add(ws.data.sessionName)
         else {
           pullSessions.delete(ws.data.sessionName)
           // Messages queued while this agent was offline. Approvals for another conversation stay queued.
-          for (const q of deps.inboxes?.drain(ws.data.sessionName, cid) ?? []) deps.sessions.routeToSession(ws.data.sessionName, q.content, { ...q.meta, queued_at: q.at })
+          for (const entry of deps.inboxes?.legacy(ws.data.sessionName, cid) ?? []) pushLegacy(deps, ws.data.sessionName, entry)
         }
         sendRulesOnce(deps, ws.data.sessionName)
         deps.costs?.set(ws.data.sessionName, (parsed as { costClass?: unknown }).costClass)
@@ -522,6 +788,7 @@ function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readon
         sendError(ws, 'rename requires name')
         return
       }
+      if (deps.inboxes?.target(parsed.name.trim())) { sendError(ws, 'alias already registered'); return }
       handleRename(ws, parsed.name, deps)
       break
     case 'reply':
@@ -603,6 +870,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     name,
     projectPath,
     instanceId,
+    name => !!deps.inboxes?.target(name),
   )
   ws.data.sessionName = actualName
   ws.data.sendCallback = sendCb
@@ -629,7 +897,13 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>): void
     sendError(ws, 'Cannot rename: not registered')
     return
   }
-  const actualName = deps.sessions.renameSession(oldName, newName)
+  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name))
+  if (pullSessions.delete(oldName)) pullSessions.add(actualName)
+  const conv = deps.conversations?.get(oldName)
+  if (conv) {
+    deps.conversations?.set(actualName, conv)
+    deps.inboxes?.remember(actualName, conv)
+  }
   ws.data.sessionName = actualName
 
   const response: WsRenamed = { type: 'renamed', oldName, newName: actualName }
@@ -689,15 +963,15 @@ function handleReact(chatId: string, messageId: string, emoji: string, deps: Rea
   })()
 }
 
-async function sendToDiscordAwait(client: Client, chatId: string, text: string, files?: readonly DiscordFile[]): Promise<string | undefined> {
+async function sendToDiscordAwait(client: Client, chatId: string, text: string, files?: readonly DiscordFile[], nonce?: string): Promise<string | undefined> {
   try {
     const ch = await fetchTextChannelOrNull(client, chatId)
     if (!ch || !('send' in ch)) return undefined
-    const sent = await ch.send({ content: text, ...(files?.length ? { files: [...files] } : {}) })
+    const sent = await ch.send({ content: text, ...(files?.length && { files: [...files] }), ...(nonce && { nonce, enforceNonce: true }) })
     noteSent(sent.id)
     return sent.id
-  } catch (err: unknown) {
-    process.stderr.write(`discord: send failed: ${err instanceof Error ? err.message : String(err)}\n`)
+  } catch {
+    process.stderr.write('discord: bus mirror unavailable\n')
     return undefined
   }
 }
@@ -1052,7 +1326,7 @@ const HUMAN_TARGETS = new Set(['human', 'admin', 'user', 'me'])
  * `to` must be an exact session name. Omitting it mirrors the message and wakes nobody.
  * `to=all` or `to=@all:synthesis` is an explicit fan-out.
  */
-export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[]): void {
+export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[], publish?: { requestId?: string; publish_id?: string }, sender?: Target): void {
   if (!ws.data.sessionName) {
     sendError(ws, 'Cannot post to bus: not registered')
     return
@@ -1061,7 +1335,7 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
     sendError(ws, 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL')
     return
   }
-  postToChannel(ws, deps.busChannelId, undefined, text, to, deps, files)
+  postToChannel(ws, deps.busChannelId, undefined, text, to, deps, files, publish, sender)
 }
 
 /** Sessions that receive untargeted traffic in a channel: everyone for the default bus, else subscribers. */
@@ -1079,15 +1353,86 @@ async function handleChannelPost(ws: WsLike, ref: string, text: string, to: stri
   postToChannel(ws, ch.id, ch.name, text, to, deps, files)
 }
 
-function postToChannel(ws: WsLike, channelId: string, channelName: string | undefined, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[]): void {
+const mirrorAttempts = new WeakMap<Inboxes, Map<string, {
+  fingerprint: string
+  result: Promise<string | undefined>
+}>>()
+
+function mirrorFingerprint(text: string, files?: readonly DiscordFile[]): string {
+  const hash = createHash('sha256').update(JSON.stringify([text, (files ?? []).map(file => [file.name, file.attachment.length])]))
+  for (const file of files ?? []) hash.update(file.attachment)
+  return hash.digest('hex')
+}
+
+function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: string, files: DiscordFile[] | undefined, attemptKey: string): Promise<string | undefined> {
+  const inboxes = deps.inboxes
+  let attempts = inboxes ? mirrorAttempts.get(inboxes) : undefined
+  if (inboxes && !attempts) { attempts = new Map(); mirrorAttempts.set(inboxes, attempts) }
+  const inFlight = attempts?.get(attemptKey)
+  if (inFlight) {
+    if (inFlight.fingerprint !== plan.fingerprint) return Promise.reject(new Error('publish_payload_mismatch'))
+    return inFlight.result
+  }
+  let expired = false
+  let deadline: number | ReturnType<typeof setTimeout>
+  const timeout = new Promise<undefined>(resolve => {
+    deadline = setTimeout(() => { expired = true; resolve(undefined) }, 2_000)
+  })
+  const chunks = chunk(`**[${plan.from} → ${plan.label}]**${plan.origin} ${text}`, deps.chunkLimit, deps.chunkMode)
+  const send = async () => {
+    let first: string | undefined
+    for (const [index, content] of chunks.entries()) {
+      if (expired) return undefined
+      const nonce = createHash('sha256').update(JSON.stringify([attemptKey, index])).digest('hex').slice(0, 25)
+      const messageId = await sendToDiscordAwait(deps.client, plan.where, content, index === 0 ? files : undefined, nonce)
+      if (!messageId) return undefined
+      first ??= messageId
+    }
+    return first
+  }
+  const attempt = Promise.race([send(), timeout]).finally(() => {
+    clearTimeout(deadline)
+    attempts?.delete(attemptKey)
+  })
+  attempts?.set(attemptKey, { fingerprint: plan.fingerprint, result: attempt })
+  return attempt
+}
+
+function postToChannel(ws: WsLike, channelId: string, channelName: string | undefined, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[], publish?: { requestId?: string; publish_id?: string }, sender?: Target): void {
   const from = ws.data.sessionName!
+  const requestId = typeof publish?.requestId === 'string' ? publish.requestId : undefined
+  const reply = (ok: boolean, data: string) => {
+    try {
+      if (requestId) sendToolResult(ws, requestId, ok, data)
+      else if (!ok) sendError(ws, data)
+      else if (publish) ws.send(JSON.stringify({ type: 'published', ...JSON.parse(data) }))
+    } catch { /* A caller can retry with the same publish id. */ }
+  }
+  if (to !== undefined && typeof to !== 'string') { reply(false, 'invalid_target'); return }
+  const now = Date.now()
+  const id = publish?.publish_id === undefined ? `pub_${now}_${randomUUID()}` : publish.publish_id
+  if (typeof id !== 'string' || !id || id.length > 256) { reply(false, 'invalid_publish_id'); return }
+  const key = JSON.stringify([sender ? identityKey(sender) : [from, deps.conversations?.get(from)], id])
+  const inboxes = deps.inboxes
+  const retry = inboxes?.publish(key, now)
+  if (retry) {
+    if (!retry.mirror) { reply(true, JSON.stringify(retry.result)); return }
+    if (retry.mirror.fingerprint !== mirrorFingerprint(text, files)) {
+      reply(false, 'publish_payload_mismatch')
+      return
+    }
+    void tryPublishMirror(deps, retry.mirror, text, files, JSON.stringify([key, retry.at])).then(messageId => {
+      if (messageId) inboxes!.publishMirrored(key, retry.at, messageId)
+      reply(true, JSON.stringify(messageId ? retry.result : { ...retry.result, mirror: 'failed' }))
+    }).catch(err => reply(false, inboxError(err)))
+    return
+  }
 
   // Loop guard: cap posts per session per minute.
-  const now = Date.now()
   const limit = deps.busMaxPerMinute ?? 12
   const times = (busPostTimes.get(from) ?? []).filter(t => now - t < 60_000)
   if (times.length >= limit) {
-    sendError(ws, `Agent bus rate limit: max ${limit} posts/minute. Wait before posting again.`)
+    reply(false, `Agent bus rate limit: max ${limit} posts/minute. Wait before posting again.`)
     return
   }
   times.push(now)
@@ -1098,10 +1443,10 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   const defaultLabel = channelId === deps.busChannelId || channelId === deps.humanChannelId ? 'all' : 'subscribers'
   const routed = routeAgentTarget(to, names, heard, defaultLabel, deps)
   if (!routed.ok) {
-    sendError(ws, routed.error)
+    reply(false, routed.error)
     return
   }
-  let targets = routed.targets
+  const targets = routed.targets
   const toLabel = routed.label
   const allMode = routed.allMode
   if (routed.passive) deps.unread?.bump(heard)
@@ -1122,18 +1467,41 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     ts: new Date(now).toISOString(),
   }
 
-  const chunks = chunk(`**[${from} → ${toLabel}]**${origin} ${text}`, deps.chunkLimit, deps.chunkMode)
-  // Deliver only after Discord accepts the mirror, so the recipient gets that message id.
-  void sendToDiscordAwait(deps.client, where, chunks[0], files?.length ? files : undefined).then(id => {
-    chunks.slice(1).forEach(c => sendToDiscord(deps.client, where, c))
-    finish(id)
+  const body = allMode === 'synthesis' ? `${text}\n\n(synthesis: read this channel for earlier replies before adding anything)` : text
+  const result: PublishResult = { publish_id: id, committed: targets }
+  const mirror: PublishMirror = { where, label: toLabel, origin, from, fingerprint: mirrorFingerprint(text, files), sender }
+  const messages = targets.map(name => {
+    const stamped = admission(deps, name, meta)
+    if (!stamped) throw new Error('unknown_target')
+    return { name, content: body, meta: stamped }
   })
-
-  function finish(messageId: string | undefined): void {
-    const m: ChannelMeta = { ...meta, ...(messageId && { message_id: messageId, chat_id: where }) }
-    const body = allMode === 'synthesis' ? `${text}\n\n(synthesis: read this channel for earlier replies before adding anything)` : text
-    deliverNamed(targets, body, m, deps)
-  }
+  const record = publish && targets.length ? { key, result, at: now, mirror } : undefined
+  const entries = inboxes?.commit(messages, record) ?? []
+  entries.forEach((entry, index) => logCommit(deps, targets[index]!, entry))
+  // Prefer a Discord message reference when available, with bounded waiting
+  // before delivery to agents. A mirror retry never replays agent transport.
+  const attemptKey = JSON.stringify([key, record ? now : 'uncommitted'])
+  void tryPublishMirror(deps, mirror, text, files, attemptKey).then(messageId => {
+    if (messageId) {
+      if (record) inboxes?.publishMirrored(key, now, messageId)
+      else {
+        inboxes?.setMirror(entries.map(entry => entry.id), messageId, sender)
+        if (publish && (publish.publish_id !== undefined || requestId) && !inboxes?.publish(key)) {
+          inboxes?.commit([], { key, result, at: now })
+        }
+      }
+    }
+    if (!inboxes) {
+      deliverNamed(targets, body, { ...meta, ...(messageId && { message_id: messageId }) }, deps)
+    } else {
+      entries.forEach((entry, index) => {
+        const pending = inboxes.get(entry.id)
+        if (pending) scheduleTransport(deps, targets[index]!, pending)
+      })
+    }
+    if (!messageId && toLabel === 'human') { reply(false, 'discord_unavailable'); return }
+    reply(true, JSON.stringify(!messageId && targets.length ? { ...result, mirror: 'failed' } : result))
+  }).catch(err => reply(false, inboxError(err)))
 
 }
 
@@ -1156,15 +1524,39 @@ function routeAgentTarget(to: string | undefined, names: readonly string[], hear
 }
 
 function deliverNamed(names: readonly string[], text: string, meta: ChannelMeta, deps: Readonly<WsDeps>): void {
-  const delay = meta.all_mode && (deps.staggerMs ?? 0) > 0 ? deps.staggerMs! : 0
-  if (delay <= 0) {
-    for (const name of names) deliver(deps, name, text, meta)
+  const inboxes = deps.inboxes
+  if (!inboxes) {
+    for (const name of names) {
+      const delay = transportDelay(deps, name, meta)
+      if (delay) setTimeout(() => deliver(deps, name, text, meta), delay)
+      else deliver(deps, name, text, meta)
+    }
     return
   }
-  const cheap = names.filter(n => (deps.costs?.get(n) ?? 'standard') === 'cheap')
-  const rest = names.filter(n => !cheap.includes(n))
-  for (const name of cheap) deliver(deps, name, text, meta)
-  if (rest.length) setTimeout(() => { for (const name of rest) deliver(deps, name, text, meta) }, delay)
+  const messages = names.flatMap(name => {
+    const stamped = admission(deps, name, meta.routed === 'dispatch' ? { ...meta, to: name } : meta)
+    return stamped ? [{ name, content: text, meta: stamped }] : []
+  })
+  const entries = inboxes.commit(messages)
+  entries.forEach((entry, index) => {
+    const name = messages[index]!.name
+    logCommit(deps, name, entry)
+    scheduleTransport(deps, name, entry)
+  })
+}
+
+function transportDelay(deps: Readonly<WsDeps>, name: string, meta: ChannelMeta): number {
+  return meta.all_mode && deps.costs?.get(name) !== 'cheap' ? deps.staggerMs ?? 0 : 0
+}
+
+function scheduleTransport(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): void {
+  const delay = transportDelay(deps, name, entry.meta)
+  if (!delay) { transport(deps, name, entry); return }
+  setTimeout(() => {
+    const current = deps.inboxes?.get(entry.id)
+    if (!current) return
+    try { transport(deps, name, current) } catch { /* Mail remains committed. */ }
+  }, delay)
 }
 
 function oneHumanTarget(deps: Readonly<WsDeps> | undefined, meta: ChannelMeta, names: readonly string[]): string | undefined {
@@ -1207,16 +1599,13 @@ function handleDispatch(ws: WsLike, parsed: { requestId?: string; messageId?: st
     if (!targets.includes(resolved.name)) targets.push(resolved.name)
   }
   if (targets.length === 0) { sendToolResult(ws, requestId, false, 'to must name at least one session'); return }
-  for (const name of targets) {
-    deliver(deps, name, saved.content, {
-      ...saved.meta,
-      from_human: 'true',
-      question_id: messageId,
-      message_id: messageId,
-      to: name,
-      routed: 'dispatch',
-    })
-  }
+  deliverNamed(targets, saved.content, {
+    ...saved.meta,
+    from_human: 'true',
+    question_id: messageId,
+    message_id: messageId,
+    routed: 'dispatch',
+  }, deps)
   const note = `routed to ${targets.join(', ')}`
   if (saved.meta.chat_id) sendToDiscord(deps.client, saved.meta.chat_id, note)
   sendToolResult(ws, requestId, true, JSON.stringify({ delivered: targets, question_id: messageId }))

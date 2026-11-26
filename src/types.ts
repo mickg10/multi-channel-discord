@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 // ============================================================
 // WebSocket Protocol — messages between MCP plugin and router
 // ============================================================
@@ -117,6 +119,8 @@ export interface WsPermissionRequest {
 /** Post to the shared agent bus channel and fan out to other sessions. */
 export interface WsBusPost {
   readonly type: 'busPost'
+  readonly requestId?: string
+  readonly publish_id?: string
   readonly text: string
   /** Exact session, "human", or "all". Omitted mirrors the post and wakes nobody. */
   readonly to?: string
@@ -289,6 +293,7 @@ export type RouterToPluginMessage =
   | WsError
   | WsToolResult
   | WsPermissionVerdict
+  | ({ type: 'published' } & PublishResult)
 
 // ============================================================
 // Session management
@@ -316,3 +321,83 @@ export interface ProjectHistoryEntry {
   readonly lastUsed: number
   readonly name: string
 }
+
+// Native gateway protocol (v1).
+export type Kind = 'claude' | 'codex' | 'opencode' | 'grok' | 'agy'
+export function nudgeText(n: number): string {
+  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError('Invalid nudge id')
+  return `[agent-bus] mail waiting (id ${n}) — call check_inbox`
+}
+
+export interface Target {
+  readonly host: string
+  readonly user: string
+  readonly kind: Kind
+  readonly conv: string
+  readonly alias: string
+}
+
+export type Nudge = { msgId: string; text: string; clientId: string }
+
+export function buildNudge(kind: Kind, conv: string, msgId: string, n: number): Nudge {
+  if (typeof msgId !== 'string' || !msgId) throw new TypeError('Invalid bus message id')
+  const hash = createHash('sha256').update(`${conv}:${msgId}`).digest('hex')
+  const clientId = kind === 'codex' ? 'bus-' + hash.slice(0, 32)
+    : kind === 'opencode' ? 'msg_bus' + hash.slice(0, 24)
+    : hash.slice(0, 32)
+  return { msgId, text: nudgeText(n), clientId }
+}
+export type WakeResult =
+  | { s: 'woken'; nativeId: string }
+  | { s: 'held' | 'refused' | 'uncertain' | 'unavailable' }
+
+export interface Adapter {
+  kind: Kind
+  probe(t: Target): Promise<{ ok: boolean }>
+  wake(t: Target, n: Nudge): Promise<WakeResult>
+  reconcile(t: Target, n: Nudge): Promise<WakeResult>
+}
+
+export type WakeState = 'committed' | 'leased' | WakeResult['s']
+
+export interface LeasedMessage {
+  readonly id: string
+  readonly leaseId: string
+  readonly body: string
+  readonly from: string
+  readonly from_human: boolean
+  readonly state: WakeState
+  readonly meta: ChannelMeta
+}
+
+export interface LeaseResult {
+  readonly messages: readonly LeasedMessage[]
+  readonly receipt?: string
+  readonly receipt_status?: 'stale'
+  readonly unread: number
+}
+
+export interface PublishResult {
+  readonly publish_id: string
+  readonly committed: readonly string[]
+  readonly mirror?: 'failed'
+}
+
+export type GatewayToRouterMessage =
+  | { type: 'registerGateway'; host: string; user: string; proto: 1; secret: string; requestId?: string }
+  | { type: 'registerAgent'; kind: Kind; conv: string; alias: string; host?: string; requestId?: string }
+  | { type: 'releaseAgent'; alias: string; requestId?: string }
+  | { type: 'agentStatus'; as: string; requestId: string }
+  | { type: 'lease'; as: string; requestId: string; receipt?: string }
+  | { type: 'ack'; as: string; requestId: string; leaseId: string; id: string; receipt: string }
+  | { type: 'mark'; as: string; requestId: string; id: string; state: 'uncertain' }
+  | { type: 'wakeResult'; as: string; requestId: string; id: string; result: WakeResult }
+  | (WsBusPost & { as: string; requestId: string })
+
+export type RouterToGatewayMessage =
+  | { type: 'gatewayRegistered'; host: string; user: string; proto: 1 }
+  | { type: 'agentRegistered'; as: string; target: Target }
+  | { type: 'agentReleased'; alias: string }
+  | { type: 'replaced'; name: string }
+  | { type: 'wake'; as: string; msgId: string; n: number; reconcile?: true }
+  | WsToolResult | WsError

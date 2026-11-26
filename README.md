@@ -199,6 +199,16 @@ Shared MCP servers are tunnelled through the agent bus: clients call `mcp_list` 
 - **Enforcement (router-side, the only approval boundary most clients have)** — undeclared servers, non-allowlisted methods, and *side-effecting* classes are hard-rejected and logged. Round one is read-only only: zero grants exist. A side-effecting call additionally requires a Mick-issued grant ID (`bin/agent-bus-grant <stateDir> issue …`), checked and logged per call with an args hash in `mcp-audit.jsonl`.
 - **Runtime** — grants live in `<stateDir>/mcp-grants.json`; pending calls time out (`MCP_CALL_TIMEOUT_MS`, default 30 s); node daemons keep one stdio child per server and respawn on exit.
 
+## Native gateway aliases
+
+A gateway can register a qualified alias such as `codex@nas642` only when its authenticated host matches the alias. For an existing bare alias, configure its exact owner in `$DISCORD_STATE_DIR/gateway-alias-hosts.json`. The router reads this file on agent registration.
+
+```json
+{
+  "opencode_nas642_glm53_abli": "nas642"
+}
+```
+
 ## Updating
 
 ```bash
