@@ -6,7 +6,7 @@ import { Inboxes, NodeRegistry } from '../nodes.js'
 import { Conversations, Unread, WakeBudget } from '../wake.js'
 import { Subscriptions } from '../subscriptions.js'
 import { buildCommand, parseTurnOutput, bootstrapPrompt } from '../node.js'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -195,6 +195,31 @@ describe('human channel + rules + archive', () => {
     expect(msgs(b).some(m => m.type === 'message')).toBe(false)
   })
 
+  test('topic posts to human send both copies while general and channel-free posts send once', async () => {
+    const channels = [{ id: 'bbq-topic', name: 'bbq' }, { id: 'bus1', name: 'general' }, { id: 'hq1', name: 'human-questions' }]
+    const h = createWsHandlers(deps({ channelOps: {
+      resolve: async name => channels.find(channel => channel.name === name) ?? null,
+      list: async () => channels,
+      create: async name => ({ id: name, name }),
+    } }))
+    const a = reg(h, 'claude@mac:bbq')
+    h.message(a, JSON.stringify({ type: 'channelPost', channel: 'bbq', text: 'answer', to: 'human' }))
+    await tick()
+    h.message(a, JSON.stringify({ type: 'channelPost', channel: 'general', text: 'new question', to: 'human' }))
+    await tick()
+    h.message(a, JSON.stringify({ type: 'busPost', text: 'channel-free question', to: 'human' }))
+    await tick()
+    h.message(a, JSON.stringify({ type: 'channelPost', channel: 'human-questions', text: 'already in human questions', to: 'human' }))
+    await tick()
+    expect(posted).toEqual([
+      ['bbq-topic', '**[claude@mac:bbq → human]** answer'],
+      ['hq1', '**[claude@mac:bbq → human]** (from #bbq) answer'],
+      ['hq1', '**[claude@mac:bbq → human]** (from #general) new question'],
+      ['hq1', '**[claude@mac:bbq → human]** (from #general) channel-free question'],
+      ['hq1', '**[claude@mac:bbq → human]** already in human questions'],
+    ])
+  })
+
   test('rules are delivered once per session name', () => {
     const seen = new Set<string>()
     const h = createWsHandlers(deps({ rules: () => ({ text: 'RULES', seen: n => seen.has(n), markSeen: n => { seen.add(n) } }) }))
@@ -269,7 +294,7 @@ describe('takeover + claims', () => {
   test('pull-mode re-register replaces the stale slot (no -2 suffix)', () => {
     const h = createWsHandlers(deps())
     reg(h, 'claude@m:x', 'pull')
-    const s2 = makeWs(); h.message(s2 as any, JSON.stringify({ type: 'register', name: 'claude@m:x', projectPath: '/p', instanceId: 'other', mode: 'pull' }))
+    const s2 = makeWs(); h.message(s2 as any, JSON.stringify({ type: 'register', name: 'claude@m:x', projectPath: '/p', instanceId: 'other', agent: 'claude', mode: 'pull' }))
     expect(msgs(s2)[0].name).toBe('claude@m:x')
     expect(sessions.getSessions().map(s => s.name)).toEqual(['claude@m:x'])
   })
@@ -415,7 +440,7 @@ describe('explicit-name takeover retires the stale holder', () => {
   test('newer client with takeover gets the exact name; old one is told "replaced"', () => {
     const h = createWsHandlers(deps())
     const stale = makeWs(); h.message(stale as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'old-thread' }))
-    const live = makeWs(); h.message(live as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'new-thread', takeover: true }))
+    const live = makeWs(); h.message(live as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'new-thread', agent: 'codex', takeover: true }))
     expect(msgs(stale).some(m => m.type === 'replaced' && m.name === 'codex@mac')).toBe(true)
     expect(msgs(live).find(m => m.type === 'registered').name).toBe('codex@mac')
     expect(sessions.getSessions().map(s => s.name)).toEqual(['codex@mac'])
@@ -423,4 +448,72 @@ describe('explicit-name takeover retires the stale holder', () => {
     expect(msgs(live).some(m => m.type === 'message' && m.content === 'for the live thread')).toBe(true)
     expect(msgs(stale).some(m => m.type === 'message' && m.content === 'for the live thread')).toBe(false)
   })
+})
+
+test('rename cannot claim reserved owner aliases or preserve legacy admin privileges', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'admin-rename-'))
+  await writeFile(join(dir, 'subscriptions.json'), JSON.stringify({
+    version: 1, legacy: {}, native: {}, owners: {}, channelOwners: { recorded: { name: 'recorded@mac' } },
+  }))
+  const subs = Subscriptions.inStateDir(dir)
+  const h = createWsHandlers(deps({
+    subs, admins: new Set(['admin@mac']),
+    channelOwners: new Map([['configured', 'owner@mac']]),
+    channelOps: {
+      resolve: async () => ({ id: 'topic', name: 'topic' }),
+      list: async () => [],
+      create: async name => ({ id: name, name }),
+    },
+  }))
+  const agent = reg(h, 'other@mac')
+  for (const name of ['ADMIN@mac', 'admin@mac-2', 'OWNER@mac-3', 'Recorded@mac', 'recorded@mac-4']) {
+    h.message(agent, JSON.stringify({ type: 'rename', name }))
+    expect(msgs(agent).at(-1)).toMatchObject({ type: 'error', message: 'invalid_bus_alias' })
+    expect(agent.data.sessionName).toBe('other@mac')
+  }
+  const adminRegistration = JSON.stringify({ type: 'register', name: 'admin@mac', projectPath: '/', instanceId: 'real-admin' })
+  const admin = makeWs()
+  h.message(admin, adminRegistration)
+  h.close(admin)
+  const reconnected = makeWs()
+  h.message(reconnected, adminRegistration)
+  const subscribe = (requestId: string) => h.message(reconnected, JSON.stringify({
+    type: 'channelSubscribe', requestId, channel: 'topic', session: 'another-agent',
+  }))
+  subscribe('before')
+  await tick()
+  expect(msgs(reconnected).find(frame => frame.requestId === 'before')).toMatchObject({ success: true })
+  h.message(reconnected, JSON.stringify({ type: 'rename', name: 'new-admin-name@mac' }))
+  h.message(reconnected, JSON.stringify({ type: 'rename', name: 'admin@mac' }))
+  expect(msgs(reconnected).at(-1)).toMatchObject({ type: 'error', message: 'invalid_bus_alias' })
+  subscribe('after')
+  expect(msgs(reconnected).find(frame => frame.requestId === 'after')).toMatchObject({ success: false })
+})
+
+test('bare pinned aliases accept takeover only from the recorded agent kind', () => {
+  const h = createWsHandlers(deps())
+  const name = 'opencode_nas642_glm53_abli'
+  const register = (agent: string, instanceId: string, takeover = false) => {
+    const ws = makeWs()
+    h.message(ws, JSON.stringify({ type: 'register', name, agent, projectPath: '/', instanceId, takeover }))
+    return ws
+  }
+  const incumbent = register('opencode', 'first')
+  const stranger = register('agy', 'second', true)
+  expect(msgs(stranger).at(-1)).toEqual({ type: 'error', message: 'takeover_refused' })
+  expect(incumbent.data.sessionName).toBe(name)
+  const replacement = register('opencode', 'third', true)
+  expect(msgs(replacement).at(-1)).toMatchObject({ type: 'registered', name })
+  expect(msgs(incumbent).at(-1)).toEqual({ type: 'replaced', name })
+})
+
+test('a Codex takeover of a different conversation supersedes the old client instead of allowing reclaim', () => {
+  const h = createWsHandlers(deps())
+  const name = 'codex@mac:work'
+  const incumbent = makeWs(), successor = makeWs()
+  const registration = { type: 'register', name, agent: 'codex', projectPath: '/', takeover: true }
+  h.message(incumbent, JSON.stringify({ ...registration, instanceId: 'first', conversationId: 'abandoned-thread' }))
+  h.message(successor, JSON.stringify({ ...registration, instanceId: 'second', conversationId: 'new-thread' }))
+  expect(msgs(incumbent).at(-1)).toEqual({ type: 'replaced', name, reclaim: false })
+  expect(msgs(successor).at(-1)).toMatchObject({ type: 'registered', name })
 })

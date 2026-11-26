@@ -22,6 +22,8 @@ export interface PublishMirror {
   readonly where: string
   readonly label: string
   readonly origin: string
+  readonly copy?: { readonly where: string; readonly origin: string }
+  readonly copyOnly?: true
   readonly from: string
   readonly fingerprint: string
   readonly sender?: Target
@@ -48,6 +50,7 @@ type Record =
   | { op: 'mirror'; ids: string[]; messageId: string; sender?: Target }
   | { op: 'remember'; name: string; conv: string }
   | { op: 'release'; alias: string }
+  | { op: 'renameLegacy'; name: string; ids: string[]; conv?: string }
   | { op: 'publishMirrored'; key: string; at: number; messageId: string }
   | { op: 'counter'; key: string; n: number }
   | { op: 'receiptKey'; key: string }
@@ -251,6 +254,16 @@ export class Inboxes {
           if (entry) this.put({ ...entry, key: identityKey(record.target) })
         }
         break
+      case 'renameLegacy':
+        if (typeof record.name !== 'string' || !isIds(record.ids) || (record.conv !== undefined && typeof record.conv !== 'string')) {
+          throw new Error('Invalid legacy rename record')
+        }
+        if (record.conv) this.legacyConversations.set(record.name, record.conv)
+        for (const id of record.ids) {
+          const entry = this.get(id)
+          if (entry) this.put({ ...entry, key: record.name })
+        }
+        break
       case 'release':
         if (typeof record.alias !== 'string') throw new Error('Invalid release record')
         this.seenAliases.add(record.alias)
@@ -310,13 +323,17 @@ export class Inboxes {
     if (this.aliases.has(alias)) this.append({ op: 'release', alias })
   }
 
+  canInheritLegacy(target: Target): boolean {
+    const legacyConversation = this.conversation(target.alias)
+    return legacyConversation === undefined ? !this.seenAliases.has(target.alias) : legacyConversation === target.conv
+  }
+
   bind(target: Target): void {
     const previous = this.target(target.alias)
     if (previous && identityKey(previous) === identityKey(target)) return
     // Legacy mail remains name-addressed until migration. If the legacy owner
     // is known, only its conversation can migrate that mail into a native inbox.
-    const legacyConversation = this.conversation(target.alias)
-    const inherit = legacyConversation === undefined ? !this.seenAliases.has(target.alias) : legacyConversation === target.conv
+    const inherit = this.canInheritLegacy(target)
     const ids = this.list(target.alias).filter(({ meta }) => {
       const approval = meta.from_human === 'true' && meta.question_id && meta.conversation_id
       return approval ? meta.conversation_id === target.conv : inherit
@@ -358,6 +375,15 @@ export class Inboxes {
     if (this.target(name)) return []
     return this.list(name).filter(({ meta }) => conversationId === undefined || meta.from_human !== 'true' || !meta.question_id ||
       !meta.conversation_id || meta.conversation_id === conversationId)
+  }
+
+  renameLegacy(oldName: string, name: string, conversationId: string | null): void {
+    if (oldName === name) return
+    const ids = this.legacy(oldName, conversationId).map(entry => entry.id)
+    const conv = conversationId && this.conversation(name) !== conversationId ? conversationId : undefined
+    if (!ids.length && !conv) return
+    if (this.count(name) + ids.length > INBOX_MAX) throw new Error('inbox_full')
+    this.append({ op: 'renameLegacy', name, ids, conv })
   }
 
   accept(ids: string[]): void {
