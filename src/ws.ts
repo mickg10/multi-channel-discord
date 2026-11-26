@@ -1880,7 +1880,7 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       }
       const actor = channelActor(ws, sender)
       const key = actor && channelActorKey(actor)
-      const topicAdmin = key && !ws.data.renamed && deps.topicAdmins?.has(key)
+      const topicAdmin = sender && key && deps.topicAdmins?.has(key)
       const protectedChannel = channel.id === deps.busChannelId || channel.id === deps.humanChannelId
       const owner = !!actor && !!key && (deps.topicChannelOwners?.get(channel.id) === key || subs.isChannelOwner(channel.id, actor))
       if (!topicAdmin && (protectedChannel || !owner)) {

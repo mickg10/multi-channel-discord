@@ -2,7 +2,8 @@ import { describe, test, expect, beforeEach, mock } from 'bun:test'
 import { createWsHandlers, resetBusRateLimit, routeHumanBusMessage } from '../ws.js'
 import { CostClasses, HumanMail, Unread } from '../wake.js'
 import { Subscriptions } from '../subscriptions.js'
-import { NodeRegistry } from '../nodes.js'
+import { createHash } from 'node:crypto'
+import { Inboxes, NodeRegistry } from '../nodes.js'
 import type { WsData, WsDeps } from '../ws.js'
 import { SessionManager, ProjectHistory } from '../sessions.js'
 import { mkdtemp, writeFile } from 'node:fs/promises'
@@ -420,7 +421,12 @@ test('channel_set_topic allows only the creator or an admin and exposes the upda
   const edited: { id: string; topic: string; reason: string }[] = []
   const d = deps({
     subs, admins: new Set(['admin@mac', 'offline-admin@mac']),
-    topicAdmins: new Set(['legacy:' + JSON.stringify(['mac', 'admin-instance'])]),
+    inboxes: new Inboxes(),
+    nodeSecrets: () => ({ hashes: { mac: createHash('sha256').update('topic-test-secret').digest('hex') }, require: true }),
+    topicAdmins: new Set([
+      'legacy:' + JSON.stringify(['mac', 'admin-instance']),
+      'native:' + JSON.stringify(['mac', 'fixture', 'codex', 'topic-admin']),
+    ]),
     humanChannelId: 'human',
     channelOps: {
       resolve: async ref => channels.get(ref) ?? null,
@@ -445,6 +451,9 @@ test('channel_set_topic allows only the creator or an admin and exposes the upda
   const outsider = register(h, 'outsider@mac')
   const admin = makeWs()
   h.message(admin, JSON.stringify({ type: 'register', name: 'admin@mac', projectPath: '/', instanceId: 'admin-instance' }))
+  const nativeAdmin = makeWs()
+  h.message(nativeAdmin, JSON.stringify({ type: 'registerGateway', host: 'mac', user: 'fixture', proto: 1, secret: 'topic-test-secret' }))
+  h.message(nativeAdmin, JSON.stringify({ type: 'registerAgent', alias: 'codex@mac:topic-admin', kind: 'codex', conv: 'topic-admin' }))
   const actor = { name: 'owner@mac', host: 'mac', instanceId: 'owner-instance' }
   subs.recordChannelOwner('bus1', actor)
   subs.recordChannelOwner('human', actor)
@@ -476,17 +485,19 @@ test('channel_set_topic allows only the creator or an admin and exposes the upda
   expect(await call(owner, 'channelSetTopic', { channel: 'cfd-injection', topic: '13 species' })).toMatchObject({ success: true })
   const list = await call(outsider, 'channelList')
   expect(JSON.parse(list.data)).toContainEqual(expect.objectContaining({ id: 'cfd-injection', topic: '13 species' }))
-  expect(await call(admin, 'channelSetTopic', { channel: 'cfd-injection', topic: '' })).toMatchObject({ success: true })
-  expect(await call(admin, 'channelSetTopic', { channel: 'general', topic: 'new rules' })).toMatchObject({ success: true })
+  expect(await call(admin, 'channelSetTopic', { channel: 'general', topic: 'legacy admin claim' })).toMatchObject({ success: false, data: 'not_channel_owner' })
+  const gatewayEdit = { as: 'codex@mac:topic-admin', op: 'channelSetTopic' }
+  expect(await call(nativeAdmin, 'gatewayOp', { ...gatewayEdit, channel: 'cfd-injection', topic: '' })).toMatchObject({ success: true })
+  expect(await call(nativeAdmin, 'gatewayOp', { ...gatewayEdit, channel: 'general', topic: 'new rules' })).toMatchObject({ success: true })
   expect(edited).toEqual([
     { id: 'cfd-injection', topic: '13 species', reason: expect.stringContaining('owner@mac') },
-    { id: 'cfd-injection', topic: '', reason: expect.stringContaining('admin@mac') },
-    { id: 'bus1', topic: 'new rules', reason: expect.stringContaining('admin@mac') },
+    { id: 'cfd-injection', topic: '', reason: expect.stringContaining('codex@mac:topic-admin') },
+    { id: 'bus1', topic: 'new rules', reason: expect.stringContaining('codex@mac:topic-admin') },
   ])
   expect(posted).toEqual([
     '**Topic changed by owner@mac**\n17 species → 13 species',
-    '**Topic changed by admin@mac**\n13 species → (empty)',
-    '**Topic changed by admin@mac**\nbus rules → new rules',
+    '**Topic changed by codex@mac:topic-admin**\n13 species → (empty)',
+    '**Topic changed by codex@mac:topic-admin**\nbus rules → new rules',
   ])
 
   h.message(owner, JSON.stringify({ type: 'rename', name: 'renamed@mac' }))

@@ -61,7 +61,10 @@ function readJsonConfig(value?: string): unknown {
 }
 
 const configuredTopicAdmins = readJsonConfig(process.env.DISCORD_TOPIC_ADMIN_IDENTITIES)
-const topicAdmins = new Set<string>(Array.isArray(configuredTopicAdmins) ? configuredTopicAdmins.filter((key): key is string => typeof key === 'string') : [])
+const topicAdmins = new Set<string>(Array.isArray(configuredTopicAdmins) ? configuredTopicAdmins.filter((key): key is string => typeof key === 'string' && key.startsWith('native:')) : [])
+if (Array.isArray(configuredTopicAdmins) && configuredTopicAdmins.some(key => typeof key === 'string' && key.startsWith('legacy:'))) {
+  process.stderr.write('discord: ignoring legacy identities in DISCORD_TOPIC_ADMIN_IDENTITIES; topic admins require a native identity\n')
+}
 const configuredTopicOwners = readJsonConfig(process.env.DISCORD_TOPIC_CHANNEL_OWNERS)
 const topicChannelOwners = new Map<string, string>(
   configuredTopicOwners && typeof configuredTopicOwners === 'object' && !Array.isArray(configuredTopicOwners)

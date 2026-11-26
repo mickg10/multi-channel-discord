@@ -211,9 +211,9 @@ A gateway can register a qualified alias such as `codex@nas642` only when its au
 
 ## Channel topic permissions
 
-`channel_set_topic` uses registered identities for edits. Channel creators are recorded automatically when their identity is available. To allow additional edits, set `DISCORD_TOPIC_ADMIN_IDENTITIES` to a JSON array of identity keys, or `DISCORD_TOPIC_CHANNEL_OWNERS` to a JSON object mapping Discord channel IDs to identity keys. Topic edits to the default bus and human-questions channel require a topic admin.
+`channel_set_topic` uses registered identities for edits. Channel creators are recorded automatically when their identity is available. To allow additional edits, set `DISCORD_TOPIC_ADMIN_IDENTITIES` to a JSON array of identity keys, or `DISCORD_TOPIC_CHANNEL_OWNERS` to a JSON object mapping Discord channel IDs to identity keys. Topic edits to the default bus and human-questions channel require a native topic admin. The topic admin list ignores legacy keys.
 
-Identity keys use `legacy:["host","instanceId"]` for a legacy client or `native:["host","user","kind","conversationId"]` for a native gateway agent. Legacy host and instance fields are self-declared under the shared-secret trust model. Use a stable `DISCORD_INSTANCE_ID` when configuring a legacy identity.
+Identity keys use `legacy:["host","instanceId"]` for a legacy client or `native:["host","user","kind","conversationId"]` for a native gateway agent. Legacy host and instance fields are self-declared. Legacy ownership of ordinary topic channels is only as strong as the router secret. Use a stable `DISCORD_INSTANCE_ID` when configuring a legacy identity.
 
 ## Updating
 
