@@ -1470,7 +1470,7 @@ function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: str
     }
     delivered[field] = first
   }
-  const sends = [send(plan, 'messageId')]
+  const sends = plan.copyOnly ? [] : [send(plan, 'messageId')]
   if (plan.copy) sends.push(send(plan.copy, 'copyId'))
   const attempt = Promise.race([Promise.all(sends).then(() => delivered), timeout]).finally(() => {
     clearTimeout(deadline)
@@ -1503,9 +1503,15 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
       reply(false, 'publish_payload_mismatch')
       return
     }
-    void tryPublishMirror(deps, retry.mirror, text, files, JSON.stringify([key, retry.at])).then(({ messageId }) => {
-      if (messageId) inboxes!.publishMirrored(key, retry.at, messageId)
-      reply(true, JSON.stringify(messageId ? retry.result : { ...retry.result, mirror: 'failed' }))
+    const copyOnly = retry.mirror.copyOnly
+    const attemptKey = JSON.stringify([key, copyOnly ? 'uncommitted' : retry.at])
+    void tryPublishMirror(deps, retry.mirror, text, files, attemptKey).then(({ messageId, copyId }) => {
+      const delivered = copyOnly ? copyId : messageId
+      if (delivered) inboxes!.publishMirrored(key, retry.at, delivered)
+      const result: PublishResult = delivered ? retry.result : copyOnly
+        ? { ...retry.result, copy: 'failed' }
+        : { ...retry.result, mirror: 'failed' }
+      reply(true, JSON.stringify(result))
     }).catch(err => reply(false, inboxError(err)))
     return
   }
@@ -1567,14 +1573,15 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   // before delivery to agents. A mirror retry never replays agent transport.
   const attemptKey = JSON.stringify([key, record ? now : 'uncommitted'])
   void tryPublishMirror(deps, mirror, text, files, attemptKey).then(({ messageId, copyId }) => {
-    const mirrorSucceeded = Boolean(messageId && (!copy || copyId))
+    const copyFailed = !!copy && !copyId
     if (copyId) inboxes?.setMirror([], copyId, sender)
     if (messageId) {
       if (record) inboxes?.publishMirrored(key, now, messageId)
       else {
         inboxes?.setMirror(entries.map(entry => entry.id), messageId, sender)
-        if (mirrorSucceeded && publish && (publish.publish_id !== undefined || requestId) && !inboxes?.publish(key)) {
-          inboxes?.commit([], { key, result, at: now })
+        if (publish && (publish.publish_id !== undefined || requestId) && !inboxes?.publish(key)) {
+          const pendingCopy = copyFailed ? { ...mirror, copyOnly: true as const } : undefined
+          inboxes?.commit([], { key, result, at: now, mirror: pendingCopy })
         }
       }
     }
@@ -1586,8 +1593,9 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
         if (pending) scheduleTransport(deps, targets[index]!, pending)
       })
     }
-    if (!mirrorSucceeded && (toLabel === 'human' || (requestId && !targets.length))) { reply(false, 'discord_unavailable'); return }
-    reply(true, JSON.stringify(!messageId && targets.length ? { ...result, mirror: 'failed' } : result))
+    if (!messageId && (toLabel === 'human' || (requestId && !targets.length))) { reply(false, 'discord_unavailable'); return }
+    if (!messageId && targets.length) reply(true, JSON.stringify({ ...result, mirror: 'failed' }))
+    else reply(true, JSON.stringify(copyFailed ? { ...result, copy: 'failed' } : result))
   }).catch(err => reply(false, inboxError(err)))
 
 }

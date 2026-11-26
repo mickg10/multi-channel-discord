@@ -385,6 +385,7 @@ export interface PublishResult {
   readonly publish_id: string
   readonly committed: readonly string[]
   readonly mirror?: 'failed'
+  readonly copy?: 'failed'
 }
 
 type ForwardedGatewayCall =

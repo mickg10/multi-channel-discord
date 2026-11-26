@@ -620,3 +620,51 @@ test.each(['woken', 'held', 'refused'] as const)('a lost %s result reply allows 
   expect(replay.result('foreign')?.data).toBe('unknown_message')
   expect(replay.frames.some(frame => frame.type === 'wake')).toBe(false)
 })
+
+test('a failed human copy reports partial success and retries only the copy after restart', async () => {
+  const dir = directory()
+  const topic = { name: 'bbq', id: 'topic-id' }
+  const options: Partial<WsDeps> = {
+    humanChannelId: 'human-id',
+    channelOps: {
+      resolve: async () => topic,
+      list: async () => [topic],
+      create: async () => topic,
+    },
+  }
+  const sent: string[] = []
+  const a = router(dir, {
+    ...options,
+    client: discord(content => {
+      sent.push(content)
+      if (content.includes('(from #bbq)')) throw new Error('copy outage')
+      return { id: 'primary-discord-id' }
+    }),
+  })
+  const sender = a.connect()
+  legacy(sender, 'sender')
+  const post = { type: 'channelPost', channel: 'bbq', text: 'answer', to: 'human', publish_id: 'topic-answer', requestId: 'post' }
+  sender.send(post)
+  await tick()
+  expect(sender.result('post')?.success).toBe(true)
+  expect(JSON.parse(sender.result('post')!.data!)).toEqual({ publish_id: 'topic-answer', committed: [], copy: 'failed' })
+  expect(sent).toEqual(['**[sender → human]** answer', '**[sender → human]** (from #bbq) answer'])
+
+  const b = router(dir, { ...options, client: discord(content => {
+    sent.push(content)
+    return { id: 'copy-discord-id' }
+  }) })
+  const retry = b.connect()
+  legacy(retry, 'sender')
+  retry.send(post)
+  await tick()
+  expect(retry.result('post')?.success).toBe(true)
+  expect(JSON.parse(retry.result('post')!.data!)).toEqual({ publish_id: 'topic-answer', committed: [] })
+  retry.send(post)
+  await tick()
+  expect(sent).toEqual([
+    '**[sender → human]** answer',
+    '**[sender → human]** (from #bbq) answer',
+    '**[sender → human]** (from #bbq) answer',
+  ])
+})
