@@ -42,6 +42,9 @@ const bun = process.execPath
 // The agent process, for the client's naming / instance id / tmux lookup.
 process.env.DISCORD_PARENT_PID ??= String(process.ppid)
 
+// A supervisor survives child updates and identifies a single non-Claude MCP instance.
+process.env.DISCORD_SUPERVISOR_PID = String(process.pid)
+
 const git = (...args: string[]) => execFileSync('git', ['-C', codeDir, ...args], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
 const head = () => { try { return isGit ? git('rev-parse', 'HEAD') : '' } catch { return '' } }
 let runningHead = head()

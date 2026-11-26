@@ -19,6 +19,7 @@ import type { WsMcpOp, PluginToRouterMessage, WsRegistered, WsRenamed, WsError, 
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
+import { isBusAlias } from './bus-alias.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
@@ -57,6 +58,8 @@ export interface WsData {
   authed?: boolean
   /** Set when this connection is a node daemon. */
   nodeName?: string
+  legacyHost?: string
+  renamed?: boolean
   gateway?: { user: string; agents: Map<string, Target> }
   /** Register-time instance id of the client connection (grant binding). */
   instanceId?: string
@@ -420,13 +423,37 @@ function matchesSecret(secret: unknown, hash: string | undefined): boolean {
     timingSafeEqual(createHash('sha256').update(secret).digest(), Buffer.from(hash, 'hex'))
 }
 
-function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
+function qualifiedAliasHost(alias: string): string | undefined {
+  return /^[-\w./]+@([a-z0-9.-]+)(?::[^@]+)?$/i.exec(alias)?.[1]
+}
+
+function aliasAllowedOnHost(alias: string, host?: string): boolean {
   const lower = alias.toLowerCase()
-  if (!/^[-\w.@:/]+$/.test(alias) || HUMAN_TARGETS.has(lower) ||
-      lower === 'router' || /^all(?::(?:synthesis|independent))?$/.test(lower) || lower.startsWith('@all')) return false
-  const qualified = /^[-\w./]+@([a-z0-9.-]+)(?::[-\w./:]+)?$/i.exec(alias)
-  if (qualified) return qualified[1] === host
-  if (alias.includes('@')) return false
+  if (!alias || HUMAN_TARGETS.has(lower) || lower === 'router' ||
+      /^all(?::(?:synthesis|independent))?$/.test(lower) || lower.startsWith('@all')) return false
+  return !alias.includes('@') || (!!host && qualifiedAliasHost(alias) === host)
+}
+
+function takeoverKindMatches(name: string, agent: string, incumbent?: string): boolean {
+  const kindAndProfile = name.toLowerCase().split('@', 1)[0]
+  if (!name.includes('@')) return incumbent === agent
+  return kindAndProfile === agent || kindAndProfile.startsWith(agent + '-')
+}
+
+function protectedRenameAlias(deps: Readonly<WsDeps>, name: string): boolean {
+  const lower = name.toLowerCase()
+  const names = [
+    ...(deps.admins ?? []), ...(deps.channelOwners?.values() ?? []), ...(deps.subs?.channelOwnerAliases() ?? []),
+  ]
+  return names.some(alias => {
+    const protectedName = alias.toLowerCase()
+    return lower === protectedName || (lower.startsWith(protectedName) && /^(?:-\d+)+$/.test(lower.slice(protectedName.length)))
+  })
+}
+
+function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
+  if (!/^[-\w.@:/]+$/.test(alias) || !aliasAllowedOnHost(alias, host)) return false
+  if (qualifiedAliasHost(alias)) return true
   const owners = deps.gatewayAliasHosts?.()
   return !!owners && Object.hasOwn(owners, alias) && owners[alias] === host
 }
@@ -798,27 +825,43 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         return
       }
       const normalized = parsed.name.trim()
+      const host = ws.data.legacyHost ?? parsed.host ?? qualifiedAliasHost(normalized)
+      if ((parsed.host !== undefined && (typeof parsed.host !== 'string' || !/^[a-z0-9][a-z0-9.-]*$/i.test(parsed.host) || parsed.host !== host)) ||
+          !isBusAlias(normalized) || !aliasAllowedOnHost(normalized, host)) {
+        sendError(ws, 'register rejected: invalid_bus_alias')
+        return
+      }
       if (deps.inboxes?.target(normalized)) {
         ws.send(JSON.stringify({ type: 'replaced', name: normalized }))
         return
       }
-      ws.data.authed = true
-      {
-        // Headless turns (pull mode) re-register the same name each turn; replace the stale
-        // slot instead of creating "name-2" that nobody reads.
-        const p = parsed as { mode?: string; takeover?: boolean; instanceId?: string }
-        const stale = deps.sessions.getSessions().find(s => s.name === parsed.name)
-        if (stale && (p.takeover || p.mode === 'pull')) {
-          // Tell the old holder it lost the name so it retires instead of lingering (a stale
-          // Codex-daemon thread kept the name and swallowed the live thread's mail and nudges).
-          deps.sessions.notifySession(parsed.name, JSON.stringify({ type: 'replaced', name: parsed.name }))
-          try { deps.sessions.deregisterSession(parsed.name) } catch {}
+      const agent = typeof parsed.agent === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(parsed.agent)
+        ? parsed.agent.toLowerCase() : undefined
+      const conversationId = typeof parsed.conversationId === 'string' ? parsed.conversationId : ''
+      const incumbent = deps.sessions.registeredIdentity(normalized)
+      if (incumbent && parsed.reclaimOnly === true) { sendError(ws, 'name_occupied'); return }
+      const takeover = parsed.takeover === true || (parsed.takeover === undefined && parsed.mode === 'pull')
+      if (incumbent && takeover) {
+        const sameInstance = incumbent.instanceId === parsed.instanceId
+        const valid = !!agent && takeoverKindMatches(normalized, agent, incumbent.agent)
+        // Older clients can prove continuity by the instance already in the slot.
+        if (!valid && !(sameInstance && parsed.agent === undefined)) {
+          sendError(ws, 'takeover_refused')
+          return
         }
+        const sameConversation = !!conversationId && conversationId === incumbent.conversationId
+        const differentConversation = !!conversationId && !!incumbent.conversationId && !sameConversation
+        const kind = agent ?? incumbent.agent ?? normalized.toLowerCase().split('@', 1)[0]!
+        const codex = kind === 'codex' || kind.startsWith('codex-') || kind === 'chatgpt-codex'
+        const reclaimable = !differentConversation && (!codex || sameInstance || sameConversation)
+        deps.sessions.notifySession(normalized, JSON.stringify({
+          type: 'replaced', name: normalized, ...(!reclaimable && { reclaim: false }),
+        }))
+        deps.sessions.deregisterSession(normalized)
       }
-      const conversationId = typeof (parsed as { conversationId?: unknown }).conversationId === 'string'
-        ? (parsed as { conversationId: string }).conversationId
-        : ''
-      handleRegister(ws, parsed.name, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
+      ws.data.authed = true
+      ws.data.legacyHost = host
+      handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, { agent, conversationId })
       if (ws.data.sessionName) {
         deps.conversations?.set(ws.data.sessionName, conversationId)
         if (conversationId) deps.inboxes?.remember(ws.data.sessionName, conversationId)
@@ -836,14 +879,17 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
     case 'deregister':
       handleDeregister(ws, deps)
       break
-    case 'rename':
-      if (!hasString(parsed, 'name')) {
-        sendError(ws, 'rename requires name')
+    case 'rename': {
+      const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
+      const name = typeof parsed.name === 'string' ? parsed.name.trim() : undefined
+      if (!isBusAlias(name) || !aliasAllowedOnHost(name, ws.data.legacyHost) || protectedRenameAlias(deps, name)) {
+        sendOperationError(ws, requestId, 'invalid_bus_alias')
         return
       }
-      if (deps.inboxes?.target(parsed.name.trim())) { sendError(ws, 'alias already registered'); return }
-      handleRename(ws, parsed.name, deps)
+      if (deps.inboxes?.target(name)) { sendOperationError(ws, requestId, 'alias already registered'); return }
+      handleRename(ws, name, deps, requestId)
       break
+    }
     case 'reply': {
       const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
       if (!hasString(parsed, 'text') || (parsed.chatId !== undefined && typeof parsed.chatId !== 'string') ||
@@ -915,7 +961,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
   }
 }
 
-function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>): void {
+function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>, identity: { agent?: string; conversationId?: string }): void {
   const sendCb = (msg: string) => ws.send(msg)
   ws.data.instanceId = instanceId
   const actualName = deps.sessions.registerSession(
@@ -924,13 +970,14 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     projectPath,
     instanceId,
     name => !!deps.inboxes?.target(name),
+    identity,
   )
   ws.data.sessionName = actualName
   deps.subs?.reclaim(actualName, instanceId)
   ws.data.sendCallback = sendCb
   deps.history.record(actualName, projectPath)
 
-  const response: WsRegistered = { type: 'registered', name: actualName }
+  const response: WsRegistered = { type: 'registered', name: actualName, reclaimOnly: true }
   ws.send(JSON.stringify(response))
   deps.onSessionChange?.()
 }
@@ -945,23 +992,22 @@ function handleDeregister(ws: WsLike, deps: Readonly<WsDeps>): void {
   }
 }
 
-function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>): void {
+function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>, requestId?: string): void {
   const oldName = ws.data.sessionName
-  if (!oldName) {
-    sendError(ws, 'Cannot rename: not registered')
+  if (!oldName || !ws.data.sendCallback || !deps.sessions.ownsSender(oldName, ws.data.sendCallback)) {
+    sendOperationError(ws, requestId, 'Cannot rename: not registered')
     return
   }
-  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name))
+  const conv = deps.conversations?.get(oldName) ?? null
+  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name) || protectedRenameAlias(deps, name),
+    name => deps.inboxes?.renameLegacy(oldName, name, conv))
   deps.subs?.rename(oldName, actualName)
   if (pullSessions.delete(oldName)) pullSessions.add(actualName)
-  const conv = deps.conversations?.get(oldName)
-  if (conv) {
-    deps.conversations?.set(actualName, conv)
-    deps.inboxes?.remember(actualName, conv)
-  }
+  if (conv) deps.conversations?.set(actualName, conv)
   ws.data.sessionName = actualName
+  if (actualName !== oldName) ws.data.renamed = true
 
-  const response: WsRenamed = { type: 'renamed', oldName, newName: actualName }
+  const response: WsRenamed = { type: 'renamed', oldName, newName: actualName, ...(requestId && { requestId }) }
   ws.send(JSON.stringify(response))
 }
 
@@ -1773,11 +1819,14 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
 }
 
 async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>, sender?: Target): Promise<void> {
-  // Admin sessions may (un)subscribe someone else (e.g. agents that lack the channel tools).
-  if (msg.session && ws.data.sessionName && msg.session !== ws.data.sessionName) {
-    if (!deps.admins?.has(ws.data.sessionName)) { sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session'); return }
+  // A legacy alias change cannot confer or carry administrative privileges.
+  const caller = ws.data.sessionName
+  const admin = caller && !ws.data.renamed && deps.admins?.has(caller)
+  if (msg.session && caller && msg.session !== caller && !admin) {
+    sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session')
+    return
   }
-  const me = (msg.session && deps.admins?.has(ws.data.sessionName ?? '') ? msg.session : null) ?? ws.data.sessionName
+  const me = (admin && msg.session) || caller
   const ops = deps.channelOps
   const subs = deps.subs
   if (!me) { sendToolResult(ws, msg.requestId, false, 'not registered'); return }

@@ -8,11 +8,14 @@ import { join } from 'node:path'
 import type { SessionEntry, BufferedMessage, WsMessage, ProjectHistoryEntry, ChannelMeta } from './types.js'
 import { SessionNotFoundError } from './errors.js'
 import { getStateDir } from './access.js'
+import { BUS_ALIAS_MAX } from './bus-alias.js'
 
 interface SessionSlot {
   readonly name: string
   readonly projectPath: string
   readonly instanceId: string
+  readonly agent?: string
+  readonly conversationId?: string
   readonly connectedAt: number
   messageCount: number
   readonly send: (msg: string) => void
@@ -30,7 +33,7 @@ export class SessionManager {
    *  If a session with the same instanceId already exists, adds this send callback
    *  to extraSends (dedup for multiple MCP spawns from the same Claude Code process).
    *  Different Claude Code instances on the same project get separate sessions with collision suffixes. */
-  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean): string {
+  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string }): string {
     // Deduplicate: if same instanceId is already registered, add send callback to existing.
     // This handles Claude Code spawning multiple MCP plugin processes for one session.
     if (instanceId) {
@@ -47,6 +50,8 @@ export class SessionManager {
       name: actualName,
       projectPath,
       instanceId: instanceId ?? `anon-${Date.now()}`,
+      agent: identity?.agent,
+      conversationId: identity?.conversationId,
       connectedAt: Date.now(),
       messageCount: 0,
       send,
@@ -88,13 +93,28 @@ export class SessionManager {
     }
   }
 
+  registeredIdentity(name: string): Pick<SessionSlot, 'instanceId' | 'agent' | 'conversationId'> | undefined {
+    const slot = this.sessions.get(name)
+    return slot && { instanceId: slot.instanceId, agent: slot.agent, conversationId: slot.conversationId }
+  }
+
+  isSameInstance(name: string, instanceId?: string): boolean {
+    return !!instanceId && this.sessions.get(name)?.instanceId === instanceId
+  }
+
+  ownsSender(name: string, send: (msg: string) => void): boolean {
+    const slot = this.sessions.get(name)
+    return !!slot && (slot.send === send || slot.extraSends.includes(send))
+  }
+
   /** Rename a session. Returns the actual new name. */
-  renameSession(oldName: string, newName: string, reserved?: (name: string) => boolean): string {
+  renameSession(oldName: string, newName: string, reserved?: (name: string) => boolean, beforeRename?: (actualName: string) => void): string {
     const slot = this.sessions.get(oldName)
     if (!slot) throw new SessionNotFoundError(oldName)
 
+    const actualName = this.resolveCollision(newName, reserved, oldName)
+    beforeRename?.(actualName)
     this.sessions.delete(oldName)
-    const actualName = this.resolveCollision(newName, reserved)
     this.sessions.set(actualName, { ...slot, name: actualName })
 
     const buf = this.buffers.get(oldName)
@@ -227,12 +247,16 @@ export class SessionManager {
     }
   }
 
-  private resolveCollision(name: string, reserved?: (name: string) => boolean): string {
-    const inUse = (candidate: string) => this.sessions.has(candidate) || reserved?.(candidate)
+  private resolveCollision(name: string, reserved?: (name: string) => boolean, previous?: string): string {
+    const inUse = (candidate: string) => (candidate !== previous && this.sessions.has(candidate)) || reserved?.(candidate)
     if (!inUse(name)) return name
     let suffix = 2
-    while (inUse(`${name}-${suffix}`)) suffix++
-    return `${name}-${suffix}`
+    let candidate: string
+    do {
+      const ending = `-${suffix++}`
+      candidate = name.slice(0, BUS_ALIAS_MAX - ending.length) + ending
+    } while (inUse(candidate))
+    return candidate
   }
 }
 
