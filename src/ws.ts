@@ -19,6 +19,7 @@ import type { WsMcpOp, PluginToRouterMessage, WsRegistered, WsRenamed, WsError, 
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
+import { isBusAlias } from './bus-alias.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
@@ -836,14 +837,16 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
     case 'deregister':
       handleDeregister(ws, deps)
       break
-    case 'rename':
-      if (!hasString(parsed, 'name')) {
-        sendError(ws, 'rename requires name')
+    case 'rename': {
+      const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
+      if (!hasString(parsed, 'name') || (requestId && !isBusAlias(parsed.name))) {
+        sendOperationError(ws, requestId, 'invalid_bus_alias')
         return
       }
-      if (deps.inboxes?.target(parsed.name.trim())) { sendError(ws, 'alias already registered'); return }
-      handleRename(ws, parsed.name, deps)
+      if (deps.inboxes?.target(parsed.name.trim())) { sendOperationError(ws, requestId, 'alias already registered'); return }
+      handleRename(ws, parsed.name, deps, requestId)
       break
+    }
     case 'reply': {
       const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
       if (!hasString(parsed, 'text') || (parsed.chatId !== undefined && typeof parsed.chatId !== 'string') ||
@@ -945,23 +948,21 @@ function handleDeregister(ws: WsLike, deps: Readonly<WsDeps>): void {
   }
 }
 
-function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>): void {
+function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>, requestId?: string): void {
   const oldName = ws.data.sessionName
-  if (!oldName) {
-    sendError(ws, 'Cannot rename: not registered')
+  if (!oldName || !ws.data.sendCallback || !deps.sessions.ownsSender(oldName, ws.data.sendCallback)) {
+    sendOperationError(ws, requestId, 'Cannot rename: not registered')
     return
   }
-  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name))
+  const conv = deps.conversations?.get(oldName) ?? null
+  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name),
+    name => deps.inboxes?.renameLegacy(oldName, name, conv))
   deps.subs?.rename(oldName, actualName)
   if (pullSessions.delete(oldName)) pullSessions.add(actualName)
-  const conv = deps.conversations?.get(oldName)
-  if (conv) {
-    deps.conversations?.set(actualName, conv)
-    deps.inboxes?.remember(actualName, conv)
-  }
+  if (conv) deps.conversations?.set(actualName, conv)
   ws.data.sessionName = actualName
 
-  const response: WsRenamed = { type: 'renamed', oldName, newName: actualName }
+  const response: WsRenamed = { type: 'renamed', oldName, newName: actualName, ...(requestId && { requestId }) }
   ws.send(JSON.stringify(response))
 }
 

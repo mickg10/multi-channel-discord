@@ -39,6 +39,7 @@ export interface WsRegister {
 /** Plugin → Router: rename this session */
 export interface WsRename {
   readonly type: 'rename'
+  readonly requestId?: string
   readonly name: string
 }
 
@@ -257,6 +258,7 @@ export interface WsRegistered {
 /** Router → Plugin: confirms rename */
 export interface WsRenamed {
   readonly type: 'renamed'
+  readonly requestId?: string
   readonly oldName: string
   readonly newName: string
 }

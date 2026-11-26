@@ -15,11 +15,12 @@ import { readNamingContext, findClaudeSession, readClaudeSession, sessionAlias }
 import { ensureRouter } from './ensure-router.js'
 import { computeBackoff } from './reconnect.js'
 import { discoverSkills } from './skills.js'
-import { loadEnvFile } from './access.js'
+import { getStateDir, loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
+import { BUS_ALIAS_MAX, BusAlias, isBusAlias } from './bus-alias.js'
 import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
@@ -108,6 +109,9 @@ export interface ConnectToRouterOptions {
   readonly wsPort: number
   readonly name: string
   readonly projectPath: string
+  readonly instanceId?: string
+  readonly takeover?: boolean
+  readonly onRenamed?: (name: string) => void
   readonly onMessage?: (content: string, meta: ChannelMeta) => void
   readonly pendingRequests?: Map<string, PendingRequest>
   readonly onPermissionVerdict?: (requestId: string, behavior: 'allow' | 'deny') => void
@@ -115,6 +119,11 @@ export interface ConnectToRouterOptions {
   readonly onReplaced?: (name: string) => void
   /** Stable conversation id. A later session that reuses the display name does not inherit held approvals. */
   readonly conversationId?: string
+}
+
+function clientInstanceId(agentKind = process.env.DISCORD_AGENT || 'claude'): string {
+  const parent = process.env.DISCORD_PARENT_PID || String(process.ppid)
+  return process.env.DISCORD_INSTANCE_ID || (agentKind === 'claude' ? parent : `${parent}-${process.env.DISCORD_SUPERVISOR_PID || process.pid}`)
 }
 
 /** Connect to the router via WebSocket and register. */
@@ -133,15 +142,12 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       // Claude Code spawns several MCP instances per session (same ppid) and they must merge.
       // Codex hosts many threads' MCP servers in one app-server daemon (also same ppid), so
       // non-Claude agents use their own pid to avoid being merged into another thread's session.
-      const agentKind = process.env.DISCORD_AGENT || 'claude'
-      const parent = process.env.DISCORD_PARENT_PID || String(process.ppid)
-      const instanceId = process.env.DISCORD_INSTANCE_ID
-        || (agentKind === 'claude' ? parent : `${parent}-${process.pid}`)
+      const instanceId = opts.instanceId ?? clientInstanceId()
       const secret = process.env.DISCORD_ROUTER_SECRET || undefined
       const mode = process.env.DISCORD_MODE === 'pull' ? 'pull' : 'push'
       // An explicitly configured name belongs to the newest client that claims it (a resumed
       // thread), not to a stale one still connected from an abandoned thread.
-      const takeover = !!process.env.DISCORD_SESSION_NAME
+      const takeover = opts.takeover ?? !!process.env.DISCORD_SESSION_NAME
       const costClass = process.env.DISCORD_COST_CLASS
       const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
       ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(takeover && { takeover }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
@@ -154,16 +160,15 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
         resolve({ ws, registeredName: msg.name })
       } else if (msg.type === 'message' && onMessage) {
         onMessage(msg.content, msg.meta)
-      } else if (msg.type === 'toolResult' && pendingRequests) {
-        const pending = pendingRequests.get(msg.requestId)
-        if (pending) {
+      } else if (msg.type === 'toolResult' || msg.type === 'renamed') {
+        if (msg.type === 'renamed') opts.onRenamed?.(msg.newName)
+        const pending = msg.requestId && pendingRequests?.get(msg.requestId)
+        if (pending && msg.requestId) {
           clearTimeout(pending.timer)
-          pendingRequests.delete(msg.requestId)
-          if (msg.success) {
-            pending.resolve(msg.data)
-          } else {
-            pending.reject(new Error(msg.data))
-          }
+          pendingRequests?.delete(msg.requestId)
+          if (msg.type === 'renamed') pending.resolve(msg.newName)
+          else if (msg.success) pending.resolve(msg.data)
+          else pending.reject(new Error(msg.data))
         }
       } else if (msg.type === 'replaced') {
         onReplaced?.(msg.name)
@@ -282,7 +287,9 @@ export async function startPlugin(): Promise<void> {
   // Claude: the session's /name alias (in ~/.claude/sessions/<pid>.json) names it, and is followed live.
   const claudeAlias = (): string | undefined => claude && sessionAlias(readClaudeSession(claude.pid))
   const alias = claudeAlias()
-  const sessionName = (!inChatGPT && process.env.DISCORD_SESSION_NAME) || `${agent}@${hostLabel}:${alias ?? namingCtx.dirName}`
+  const instanceId = clientInstanceId(agent)
+  const explicitAlias = new BusAlias(getStateDir(), instanceId)
+  const sessionName = explicitAlias.name || (!inChatGPT && process.env.DISCORD_SESSION_NAME) || `${agent}@${hostLabel}:${alias ?? namingCtx.dirName}`
 
   // Inbox: every inbound message is also queued here so clients without channel push
   // (Codex, agy) can read them with the check_inbox tool.
@@ -367,6 +374,7 @@ export async function startPlugin(): Promise<void> {
 
   let currentWs: WebSocket | null = null
   let currentName = sessionName
+  let renamePending = false
   let reconnectAttempt = 0
   let shuttingDown = false
   let retired = false
@@ -416,14 +424,18 @@ export async function startPlugin(): Promise<void> {
     // Re-read router URL / secret each (re)connect so moving the router or rotating the
     // secret needs no agent restart.
     reloadClientEnv()
+    explicitAlias.restore()
     // Don't auto-spawn the router — it's a Discord bot that must be started manually.
     // The plugin just connects to it.
     try {
       const conversationId = process.env.DISCORD_CONVERSATION_ID || claude?.sessionId
       const { ws, registeredName } = await connectToRouter({
         wsPort,
-        name: currentName,
+        name: explicitAlias.name ?? currentName,
         projectPath: cwd,
+        instanceId,
+        ...(explicitAlias.name && { takeover: false }),
+        onRenamed: name => { currentName = name },
         onMessage,
         pendingRequests,
         onPermissionVerdict,
@@ -440,6 +452,9 @@ export async function startPlugin(): Promise<void> {
       })
       currentWs = ws
       currentName = registeredName
+      if (explicitAlias.name && explicitAlias.name !== registeredName) {
+        try { explicitAlias.save(registeredName) } catch { process.stderr.write('discord plugin: could not save the registered bus alias\n') }
+      }
       reconnectAttempt = 0
       process.stderr.write(`discord plugin: connected as "${registeredName}"\n`)
       if (alias !== undefined || agent === 'claude') startAliasWatch()
@@ -471,11 +486,13 @@ export async function startPlugin(): Promise<void> {
 
   let aliasTimer: ReturnType<typeof setInterval> | null = null
   function startAliasWatch(): void {
-    if (aliasTimer || process.env.DISCORD_SESSION_NAME || !claude) return
+    if (aliasTimer || explicitAlias.name || process.env.DISCORD_SESSION_NAME || !claude) return
     aliasTimer = setInterval(() => {
+      explicitAlias.restore()
+      if (explicitAlias.name) { clearInterval(aliasTimer!); aliasTimer = null; return }
       const a = claudeAlias()
       const want = `${agent}@${hostLabel}:${a ?? namingCtx.dirName}`
-      if (want !== currentName && currentWs && currentWs.readyState === WebSocket.OPEN) {
+      if (!renamePending && want !== currentName && currentWs && currentWs.readyState === WebSocket.OPEN) {
         process.stderr.write(`discord plugin: /name changed -> ${want}\n`)
         currentWs.send(JSON.stringify({ type: 'rename', name: want }))
         currentName = want
@@ -502,6 +519,15 @@ export async function startPlugin(): Promise<void> {
   // Register tools
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
+      {
+        name: 'bus_rename',
+        description: 'Rename this session on the agent bus. Call this after the user renames you (e.g. agy /rename) so the bus name matches.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: { name: { type: 'string', description: 'The new exact bus alias', maxLength: BUS_ALIAS_MAX } },
+          required: ['name'],
+        },
+      },
       {
         name: 'dispatch',
         description: 'Dispatcher only. Re-deliver a human message to exact sessions. The router sends Mick\'s original text with from_human and question_id set to message_id. Do not paraphrase it with bus_post.',
@@ -751,6 +777,19 @@ export async function startPlugin(): Promise<void> {
           if (!messageId || to.length === 0) throw new Error('dispatch requires message_id and to (exact session names)')
           const r = await sendToolRequest({ type: 'dispatch', messageId, to })
           return { content: [{ type: 'text', text: r }] }
+        }
+        case 'bus_rename': {
+          if (!isBusAlias(args.name)) throw new Error(`Name must use bus alias characters and be 1–${BUS_ALIAS_MAX} characters long`)
+          if (renamePending) throw new Error('A bus rename is already in progress')
+          renamePending = true
+          try {
+            const name = await sendToolRequest({ type: 'rename', name: args.name })
+            if (aliasTimer) { clearInterval(aliasTimer); aliasTimer = null }
+            try { explicitAlias.save(name) } catch {
+              throw new Error(`Renamed to "${name}", but could not save it for a restart`)
+            }
+            return { content: [{ type: 'text', text: name }] }
+          } finally { renamePending = false }
         }
         case 'bus_post': {
           if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')

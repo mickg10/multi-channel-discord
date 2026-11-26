@@ -88,13 +88,19 @@ export class SessionManager {
     }
   }
 
+  ownsSender(name: string, send: (msg: string) => void): boolean {
+    const slot = this.sessions.get(name)
+    return !!slot && (slot.send === send || slot.extraSends.includes(send))
+  }
+
   /** Rename a session. Returns the actual new name. */
-  renameSession(oldName: string, newName: string, reserved?: (name: string) => boolean): string {
+  renameSession(oldName: string, newName: string, reserved?: (name: string) => boolean, beforeRename?: (actualName: string) => void): string {
     const slot = this.sessions.get(oldName)
     if (!slot) throw new SessionNotFoundError(oldName)
 
+    const actualName = this.resolveCollision(newName, reserved, oldName)
+    beforeRename?.(actualName)
     this.sessions.delete(oldName)
-    const actualName = this.resolveCollision(newName, reserved)
     this.sessions.set(actualName, { ...slot, name: actualName })
 
     const buf = this.buffers.get(oldName)
@@ -227,8 +233,8 @@ export class SessionManager {
     }
   }
 
-  private resolveCollision(name: string, reserved?: (name: string) => boolean): string {
-    const inUse = (candidate: string) => this.sessions.has(candidate) || reserved?.(candidate)
+  private resolveCollision(name: string, reserved?: (name: string) => boolean, previous?: string): string {
+    const inUse = (candidate: string) => (candidate !== previous && this.sessions.has(candidate)) || reserved?.(candidate)
     if (!inUse(name)) return name
     let suffix = 2
     while (inUse(`${name}-${suffix}`)) suffix++
