@@ -45,6 +45,7 @@ export interface WsRename {
 /** Plugin → Router: send a reply to Discord */
 export interface WsReply {
   readonly type: 'reply'
+  readonly requestId?: string
   readonly text: string
   /** Target channel. If it is the agent-bus channel the reply is treated as a busPost. */
   readonly chatId?: string
@@ -143,6 +144,9 @@ export interface WsListSessions {
 /** Post to a specific Discord channel (id or name); delivered to its subscribers. */
 export interface WsChannelPost {
   readonly type: 'channelPost'
+  readonly requestId?: string
+  readonly publish_id?: string
+  readonly files?: WsReply['files']
   readonly channel: string
   readonly text: string
   readonly to?: string
@@ -383,7 +387,23 @@ export interface PublishResult {
   readonly mirror?: 'failed'
 }
 
+type ForwardedGatewayCall =
+  | (Omit<WsChannelPost, 'type'> & { op: 'channelPost' })
+  | (Omit<WsReply, 'type'> & { op: 'reply' })
+  | (Omit<WsFetchMessages, 'type'> & { op: 'fetchMessages' })
+  | { op: 'busSessions' }
+  | (Omit<WsClaimOp, 'type'> & { op: WsClaimOp['type'] })
+  | (Omit<WsMcpOp, 'type'> & { op: WsMcpOp['type'] })
+  | { op: 'channelList' | 'channelSubscribe'; channel?: string; session?: string }
+
+export type GatewayToolCall = ForwardedGatewayCall & {
+  type: 'gatewayOp'
+  as: string
+  requestId: string
+}
+
 export type GatewayToRouterMessage =
+  | GatewayToolCall
   | { type: 'registerGateway'; host: string; user: string; proto: 1; secret: string; requestId?: string }
   | { type: 'registerAgent'; kind: Kind; conv: string; alias: string; host?: string; requestId?: string }
   | { type: 'releaseAgent'; alias: string; requestId?: string }
