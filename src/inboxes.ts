@@ -22,6 +22,7 @@ export interface PublishMirror {
   readonly where: string
   readonly label: string
   readonly origin: string
+  readonly copy?: { readonly where: string; readonly origin: string }
   readonly from: string
   readonly fingerprint: string
   readonly sender?: Target

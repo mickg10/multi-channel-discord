@@ -1426,9 +1426,14 @@ async function handleChannelPost(ws: WsLike, msg: WsChannelPost, deps: Readonly<
   postToChannel(ws, ch.id, ch.name, msg.text, msg.to, deps, files, requestId ? { requestId, publish_id: msg.publish_id } : undefined, sender)
 }
 
+interface MirrorDelivery {
+  messageId?: string
+  copyId?: string
+}
+
 const mirrorAttempts = new WeakMap<Inboxes, Map<string, {
   fingerprint: string
-  result: Promise<string | undefined>
+  result: Promise<MirrorDelivery>
 }>>()
 
 function mirrorFingerprint(text: string, files?: readonly DiscordFile[]): string {
@@ -1437,7 +1442,7 @@ function mirrorFingerprint(text: string, files?: readonly DiscordFile[]): string
   return hash.digest('hex')
 }
 
-function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: string, files: DiscordFile[] | undefined, attemptKey: string): Promise<string | undefined> {
+function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: string, files: DiscordFile[] | undefined, attemptKey: string): Promise<MirrorDelivery> {
   const inboxes = deps.inboxes
   let attempts = inboxes ? mirrorAttempts.get(inboxes) : undefined
   if (inboxes && !attempts) { attempts = new Map(); mirrorAttempts.set(inboxes, attempts) }
@@ -1448,22 +1453,26 @@ function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: str
   }
   let expired = false
   let deadline: number | ReturnType<typeof setTimeout>
-  const timeout = new Promise<undefined>(resolve => {
-    deadline = setTimeout(() => { expired = true; resolve(undefined) }, 2_000)
+  const delivered: MirrorDelivery = {}
+  const timeout = new Promise<MirrorDelivery>(resolve => {
+    deadline = setTimeout(() => { expired = true; resolve({ ...delivered }) }, 2_000)
   })
-  const chunks = chunk(`**[${plan.from} → ${plan.label}]**${plan.origin} ${text}`, deps.chunkLimit, deps.chunkMode)
-  const send = async () => {
+  const send = async (destination: { where: string; origin: string }, field: keyof MirrorDelivery) => {
+    const chunks = chunk(`**[${plan.from} → ${plan.label}]**${destination.origin} ${text}`, deps.chunkLimit, deps.chunkMode)
     let first: string | undefined
     for (const [index, content] of chunks.entries()) {
-      if (expired) return undefined
-      const nonce = createHash('sha256').update(JSON.stringify([attemptKey, index])).digest('hex').slice(0, 25)
-      const messageId = await sendToDiscordAwait(deps.client, plan.where, content, index === 0 ? files : undefined, nonce)
-      if (!messageId) return undefined
+      if (expired) return
+      const nonceParts = field === 'copyId' ? [attemptKey, index, 'copy'] : [attemptKey, index]
+      const nonce = createHash('sha256').update(JSON.stringify(nonceParts)).digest('hex').slice(0, 25)
+      const messageId = await sendToDiscordAwait(deps.client, destination.where, content, index === 0 ? files : undefined, nonce)
+      if (!messageId) return
       first ??= messageId
     }
-    return first
+    delivered[field] = first
   }
-  const attempt = Promise.race([send(), timeout]).finally(() => {
+  const sends = [send(plan, 'messageId')]
+  if (plan.copy) sends.push(send(plan.copy, 'copyId'))
+  const attempt = Promise.race([Promise.all(sends).then(() => delivered), timeout]).finally(() => {
     clearTimeout(deadline)
     attempts?.delete(attemptKey)
   })
@@ -1494,7 +1503,7 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
       reply(false, 'publish_payload_mismatch')
       return
     }
-    void tryPublishMirror(deps, retry.mirror, text, files, JSON.stringify([key, retry.at])).then(messageId => {
+    void tryPublishMirror(deps, retry.mirror, text, files, JSON.stringify([key, retry.at])).then(({ messageId }) => {
       if (messageId) inboxes!.publishMirrored(key, retry.at, messageId)
       reply(true, JSON.stringify(messageId ? retry.result : { ...retry.result, mirror: 'failed' }))
     }).catch(err => reply(false, inboxError(err)))
@@ -1525,10 +1534,12 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   if (routed.passive) deps.unread?.bump(heard)
   deps.activity?.markPost(from)
 
-  const toHuman = toLabel === 'human' && deps.humanChannelId && deps.humanChannelId !== channelId &&
-    (!channelName || channelId === deps.busChannelId)
-  const where = toHuman ? deps.humanChannelId! : channelId
-  const origin = toHuman ? ` (from ${channelName ? `#${channelName}` : channelId === deps.busChannelId ? '#general' : channelId})` : ''
+  const humanChannel = toLabel === 'human' && deps.humanChannelId !== channelId ? deps.humanChannelId : undefined
+  const redirect = humanChannel && (!channelName || channelId === deps.busChannelId)
+  const source = channelName ? `#${channelName}` : '#general'
+  const where = redirect ? humanChannel : channelId
+  const origin = redirect ? ` (from ${source})` : ''
+  const copy = humanChannel && !redirect ? { where: humanChannel, origin: ` (from ${source})` } : undefined
   const meta: ChannelMeta = {
     ...(files?.length && { attachments: files.map(f => f.name).join('; '), attachment_count: String(files.length) }),
     chat_id: channelId,
@@ -1543,7 +1554,7 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
 
   const body = allMode === 'synthesis' ? `${text}\n\n(synthesis: read this channel for earlier replies before adding anything)` : text
   const result: PublishResult = { publish_id: id, committed: targets }
-  const mirror: PublishMirror = { where, label: toLabel, origin, from, fingerprint: mirrorFingerprint(text, files), sender }
+  const mirror: PublishMirror = { where, label: toLabel, origin, copy, from, fingerprint: mirrorFingerprint(text, files), sender }
   const messages = targets.map(name => {
     const stamped = admission(deps, name, meta)
     if (!stamped) throw new Error('unknown_target')
@@ -1555,12 +1566,14 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   // Prefer a Discord message reference when available, with bounded waiting
   // before delivery to agents. A mirror retry never replays agent transport.
   const attemptKey = JSON.stringify([key, record ? now : 'uncommitted'])
-  void tryPublishMirror(deps, mirror, text, files, attemptKey).then(messageId => {
+  void tryPublishMirror(deps, mirror, text, files, attemptKey).then(({ messageId, copyId }) => {
+    const mirrorSucceeded = Boolean(messageId && (!copy || copyId))
+    if (copyId) inboxes?.setMirror([], copyId, sender)
     if (messageId) {
       if (record) inboxes?.publishMirrored(key, now, messageId)
       else {
         inboxes?.setMirror(entries.map(entry => entry.id), messageId, sender)
-        if (publish && (publish.publish_id !== undefined || requestId) && !inboxes?.publish(key)) {
+        if (mirrorSucceeded && publish && (publish.publish_id !== undefined || requestId) && !inboxes?.publish(key)) {
           inboxes?.commit([], { key, result, at: now })
         }
       }
@@ -1573,7 +1586,7 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
         if (pending) scheduleTransport(deps, targets[index]!, pending)
       })
     }
-    if (!messageId && (toLabel === 'human' || (requestId && !targets.length))) { reply(false, 'discord_unavailable'); return }
+    if (!mirrorSucceeded && (toLabel === 'human' || (requestId && !targets.length))) { reply(false, 'discord_unavailable'); return }
     reply(true, JSON.stringify(!messageId && targets.length ? { ...result, mirror: 'failed' } : result))
   }).catch(err => reply(false, inboxError(err)))
 

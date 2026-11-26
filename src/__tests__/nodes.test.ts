@@ -195,8 +195,8 @@ describe('human channel + rules + archive', () => {
     expect(msgs(b).some(m => m.type === 'message')).toBe(false)
   })
 
-  test('channel_post to human stays in its topic while #general still redirects', async () => {
-    const channels = [{ id: 'bbq-topic', name: 'bbq' }, { id: 'bus1', name: 'general' }]
+  test('topic posts to human send both copies while general and channel-free posts send once', async () => {
+    const channels = [{ id: 'bbq-topic', name: 'bbq' }, { id: 'bus1', name: 'general' }, { id: 'hq1', name: 'human-questions' }]
     const h = createWsHandlers(deps({ channelOps: {
       resolve: async name => channels.find(channel => channel.name === name) ?? null,
       list: async () => channels,
@@ -207,9 +207,16 @@ describe('human channel + rules + archive', () => {
     await tick()
     h.message(a, JSON.stringify({ type: 'channelPost', channel: 'general', text: 'new question', to: 'human' }))
     await tick()
+    h.message(a, JSON.stringify({ type: 'busPost', text: 'channel-free question', to: 'human' }))
+    await tick()
+    h.message(a, JSON.stringify({ type: 'channelPost', channel: 'human-questions', text: 'already in human questions', to: 'human' }))
+    await tick()
     expect(posted).toEqual([
       ['bbq-topic', '**[claude@mac:bbq → human]** answer'],
+      ['hq1', '**[claude@mac:bbq → human]** (from #bbq) answer'],
       ['hq1', '**[claude@mac:bbq → human]** (from #general) new question'],
+      ['hq1', '**[claude@mac:bbq → human]** (from #general) channel-free question'],
+      ['hq1', '**[claude@mac:bbq → human]** already in human questions'],
     ])
   })
 
