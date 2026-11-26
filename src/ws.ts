@@ -59,6 +59,7 @@ export interface WsData {
   /** Set when this connection is a node daemon. */
   nodeName?: string
   legacyHost?: string
+  renamed?: boolean
   gateway?: { user: string; agents: Map<string, Target> }
   /** Register-time instance id of the client connection (grant binding). */
   instanceId?: string
@@ -431,6 +432,17 @@ function aliasAllowedOnHost(alias: string, host?: string): boolean {
   if (!alias || HUMAN_TARGETS.has(lower) || lower === 'router' ||
       /^all(?::(?:synthesis|independent))?$/.test(lower) || lower.startsWith('@all')) return false
   return !alias.includes('@') || (!!host && qualifiedAliasHost(alias) === host)
+}
+
+function protectedRenameAlias(deps: Readonly<WsDeps>, name: string): boolean {
+  const lower = name.toLowerCase()
+  const names = [
+    ...(deps.admins ?? []), ...(deps.channelOwners?.values() ?? []), ...(deps.subs?.channelOwnerAliases() ?? []),
+  ]
+  return names.some(alias => {
+    const protectedName = alias.toLowerCase()
+    return lower === protectedName || (lower.startsWith(protectedName) && /^(?:-\d+)+$/.test(lower.slice(protectedName.length)))
+  })
 }
 
 function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
@@ -855,7 +867,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
     case 'rename': {
       const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
       const name = typeof parsed.name === 'string' ? parsed.name.trim() : undefined
-      if (!isBusAlias(name) || !aliasAllowedOnHost(name, ws.data.legacyHost)) {
+      if (!isBusAlias(name) || !aliasAllowedOnHost(name, ws.data.legacyHost) || protectedRenameAlias(deps, name)) {
         sendOperationError(ws, requestId, 'invalid_bus_alias')
         return
       }
@@ -971,12 +983,13 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>, reque
     return
   }
   const conv = deps.conversations?.get(oldName) ?? null
-  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name),
+  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name) || protectedRenameAlias(deps, name),
     name => deps.inboxes?.renameLegacy(oldName, name, conv))
   deps.subs?.rename(oldName, actualName)
   if (pullSessions.delete(oldName)) pullSessions.add(actualName)
   if (conv) deps.conversations?.set(actualName, conv)
   ws.data.sessionName = actualName
+  if (actualName !== oldName) ws.data.renamed = true
 
   const response: WsRenamed = { type: 'renamed', oldName, newName: actualName, ...(requestId && { requestId }) }
   ws.send(JSON.stringify(response))
@@ -1790,11 +1803,14 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
 }
 
 async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>, sender?: Target): Promise<void> {
-  // Admin sessions may (un)subscribe someone else (e.g. agents that lack the channel tools).
-  if (msg.session && ws.data.sessionName && msg.session !== ws.data.sessionName) {
-    if (!deps.admins?.has(ws.data.sessionName)) { sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session'); return }
+  // A legacy alias change cannot confer or carry administrative privileges.
+  const caller = ws.data.sessionName
+  const admin = caller && !ws.data.renamed && deps.admins?.has(caller)
+  if (msg.session && caller && msg.session !== caller && !admin) {
+    sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session')
+    return
   }
-  const me = (msg.session && deps.admins?.has(ws.data.sessionName ?? '') ? msg.session : null) ?? ws.data.sessionName
+  const me = (admin && msg.session) || caller
   const ops = deps.channelOps
   const subs = deps.subs
   if (!me) { sendToolResult(ws, msg.requestId, false, 'not registered'); return }

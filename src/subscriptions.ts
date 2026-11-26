@@ -7,17 +7,21 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
+export type ChannelOwner = { name: string; instanceId?: string } | { identity: string }
+
 interface SubscriptionState {
   version: 1
   legacy: Record<string, string[]>
   native: Record<string, string[]>
   owners: Record<string, string>
+  channelOwners?: Record<string, ChannelOwner>
 }
 
 export class Subscriptions {
   private readonly map = new Map<string, Set<string>>()
   private readonly native = new Map<string, Set<string>>()
   private readonly owners = new Map<string, string>()
+  private readonly channelOwners = new Map<string, ChannelOwner>()
   private unversioned = false
 
   constructor(private readonly file?: string) {
@@ -29,6 +33,7 @@ export class Subscriptions {
         for (const [name, channels] of Object.entries(state.legacy)) this.map.set(name, new Set(channels))
         for (const [key, channels] of Object.entries(state.native)) this.native.set(key, new Set(channels))
         for (const [name, instance] of Object.entries(state.owners)) this.owners.set(name, instance)
+        for (const [channel, owner] of Object.entries(state.channelOwners ?? {})) this.channelOwners.set(channel, owner)
       } else {
         this.unversioned = true
         for (const [name, channels] of Object.entries(raw)) this.map.set(name, new Set(channels))
@@ -76,6 +81,10 @@ export class Subscriptions {
 
   nativeSubscribers(channelId: string): string[] {
     return [...this.native].filter(([, channels]) => channels.has(channelId)).map(([key]) => key)
+  }
+
+  channelOwnerAliases(): string[] {
+    return [...this.channelOwners.values()].flatMap(owner => owner && 'name' in owner ? [owner.name] : [])
   }
 
   reclaim(name: string, instanceId?: string): void {
@@ -145,6 +154,7 @@ export class Subscriptions {
       const serialize = (map: Map<string, Set<string>>) => Object.fromEntries([...map].map(([key, channels]) => [key, [...channels]]))
       const state: SubscriptionState = {
         version: 1, legacy: serialize(this.map), native: serialize(this.native), owners: Object.fromEntries(this.owners),
+        channelOwners: Object.fromEntries(this.channelOwners),
       }
       writeFileSync(tmp, JSON.stringify(state, null, 2))
       renameSync(tmp, this.file)

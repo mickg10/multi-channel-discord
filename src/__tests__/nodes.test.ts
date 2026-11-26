@@ -6,7 +6,7 @@ import { Inboxes, NodeRegistry } from '../nodes.js'
 import { Conversations, Unread, WakeBudget } from '../wake.js'
 import { Subscriptions } from '../subscriptions.js'
 import { buildCommand, parseTurnOutput, bootstrapPrompt } from '../node.js'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -448,4 +448,44 @@ describe('explicit-name takeover retires the stale holder', () => {
     expect(msgs(live).some(m => m.type === 'message' && m.content === 'for the live thread')).toBe(true)
     expect(msgs(stale).some(m => m.type === 'message' && m.content === 'for the live thread')).toBe(false)
   })
+})
+
+test('rename cannot claim reserved owner aliases or preserve legacy admin privileges', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'admin-rename-'))
+  await writeFile(join(dir, 'subscriptions.json'), JSON.stringify({
+    version: 1, legacy: {}, native: {}, owners: {}, channelOwners: { recorded: { name: 'recorded@mac' } },
+  }))
+  const subs = Subscriptions.inStateDir(dir)
+  const h = createWsHandlers(deps({
+    subs, admins: new Set(['admin@mac']),
+    channelOwners: new Map([['configured', 'owner@mac']]),
+    channelOps: {
+      resolve: async () => ({ id: 'topic', name: 'topic' }),
+      list: async () => [],
+      create: async name => ({ id: name, name }),
+    },
+  }))
+  const agent = reg(h, 'other@mac')
+  for (const name of ['ADMIN@mac', 'admin@mac-2', 'OWNER@mac-3', 'Recorded@mac', 'recorded@mac-4']) {
+    h.message(agent, JSON.stringify({ type: 'rename', name }))
+    expect(msgs(agent).at(-1)).toMatchObject({ type: 'error', message: 'invalid_bus_alias' })
+    expect(agent.data.sessionName).toBe('other@mac')
+  }
+  const adminRegistration = JSON.stringify({ type: 'register', name: 'admin@mac', projectPath: '/', instanceId: 'real-admin' })
+  const admin = makeWs()
+  h.message(admin, adminRegistration)
+  h.close(admin)
+  const reconnected = makeWs()
+  h.message(reconnected, adminRegistration)
+  const subscribe = (requestId: string) => h.message(reconnected, JSON.stringify({
+    type: 'channelSubscribe', requestId, channel: 'topic', session: 'another-agent',
+  }))
+  subscribe('before')
+  await tick()
+  expect(msgs(reconnected).find(frame => frame.requestId === 'before')).toMatchObject({ success: true })
+  h.message(reconnected, JSON.stringify({ type: 'rename', name: 'new-admin-name@mac' }))
+  h.message(reconnected, JSON.stringify({ type: 'rename', name: 'admin@mac' }))
+  expect(msgs(reconnected).at(-1)).toMatchObject({ type: 'error', message: 'invalid_bus_alias' })
+  subscribe('after')
+  expect(msgs(reconnected).find(frame => frame.requestId === 'after')).toMatchObject({ success: false })
 })
