@@ -1,6 +1,6 @@
 # Round 8 · Fable · Last defence
 
-I accept all five cuts put to me. One thing already cut must be narrowed, and it is my own #10. Nothing else needs to come back. The A10 rewrite is in [a10-v2-draft.md](a10-v2-draft.md) (52 lines). Checked against the lines visible in `prs/`; tests not run.
+I accept all five cuts put to me. One thing already cut must be narrowed, and it is my own #10. Nothing else needs to come back. The A10 rewrite is in [a10-v2-draft.md](a10-v2-draft.md) (53 lines). Checked against the lines visible in `prs/`; tests not run.
 
 ## #22, #12(a), #24–#26
 
