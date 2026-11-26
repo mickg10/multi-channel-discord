@@ -22,6 +22,7 @@ export interface WsRegister {
   readonly name: string
   /** Declared local host label, pinned for renames in this legacy connection. */
   readonly host?: string
+  readonly agent?: string
   readonly projectPath: string
   /** Parent PID of the Claude Code process. Used to dedup multiple MCP spawns
    *  from the same instance while keeping separate instances as separate sessions. */
@@ -32,6 +33,8 @@ export interface WsRegister {
   readonly mode?: 'push' | 'pull'
   /** Replace an existing session with this name instead of getting a "-2" suffix. */
   readonly takeover?: boolean
+  /** Reclaim the exact name once vacant, without displacing its current holder. */
+  readonly reclaimOnly?: boolean
   /** cheap | standard | premium. Omitted = standard. Used to order and budget cold wakes. */
   readonly costClass?: 'cheap' | 'standard' | 'premium'
   /** Stable id of this conversation. A reused display name with a different id does not inherit held approvals. */
@@ -255,6 +258,7 @@ export interface WsMessage {
 export interface WsRegistered {
   readonly type: 'registered'
   readonly name: string
+  readonly reclaimOnly?: true
 }
 
 /** Router → Plugin: confirms rename */

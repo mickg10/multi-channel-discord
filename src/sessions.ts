@@ -89,6 +89,10 @@ export class SessionManager {
     }
   }
 
+  isSameInstance(name: string, instanceId?: string): boolean {
+    return !!instanceId && this.sessions.get(name)?.instanceId === instanceId
+  }
+
   ownsSender(name: string, send: (msg: string) => void): boolean {
     const slot = this.sessions.get(name)
     return !!slot && (slot.send === send || slot.extraSends.includes(send))

@@ -294,7 +294,7 @@ describe('takeover + claims', () => {
   test('pull-mode re-register replaces the stale slot (no -2 suffix)', () => {
     const h = createWsHandlers(deps())
     reg(h, 'claude@m:x', 'pull')
-    const s2 = makeWs(); h.message(s2 as any, JSON.stringify({ type: 'register', name: 'claude@m:x', projectPath: '/p', instanceId: 'other', mode: 'pull' }))
+    const s2 = makeWs(); h.message(s2 as any, JSON.stringify({ type: 'register', name: 'claude@m:x', projectPath: '/p', instanceId: 'other', agent: 'claude', mode: 'pull' }))
     expect(msgs(s2)[0].name).toBe('claude@m:x')
     expect(sessions.getSessions().map(s => s.name)).toEqual(['claude@m:x'])
   })
@@ -440,7 +440,7 @@ describe('explicit-name takeover retires the stale holder', () => {
   test('newer client with takeover gets the exact name; old one is told "replaced"', () => {
     const h = createWsHandlers(deps())
     const stale = makeWs(); h.message(stale as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'old-thread' }))
-    const live = makeWs(); h.message(live as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'new-thread', takeover: true }))
+    const live = makeWs(); h.message(live as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'new-thread', agent: 'codex', takeover: true }))
     expect(msgs(stale).some(m => m.type === 'replaced' && m.name === 'codex@mac')).toBe(true)
     expect(msgs(live).find(m => m.type === 'registered').name).toBe('codex@mac')
     expect(sessions.getSessions().map(s => s.name)).toEqual(['codex@mac'])
