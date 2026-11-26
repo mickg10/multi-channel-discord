@@ -1,39 +1,25 @@
-type WakeOutcome = 'confirmed' | 'failed' | 'cancelled'
-
 interface TmuxWakeOptions {
   readonly pane: string
   readonly text: string
-  /** Return stdout, or undefined when the command fails. */
-  readonly run: (args: string[]) => Promise<string | undefined>
+  readonly run: (args: string[]) => Promise<boolean>
+  /** False once the agent drains the inbox or the wake is superseded. */
   readonly isCurrent: () => boolean
+  readonly onUnconfirmed: () => void
   readonly wait?: (ms: number) => Promise<void>
 }
 
-export async function wakeTmux({ pane, text, run, isCurrent, wait = sleep }: TmuxWakeOptions): Promise<WakeOutcome> {
-  const capture = () => run(['capture-pane', '-p', '-J', '-S', '-30', '-t', pane])
-  const occurrences = (snapshot: string) => snapshot.split(text).length - 1
-  const hasNewWake = (before?: string, after?: string) => before !== undefined && after !== undefined &&
-    occurrences(after) > occurrences(before)
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (!isCurrent()) return 'cancelled'
-    const before = await capture()
-    if (!isCurrent()) return 'cancelled'
-    const typed = await run(['send-keys', '-t', pane, '-l', text])
-    if (typed !== undefined) {
-      await wait(300)
-      if (!isCurrent()) return 'cancelled'
-      const entered = await run(['send-keys', '-t', pane, 'Enter'])
-      if (entered !== undefined) {
-        await wait(3_000)
-        if (!isCurrent()) return 'cancelled'
-        if (hasNewWake(before, await capture())) return isCurrent() ? 'confirmed' : 'cancelled'
-      }
-    }
-    if (!isCurrent()) return 'cancelled'
-    if (attempt === 0) await wait(30_000)
+export async function wakeTmux({ pane, text, run, isCurrent, onUnconfirmed, wait = sleep }: TmuxWakeOptions): Promise<void> {
+  if (!isCurrent()) return
+  const typed = await run(['send-keys', '-t', pane, '-l', text])
+  if (typed) {
+    await wait(300)
+    if (!isCurrent()) return
+    const entered = await run(['send-keys', '-t', pane, 'Enter'])
+    if (entered && isCurrent()) await wait(30_000)
   }
-  return 'failed'
+  // Only a real inbox drain can confirm delivery. A timeout opens the
+  // latch for future mail and never submits another prompt on its own.
+  if (isCurrent()) onUnconfirmed()
 }
 
 function sleep(ms: number): Promise<void> {

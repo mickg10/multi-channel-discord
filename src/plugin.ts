@@ -300,9 +300,6 @@ export async function startPlugin(): Promise<void> {
   let wakeTimer: ReturnType<typeof setTimeout> | null = null
   let wakeInFlight = false
   let wakeGen = 0
-  let flightTimer: ReturnType<typeof setTimeout> | null = null
-  // If check_inbox never acks, open the latch so a dropped turn cannot swallow later mail.
-  const maxInFlightMs = 15 * 60 * 1000
   // One nudge until check_inbox acks it. A second directed message stays queued (hold)
   // and is either included in that drain or nudges exactly once after the ack.
   function considerWake(): void {
@@ -311,13 +308,6 @@ export async function startPlugin(): Promise<void> {
     if (wakeMode !== 'tmux' || !wakePane || wakeTimer) return
     wakeInFlight = true
     const gen = ++wakeGen
-    if (flightTimer) clearTimeout(flightTimer)
-    flightTimer = setTimeout(() => {
-      flightTimer = null
-      if (!wakeInFlight) return
-      wakeInFlight = false
-      if (inbox.length > 0) considerWake()
-    }, maxInFlightMs)
     wakeTimer = setTimeout(() => {
       wakeTimer = null
       void flushWake(gen)
@@ -327,16 +317,16 @@ export async function startPlugin(): Promise<void> {
     const pane = wakePane
     if (!pane) return
     const isCurrent = () => !retired && !shuttingDown && gen === wakeGen && inbox.length > 0
-    const outcome = await wakeTmux({
+    await wakeTmux({
       pane, text: wakeText, isCurrent,
       run: args => new Promise(resolve => {
-        execFile(tmuxBin, args, { timeout: 5_000, maxBuffer: 128 * 1024 }, (err, stdout) => resolve(err ? undefined : stdout))
+        execFile(tmuxBin, args, { timeout: 5_000 }, err => resolve(!err))
       }),
+      onUnconfirmed: () => {
+        process.stderr.write('discord plugin: tmux wake was not confirmed by check_inbox; releasing wake latch\n')
+        wakeInFlight = false
+      },
     })
-    if (outcome !== 'failed' || !isCurrent()) return
-    process.stderr.write('discord plugin: tmux wake was not confirmed after two attempts; releasing wake latch\n')
-    wakeInFlight = false
-    if (flightTimer) { clearTimeout(flightTimer); flightTimer = null }
   }
   function ackWake(): void {
     const remaining = inbox.length
@@ -344,7 +334,6 @@ export async function startPlugin(): Promise<void> {
     wakeInFlight = next.inFlight
     wakeGen++
     if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null }
-    if (flightTimer) { clearTimeout(flightTimer); flightTimer = null }
     if (next.nudge) considerWake()
   }
 
