@@ -434,6 +434,12 @@ function aliasAllowedOnHost(alias: string, host?: string): boolean {
   return !alias.includes('@') || (!!host && qualifiedAliasHost(alias) === host)
 }
 
+function takeoverKindMatches(name: string, agent: string, incumbent?: string): boolean {
+  const kindAndProfile = name.toLowerCase().split('@', 1)[0]
+  if (!name.includes('@')) return incumbent === agent
+  return kindAndProfile === agent || kindAndProfile.startsWith(agent + '-')
+}
+
 function protectedRenameAlias(deps: Readonly<WsDeps>, name: string): boolean {
   const lower = name.toLowerCase()
   const names = [
@@ -829,24 +835,33 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         ws.send(JSON.stringify({ type: 'replaced', name: normalized }))
         return
       }
+      const agent = typeof parsed.agent === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(parsed.agent)
+        ? parsed.agent.toLowerCase() : undefined
+      const conversationId = typeof parsed.conversationId === 'string' ? parsed.conversationId : ''
+      const incumbent = deps.sessions.registeredIdentity(normalized)
+      if (incumbent && parsed.reclaimOnly === true) { sendError(ws, 'name_occupied'); return }
+      const takeover = parsed.takeover === true || (parsed.takeover === undefined && parsed.mode === 'pull')
+      if (incumbent && takeover) {
+        const sameInstance = incumbent.instanceId === parsed.instanceId
+        const valid = !!agent && takeoverKindMatches(normalized, agent, incumbent.agent)
+        // Older clients can prove continuity by the instance already in the slot.
+        if (!valid && !(sameInstance && parsed.agent === undefined)) {
+          sendError(ws, 'takeover_refused')
+          return
+        }
+        const sameConversation = !!conversationId && conversationId === incumbent.conversationId
+        const differentConversation = !!conversationId && !!incumbent.conversationId && !sameConversation
+        const kind = agent ?? incumbent.agent ?? normalized.toLowerCase().split('@', 1)[0]!
+        const codex = kind === 'codex' || kind.startsWith('codex-') || kind === 'chatgpt-codex'
+        const reclaimable = !differentConversation && (!codex || sameInstance || sameConversation)
+        deps.sessions.notifySession(normalized, JSON.stringify({
+          type: 'replaced', name: normalized, ...(!reclaimable && { reclaim: false }),
+        }))
+        deps.sessions.deregisterSession(normalized)
+      }
       ws.data.authed = true
       ws.data.legacyHost = host
-      {
-        // Headless turns (pull mode) re-register the same name each turn; replace the stale
-        // slot instead of creating "name-2" that nobody reads.
-        const p = parsed as { mode?: string; takeover?: boolean; instanceId?: string }
-        const stale = deps.sessions.getSessions().find(s => s.name === normalized)
-        if (stale && (p.takeover || p.mode === 'pull')) {
-          // Tell the old holder it lost the name so it retires instead of lingering (a stale
-          // Codex-daemon thread kept the name and swallowed the live thread's mail and nudges).
-          deps.sessions.notifySession(normalized, JSON.stringify({ type: 'replaced', name: normalized }))
-          try { deps.sessions.deregisterSession(normalized) } catch {}
-        }
-      }
-      const conversationId = typeof (parsed as { conversationId?: unknown }).conversationId === 'string'
-        ? (parsed as { conversationId: string }).conversationId
-        : ''
-      handleRegister(ws, normalized, parsed.projectPath, (parsed as { instanceId?: string }).instanceId, deps)
+      handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, { agent, conversationId })
       if (ws.data.sessionName) {
         deps.conversations?.set(ws.data.sessionName, conversationId)
         if (conversationId) deps.inboxes?.remember(ws.data.sessionName, conversationId)
@@ -946,7 +961,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
   }
 }
 
-function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>): void {
+function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>, identity: { agent?: string; conversationId?: string }): void {
   const sendCb = (msg: string) => ws.send(msg)
   ws.data.instanceId = instanceId
   const actualName = deps.sessions.registerSession(
@@ -955,13 +970,14 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     projectPath,
     instanceId,
     name => !!deps.inboxes?.target(name),
+    identity,
   )
   ws.data.sessionName = actualName
   deps.subs?.reclaim(actualName, instanceId)
   ws.data.sendCallback = sendCb
   deps.history.record(actualName, projectPath)
 
-  const response: WsRegistered = { type: 'registered', name: actualName }
+  const response: WsRegistered = { type: 'registered', name: actualName, reclaimOnly: true }
   ws.send(JSON.stringify(response))
   deps.onSessionChange?.()
 }

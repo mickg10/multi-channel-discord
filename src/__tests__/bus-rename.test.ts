@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Inboxes } from '../inboxes.js'
@@ -71,19 +71,22 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
   expect(rawReplies.at(-1)?.newName).toBe('a'.repeat(126) + '-2')
   handlers.message(existing, JSON.stringify({ type: 'rename', name: 'cfd-injection-smart' }))
 
-  async function plugin(name = original, host = 'nas642') {
+  const reclaimClock = join(stateDir, 'reclaim-clock.js')
+  writeFileSync(reclaimClock, `const schedule = globalThis.setTimeout;
+globalThis.setTimeout = (cb, ms, ...args) => schedule(cb, ms === 60000 ? 100 : ms, ...args);`)
+  async function plugin(name = original, host = 'nas642', instanceId?: string, agent = 'agy') {
     const client = new Client({ name: 'rename-fixture', version: '1' })
     clients.push(client)
     await client.connect(new StdioClientTransport({
       command: process.execPath,
-      args: [join(import.meta.dir, '..', 'plugin.ts')],
+      args: ['--preload', reclaimClock, join(import.meta.dir, '..', 'plugin.ts')],
       stderr: 'ignore',
       env: {
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: stateDir,
-        DISCORD_AGENT: 'agy',
+        DISCORD_AGENT: agent,
         DISCORD_HOST_LABEL: host,
-        ...(host !== 'nas642' && { DISCORD_INSTANCE_ID: 'invalid-host-fixture' }),
+        ...((instanceId || host !== 'nas642') && { DISCORD_INSTANCE_ID: instanceId ?? 'invalid-host-fixture' }),
         DISCORD_PARENT_PID: String(process.pid),
         DISCORD_CONVERSATION_ID: 'injection-conversation',
         DISCORD_STATE_DIR: stateDir,
@@ -141,16 +144,72 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
     expect(JSON.stringify(denied.content)).toContain('Check DISCORD_SESSION_NAME and DISCORD_HOST_LABEL')
     await new Promise(resolve => setTimeout(resolve, 1_100))
     expect(registrations.length).toBe(4)
+    await restarted.close()
+    await waitFor(() => sockets.size === 0)
+    const pinned = 'agy-tools@nas642:pinned'
+    const holder = await plugin(pinned, 'nas642', 'pinned-holder')
+    await waitFor(() => registrations.includes(pinned))
+    const taker = makePeer()
+    const wrong = makePeer()
+    handlers.message(wrong.ws, JSON.stringify({
+      type: 'register', name: pinned, projectPath: '/', host: 'nas642', agent: 'claude',
+      instanceId: 'pinned-holder', takeover: true,
+    }))
+    expect(wrong.frames.at(-1)).toEqual({ type: 'error', message: 'takeover_refused' })
+    expect(wrong.ws.data.sessionName).toBeNull()
+    expect(deps.sessions.isSameInstance(pinned, 'pinned-holder')).toBe(true)
+
+    handlers.message(taker.ws, JSON.stringify({
+      type: 'register', name: pinned, projectPath: '/', host: 'nas642', agent: 'agy',
+      instanceId: 'legitimate-taker', takeover: true,
+    }))
+    expect(taker.frames.at(-1)).toMatchObject({ type: 'registered', name: pinned })
+    await waitFor(() => registrations.length > 5)
+    expect(deps.sessions.isSameInstance(pinned, 'legitimate-taker')).toBe(true)
+    expect(deps.sessions.getSessions().some(session => session.name.startsWith(pinned + '-'))).toBe(false)
+    handlers.close(taker.ws)
+    await waitFor(() => deps.sessions.isSameInstance(pinned, 'pinned-holder'))
+    await waitFor(async () => {
+      const restored = await holder.callTool({ name: 'bus_sessions', arguments: {} })
+      return !restored.isError && JSON.stringify(restored.content).includes(pinned + '  (you)')
+    })
+
+    const codexName = 'codex@nas642:abandoned'
+    const abandoned = await plugin(codexName, 'nas642', 'old-codex-instance', 'codex')
+    await waitFor(() => registrations.includes(codexName))
+    const successor = makePeer()
+    handlers.message(successor.ws, JSON.stringify({
+      type: 'register', agent: 'codex', name: codexName, projectPath: '/', instanceId: 'new-codex-instance',
+      takeover: true, conversationId: 'new-codex-thread',
+    }))
+    await waitFor(async () => {
+      const status = await abandoned.callTool({ name: 'bus_sessions', arguments: {} })
+      return status.isError === true && JSON.stringify(status.content).includes('superseded')
+    })
+    handlers.close(successor.ws)
+    const count = registrations.length
+    await new Promise(resolve => setTimeout(resolve, 250))
+    expect(registrations.length).toBe(count)
+    expect(deps.sessions.registeredIdentity(codexName)).toBeUndefined()
   } finally {
     await Promise.allSettled(clients.map(client => client.close()))
     await fixture.stop(true)
     rmSync(stateDir, { recursive: true, force: true })
   }
-}, 12_000)
+}, 16_000)
 
-async function waitFor(condition: () => boolean): Promise<void> {
+function makePeer() {
+  const frames: object[] = []
+  const ws: WsLike = {
+    data: { sessionName: null, sendCallback: null },
+    send(raw) { frames.push(JSON.parse(raw)) },
+  }
+  return { ws, frames }
+}
+
+async function waitFor(condition: () => boolean | Promise<boolean>): Promise<void> {
   const deadline = Date.now() + 5_000
-  while (!condition()) {
+  while (!await condition()) {
     if (Date.now() >= deadline) throw new Error('Timed out waiting for plugin registration')
     await new Promise(resolve => setTimeout(resolve, 10))
   }

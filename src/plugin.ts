@@ -88,6 +88,7 @@ either from another agent (from="<agent session name>") or from the human postin
 interface ConnectResult {
   readonly ws: WebSocket
   readonly registeredName: string
+  readonly canReclaim: boolean
 }
 
 /** Pending request awaiting a WsToolResult response from the router. */
@@ -112,12 +113,14 @@ export interface ConnectToRouterOptions {
   readonly instanceId?: string
   readonly host?: string
   readonly takeover?: boolean
+  readonly reclaimOnly?: boolean
+  readonly agent?: string
   readonly onRenamed?: (name: string) => void
   readonly onMessage?: (content: string, meta: ChannelMeta) => void
   readonly pendingRequests?: Map<string, PendingRequest>
   readonly onPermissionVerdict?: (requestId: string, behavior: 'allow' | 'deny') => void
-  /** The router gave our name to a newer connection: retire (no reconnect, no wake). */
-  readonly onReplaced?: (name: string) => void
+  /** The router gave our name to a newer connection. */
+  readonly onReplaced?: (name: string, reclaim: boolean) => void
   /** Stable conversation id. A later session that reuses the display name does not inherit held approvals. */
   readonly conversationId?: string
 }
@@ -138,6 +141,7 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       reject(new Error('WebSocket connection timeout'))
     }, 5000)
 
+    let registered = false
     ws.onopen = () => {
       // process.ppid IS the Claude Code process (confirmed via process tree).
       // Multiple MCP spawns from the same Claude Code share this PID.
@@ -149,17 +153,19 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       const mode = process.env.DISCORD_MODE === 'pull' ? 'pull' : 'push'
       // An explicitly configured name belongs to the newest client that claims it (a resumed
       // thread), not to a stale one still connected from an abandoned thread.
-      const takeover = opts.takeover ?? !!process.env.DISCORD_SESSION_NAME
+      const takeover = opts.takeover ?? (process.env.DISCORD_SESSION_NAME ? true : undefined)
+      const agent = opts.agent ?? (process.env.DISCORD_AGENT || 'claude')
       const costClass = process.env.DISCORD_COST_CLASS
       const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
-      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, mode, ...(opts.host && { host: opts.host }), ...(takeover && { takeover }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
+      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, agent, mode, ...(opts.host && { host: opts.host }), ...(takeover !== undefined && { takeover }), ...(opts.reclaimOnly && { reclaimOnly: true }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
     }
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(String(event.data)) as RouterToPluginMessage
       if (msg.type === 'registered') {
+        registered = true
         clearTimeout(timeout)
-        resolve({ ws, registeredName: msg.name })
+        resolve({ ws, registeredName: msg.name, canReclaim: msg.reclaimOnly === true })
       } else if (msg.type === 'message' && onMessage) {
         onMessage(msg.content, msg.meta)
       } else if (msg.type === 'toolResult' || msg.type === 'renamed') {
@@ -173,10 +179,15 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
           else pending.reject(new Error(msg.data))
         }
       } else if (msg.type === 'replaced') {
-        onReplaced?.(msg.name)
+        onReplaced?.(msg.name, msg.reclaim !== false)
+        if (!registered) {
+          clearTimeout(timeout)
+          ws.close()
+          reject(new Error('name_occupied'))
+        }
       } else if (msg.type === 'error') {
         process.stderr.write(`discord plugin: router error: ${msg.message}\n`)
-        if (msg.message.startsWith('register rejected')) {
+        if (!registered && (msg.message.startsWith('register rejected') || msg.message === 'takeover_refused' || msg.message === 'name_occupied')) {
           clearTimeout(timeout)
           ws.close()
           reject(new Error(msg.message))
@@ -291,8 +302,11 @@ export async function startPlugin(): Promise<void> {
   const alias = claudeAlias()
   const generatedName = (suffix: string) => `${agent}@${hostLabel}:${suffix.replace(/[^-\w./:]/g, '-')}`.slice(0, BUS_ALIAS_MAX)
   const instanceId = clientInstanceId(agent)
+  const configuredName = !inChatGPT ? process.env.DISCORD_SESSION_NAME : undefined
+  delete process.env.DISCORD_SESSION_NAME
+  delete process.env.DISCORD_INSTANCE_ID
   const explicitAlias = new BusAlias(getStateDir(), instanceId)
-  const sessionName = explicitAlias.name || (!inChatGPT && process.env.DISCORD_SESSION_NAME) || generatedName(alias ?? namingCtx.dirName)
+  const sessionName = explicitAlias.name || configuredName || generatedName(alias ?? namingCtx.dirName)
 
   // Inbox: every inbound message is also queued here so clients without channel push
   // (Codex, agy) can read them with the check_inbox tool.
@@ -380,8 +394,11 @@ export async function startPlugin(): Promise<void> {
   let renamePending = false
   let registrationError: string | undefined
   let reconnectAttempt = 0
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined
   let shuttingDown = false
   let retired = false
+  let routerSupportsReclaim = false
+  let reclaimAllowed = true
   const pendingRequests = new Map<string, PendingRequest>()
 
   function onMessage(content: string, meta: ChannelMeta): void {
@@ -433,31 +450,32 @@ export async function startPlugin(): Promise<void> {
     // The plugin just connects to it.
     try {
       const conversationId = process.env.DISCORD_CONVERSATION_ID || claude?.sessionId
-      const { ws, registeredName } = await connectToRouter({
+      const { ws, registeredName, canReclaim } = await connectToRouter({
         wsPort,
         name: explicitAlias.name ?? currentName,
         projectPath: cwd,
         instanceId,
         host: hostLabel,
-        ...(explicitAlias.name && { takeover: false }),
+        agent,
+        ...((retired || explicitAlias.name) ? { takeover: false, reclaimOnly: retired } : configuredName && { takeover: true }),
         onRenamed: name => { currentName = name },
         onMessage,
         pendingRequests,
         onPermissionVerdict,
-        onReplaced: (n: string) => {
-          // A newer client (e.g. the resumed thread of this Codex conversation) owns the name now.
-          // Stay alive for the MCP host, but never reconnect or nudge again.
-          process.stderr.write(`discord plugin: name "${n}" taken over by a newer session; retiring this client\n`)
+        onReplaced: (n: string, reclaim: boolean) => {
+          reclaimAllowed = reclaim
+          process.stderr.write(`discord plugin: name "${n}" taken over${reclaim ? '; waiting for it to become free' : '; conversation superseded'}\n`)
           retired = true
-          shuttingDown = true
+          ackWake()
           try { currentWs?.close() } catch {}
-          currentWs = null
         },
         ...(conversationId && { conversationId }),
       })
       currentWs = ws
+      routerSupportsReclaim = canReclaim
       currentName = registeredName
-      const configuredName = !inChatGPT && process.env.DISCORD_SESSION_NAME
+      retired = false
+      reclaimAllowed = true
       if (explicitAlias.name && configuredName && explicitAlias.name !== configuredName) {
         process.stderr.write(`discord plugin: using saved bus alias "${registeredName}" (overrides DISCORD_SESSION_NAME)\n`)
       }
@@ -488,6 +506,11 @@ export async function startPlugin(): Promise<void> {
         currentWs = null
       }
     } catch (err: unknown) {
+      if (err instanceof Error && err.message === 'takeover_refused') {
+        registrationError = 'The router refused to take over the pinned bus alias. Check DISCORD_AGENT and DISCORD_SESSION_NAME.'
+        process.stderr.write(`discord plugin: ${registrationError}\n`)
+        return
+      }
       if (err instanceof Error && err.message === 'register rejected: invalid_bus_alias') {
         registrationError = 'The router rejected the bus alias. Check DISCORD_SESSION_NAME and DISCORD_HOST_LABEL, then restart the client.'
         process.stderr.write(`discord plugin: ${registrationError}\n`)
@@ -500,7 +523,7 @@ export async function startPlugin(): Promise<void> {
 
   let aliasTimer: ReturnType<typeof setInterval> | null = null
   function startAliasWatch(): void {
-    if (aliasTimer || explicitAlias.name || process.env.DISCORD_SESSION_NAME || !claude) return
+    if (aliasTimer || explicitAlias.name || configuredName || !claude) return
     aliasTimer = setInterval(() => {
       explicitAlias.restore()
       if (explicitAlias.name) { clearInterval(aliasTimer!); aliasTimer = null; return }
@@ -516,11 +539,12 @@ export async function startPlugin(): Promise<void> {
   }
 
   function scheduleReconnect(): void {
-    const delay = computeBackoff(reconnectAttempt)
-    reconnectAttempt++
-    process.stderr.write(`discord plugin: reconnecting in ${delay}ms (attempt ${reconnectAttempt})\n`)
-    setTimeout(() => {
-      if (!shuttingDown) connect()
+    if (reconnectTimer || shuttingDown || (retired && (!routerSupportsReclaim || !reclaimAllowed))) return
+    const delay = retired ? 60_000 : computeBackoff(reconnectAttempt++)
+    process.stderr.write(`discord plugin: reconnecting in ${delay}ms\n`)
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined
+      if (!shuttingDown) void connect()
     }, delay)
   }
 
@@ -774,7 +798,11 @@ export async function startPlugin(): Promise<void> {
       return { content: [{ type: 'text', text: registrationError }], isError: true }
     }
     if (retired) {
-      return { content: [{ type: 'text', text: `This client was retired: a newer session took over the name "${currentName}". Discord tools are unavailable from this thread; use the active session.` }], isError: true }
+      return { content: [{ type: 'text', text: !reclaimAllowed
+        ? `A newer conversation superseded the bus name "${currentName}".`
+        : routerSupportsReclaim
+        ? `Waiting to reclaim the bus name "${currentName}". Discord tools are unavailable until the active holder disconnects.`
+        : `A newer session took over the bus name "${currentName}". This router does not support automatic reclaim.` }], isError: true }
     }
     try {
       switch (req.params.name) {

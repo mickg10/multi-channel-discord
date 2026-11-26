@@ -14,6 +14,8 @@ interface SessionSlot {
   readonly name: string
   readonly projectPath: string
   readonly instanceId: string
+  readonly agent?: string
+  readonly conversationId?: string
   readonly connectedAt: number
   messageCount: number
   readonly send: (msg: string) => void
@@ -31,7 +33,7 @@ export class SessionManager {
    *  If a session with the same instanceId already exists, adds this send callback
    *  to extraSends (dedup for multiple MCP spawns from the same Claude Code process).
    *  Different Claude Code instances on the same project get separate sessions with collision suffixes. */
-  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean): string {
+  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string }): string {
     // Deduplicate: if same instanceId is already registered, add send callback to existing.
     // This handles Claude Code spawning multiple MCP plugin processes for one session.
     if (instanceId) {
@@ -48,6 +50,8 @@ export class SessionManager {
       name: actualName,
       projectPath,
       instanceId: instanceId ?? `anon-${Date.now()}`,
+      agent: identity?.agent,
+      conversationId: identity?.conversationId,
       connectedAt: Date.now(),
       messageCount: 0,
       send,
@@ -87,6 +91,15 @@ export class SessionManager {
       const idx = slot.extraSends.indexOf(send)
       if (idx !== -1) slot.extraSends.splice(idx, 1)
     }
+  }
+
+  registeredIdentity(name: string): Pick<SessionSlot, 'instanceId' | 'agent' | 'conversationId'> | undefined {
+    const slot = this.sessions.get(name)
+    return slot && { instanceId: slot.instanceId, agent: slot.agent, conversationId: slot.conversationId }
+  }
+
+  isSameInstance(name: string, instanceId?: string): boolean {
+    return !!instanceId && this.sessions.get(name)?.instanceId === instanceId
   }
 
   ownsSender(name: string, send: (msg: string) => void): boolean {

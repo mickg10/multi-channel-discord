@@ -294,7 +294,7 @@ describe('takeover + claims', () => {
   test('pull-mode re-register replaces the stale slot (no -2 suffix)', () => {
     const h = createWsHandlers(deps())
     reg(h, 'claude@m:x', 'pull')
-    const s2 = makeWs(); h.message(s2 as any, JSON.stringify({ type: 'register', name: 'claude@m:x', projectPath: '/p', instanceId: 'other', mode: 'pull' }))
+    const s2 = makeWs(); h.message(s2 as any, JSON.stringify({ type: 'register', name: 'claude@m:x', projectPath: '/p', instanceId: 'other', agent: 'claude', mode: 'pull' }))
     expect(msgs(s2)[0].name).toBe('claude@m:x')
     expect(sessions.getSessions().map(s => s.name)).toEqual(['claude@m:x'])
   })
@@ -440,7 +440,7 @@ describe('explicit-name takeover retires the stale holder', () => {
   test('newer client with takeover gets the exact name; old one is told "replaced"', () => {
     const h = createWsHandlers(deps())
     const stale = makeWs(); h.message(stale as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'old-thread' }))
-    const live = makeWs(); h.message(live as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'new-thread', takeover: true }))
+    const live = makeWs(); h.message(live as any, JSON.stringify({ type: 'register', name: 'codex@mac', projectPath: '/', instanceId: 'new-thread', agent: 'codex', takeover: true }))
     expect(msgs(stale).some(m => m.type === 'replaced' && m.name === 'codex@mac')).toBe(true)
     expect(msgs(live).find(m => m.type === 'registered').name).toBe('codex@mac')
     expect(sessions.getSessions().map(s => s.name)).toEqual(['codex@mac'])
@@ -488,4 +488,32 @@ test('rename cannot claim reserved owner aliases or preserve legacy admin privil
   expect(msgs(reconnected).at(-1)).toMatchObject({ type: 'error', message: 'invalid_bus_alias' })
   subscribe('after')
   expect(msgs(reconnected).find(frame => frame.requestId === 'after')).toMatchObject({ success: false })
+})
+
+test('bare pinned aliases accept takeover only from the recorded agent kind', () => {
+  const h = createWsHandlers(deps())
+  const name = 'opencode_nas642_glm53_abli'
+  const register = (agent: string, instanceId: string, takeover = false) => {
+    const ws = makeWs()
+    h.message(ws, JSON.stringify({ type: 'register', name, agent, projectPath: '/', instanceId, takeover }))
+    return ws
+  }
+  const incumbent = register('opencode', 'first')
+  const stranger = register('agy', 'second', true)
+  expect(msgs(stranger).at(-1)).toEqual({ type: 'error', message: 'takeover_refused' })
+  expect(incumbent.data.sessionName).toBe(name)
+  const replacement = register('opencode', 'third', true)
+  expect(msgs(replacement).at(-1)).toMatchObject({ type: 'registered', name })
+  expect(msgs(incumbent).at(-1)).toEqual({ type: 'replaced', name })
+})
+
+test('a Codex takeover of a different conversation supersedes the old client instead of allowing reclaim', () => {
+  const h = createWsHandlers(deps())
+  const name = 'codex@mac:work'
+  const incumbent = makeWs(), successor = makeWs()
+  const registration = { type: 'register', name, agent: 'codex', projectPath: '/', takeover: true }
+  h.message(incumbent, JSON.stringify({ ...registration, instanceId: 'first', conversationId: 'abandoned-thread' }))
+  h.message(successor, JSON.stringify({ ...registration, instanceId: 'second', conversationId: 'new-thread' }))
+  expect(msgs(incumbent).at(-1)).toEqual({ type: 'replaced', name, reclaim: false })
+  expect(msgs(successor).at(-1)).toMatchObject({ type: 'registered', name })
 })
