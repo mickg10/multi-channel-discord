@@ -20,7 +20,7 @@ import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { execFile } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
-import { wakeTmux } from './tmux-wake.js'
+import { tmuxWakeUnlatchMs, wakeTmux } from './tmux-wake.js'
 import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
@@ -297,6 +297,7 @@ export async function startPlugin(): Promise<void> {
   if (wakeMode === 'tmux' && !wakePane) wakePane = await findTmuxPane(tmuxBin)
   if (wakeMode === 'tmux') process.stderr.write(`discord plugin: tmux wake ${wakePane ? `-> pane ${wakePane}` : 'disabled (no pane found)'}\n`)
   const wakeText = process.env.DISCORD_WAKE_TEXT || 'New agent-bus/Discord message(s): call the discord check_inbox tool and handle them.'
+  const wakeUnlatchMs = tmuxWakeUnlatchMs(process.env.DISCORD_WAKE_UNLATCH_MS)
   let wakeTimer: ReturnType<typeof setTimeout> | null = null
   let wakeInFlight = false
   let wakeGen = 0
@@ -318,12 +319,13 @@ export async function startPlugin(): Promise<void> {
     if (!pane) return
     const isCurrent = () => !retired && !shuttingDown && gen === wakeGen && inbox.length > 0
     await wakeTmux({
-      pane, text: wakeText, isCurrent,
+      pane, text: wakeText, isCurrent, unlatchMs: wakeUnlatchMs,
       run: args => new Promise(resolve => {
         execFile(tmuxBin, args, { timeout: 5_000 }, err => resolve(!err))
       }),
-      onUnconfirmed: () => {
-        process.stderr.write('discord plugin: tmux wake was not confirmed by check_inbox; releasing wake latch\n')
+      onUnconfirmed: () => process.stderr.write('discord plugin: tmux wake not confirmed by check_inbox yet\n'),
+      onUnlatch: () => {
+        process.stderr.write('discord plugin: tmux wake confirmation deadline expired; releasing wake latch\n')
         wakeInFlight = false
       },
     })
