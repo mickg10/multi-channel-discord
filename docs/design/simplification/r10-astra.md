@@ -1,0 +1,4 @@
+**REJECT — sole blocker: A10 v2 acceptance test 5 promises one visible Discord answer across an arbitrarily long outage.**
+If Discord accepts the answer and the router dies before recording the returned message ID, #20 replays a pending publication. Discord checks nonce uniqueness only for the past few minutes, so a later retry can display the same answer twice (#20 `src/ws.ts` lines 1018 and 1465–1468; `discord-api-types/rest/v10/channel.d.ts` line 285).
+Keep one durable disposition and answer payload per human post. After the nonce window, reconcile an ambiguous send by a durable publication reference before retrying; if delivery cannot be established, surface it as uncertain. Test that crash window with nonce deduplication expired.
+I accept the other rulings at `352310b`, including #2 deferred to Mick, narrowed #10, Neon's six fixes, and the six-PR rollout order.

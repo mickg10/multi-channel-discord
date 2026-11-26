@@ -47,7 +47,7 @@ The router itself retries any journalled answer whose publication is still pendi
 2. Post during the black-hole window: the new master receives it once.
 3. A → B → A, where B answered X with `answers: X`: A's delayed term-1 `assign` for X gives `stale_term`, zero owners, zero deliveries. Repeat after a router restart.
 4. Retry of a committed `assign` returns the recorded owner with one delivery.
-5. Crash before and after the Discord send of an answer, and a Discord outage longer than five minutes: one visible answer, none recomposed.
+5. Crash before and after the Discord send of an answer, and a Discord outage longer than five minutes: the answer is never recomposed; inside Discord's nonce window a retry shows one answer. After the window, an ambiguous send is reconciled against a durable publication reference (recent channel history) before any retry; if delivery cannot be established it is surfaced as `uncertain`, not re-sent blindly. Test the crash window with nonce dedupe expired. (R10, Astra)
 6. Router restart with the standby reconnecting first: the journalled master keeps the role and the term does not change.
 7. A returning priority-1 candidate does not displace a live priority-2 master.
 8. `demote` promotes at once; an unlisted alias gets `not_master_candidate`; no candidate live gives the broadcast fallback.
