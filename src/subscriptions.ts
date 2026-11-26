@@ -7,7 +7,7 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
-export type ChannelOwner = { name: string; instanceId?: string } | { identity: string }
+export type ChannelOwner = { name: string; instanceId?: string; host?: string } | { identity: string }
 
 interface SubscriptionState {
   version: 1
@@ -93,8 +93,8 @@ export class Subscriptions {
     const owner = this.channelOwners.get(channel)
     if (!owner) return false
     if ('identity' in owner) return 'identity' in caller && owner.identity === caller.identity
-    return 'name' in caller && owner.name === caller.name &&
-      (owner.instanceId === undefined || owner.instanceId === caller.instanceId)
+    return 'name' in caller && !!owner.host && !!owner.instanceId &&
+      owner.host === caller.host && owner.instanceId === caller.instanceId
   }
 
   private moveChannelOwnership(name: string, destination: ChannelOwner): boolean {
@@ -103,10 +103,14 @@ export class Subscriptions {
     for (const [channel, owner] of this.channelOwners) {
       if (!('name' in owner) || owner.name !== name ||
           (owner.instanceId !== undefined && owner.instanceId !== instanceId)) continue
-      this.channelOwners.set(channel, destination)
+      this.channelOwners.set(channel, 'name' in destination ? { ...owner, name: destination.name } : destination)
       changed = true
     }
     return changed
+  }
+
+  channelOwnerAliases(): string[] {
+    return [...this.channelOwners.values()].flatMap(owner => owner && 'name' in owner ? [owner.name] : [])
   }
 
   reclaim(name: string, instanceId?: string): void {

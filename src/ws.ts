@@ -35,7 +35,7 @@ export interface ChannelOps {
   create(name: string, topic?: string): Promise<{ id: string; name: string }>
   /** Move to the "archive" category and set its topic (optional: not all routers support it). */
   archive?(id: string, topic: string): Promise<void>
-  setTopic?(id: string, topic: string, reason: string): Promise<{ id: string; name: string; topic: string | null }>
+  setTopic?(id: string, topic: string, reason: string): Promise<{ id: string; name: string; topic: string | null; previousTopic: string | null }>
 }
 import { chunk } from './discord.js'
 import { noteSent, getStateDir } from './access.js'
@@ -61,6 +61,7 @@ export interface WsData {
   /** Set when this connection is a node daemon. */
   nodeName?: string
   legacyHost?: string
+  renamed?: boolean
   gateway?: { user: string; agents: Map<string, Target> }
   /** Register-time instance id of the client connection (grant binding). */
   instanceId?: string
@@ -102,6 +103,9 @@ export interface WsDeps {
   readonly gatewayAliasHosts?: () => Readonly<Record<string, string>>
   /** Sessions allowed to manage other sessions' subscriptions (DISCORD_ADMIN_SESSIONS). */
   readonly admins?: ReadonlySet<string>
+  /** Topic permissions are keyed by registered identity, never by display alias. */
+  readonly topicAdmins?: ReadonlySet<string>
+  readonly topicChannelOwners?: ReadonlyMap<string, string>
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
   readonly humanChannelId?: string
   /** Bus rules sent once to every session on (first) register. */
@@ -433,6 +437,17 @@ function aliasAllowedOnHost(alias: string, host?: string): boolean {
   if (!alias || HUMAN_TARGETS.has(lower) || lower === 'router' ||
       /^all(?::(?:synthesis|independent))?$/.test(lower) || lower.startsWith('@all')) return false
   return !alias.includes('@') || (!!host && qualifiedAliasHost(alias) === host)
+}
+
+function protectedRenameAlias(deps: Readonly<WsDeps>, name: string): boolean {
+  const lower = name.toLowerCase()
+  const names = [
+    ...(deps.admins ?? []), ...(deps.channelOwners?.values() ?? []), ...(deps.subs?.channelOwnerAliases() ?? []),
+  ]
+  return names.some(alias => {
+    const protectedName = alias.toLowerCase()
+    return lower === protectedName || (lower.startsWith(protectedName) && /^(?:-\d+)+$/.test(lower.slice(protectedName.length)))
+  })
 }
 
 function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
@@ -859,7 +874,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
     case 'rename': {
       const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
       const name = typeof parsed.name === 'string' ? parsed.name.trim() : undefined
-      if (!isBusAlias(name) || !aliasAllowedOnHost(name, ws.data.legacyHost)) {
+      if (!isBusAlias(name) || !aliasAllowedOnHost(name, ws.data.legacyHost) || protectedRenameAlias(deps, name)) {
         sendOperationError(ws, requestId, 'invalid_bus_alias')
         return
       }
@@ -975,12 +990,13 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>, reque
     return
   }
   const conv = deps.conversations?.get(oldName) ?? null
-  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name),
+  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name) || protectedRenameAlias(deps, name),
     name => deps.inboxes?.renameLegacy(oldName, name, conv))
   deps.subs?.rename(oldName, actualName)
   if (pullSessions.delete(oldName)) pullSessions.add(actualName)
   if (conv) deps.conversations?.set(actualName, conv)
   ws.data.sessionName = actualName
+  if (actualName !== oldName) ws.data.renamed = true
 
   const response: WsRenamed = { type: 'renamed', oldName, newName: actualName, ...(requestId && { requestId }) }
   ws.send(JSON.stringify(response))
@@ -1045,7 +1061,7 @@ async function sendToDiscordAwait(client: Client, chatId: string, text: string, 
   }
 }
 
-async function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly DiscordFile[]): Promise<boolean> {
+async function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly DiscordFile[], suppressMentions = false): Promise<boolean> {
   try {
     const ch = await fetchTextChannelOrNull(client, chatId)
     if (!ch || !('send' in ch)) return false
@@ -1053,6 +1069,7 @@ async function sendToDiscord(client: Client, chatId: string, text: string, reply
       content: text,
       ...(files?.length && { files: [...files] }),
       ...(replyTo && { reply: { messageReference: replyTo, failIfNotExists: false } }),
+      ...(suppressMentions && { allowedMentions: { parse: [] } }),
     })
     noteSent(sent.id)
     return true
@@ -1793,12 +1810,26 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
   return []
 }
 
+function channelActor(ws: WsLike, sender?: Target): ChannelOwner | undefined {
+  if (sender) return { identity: identityKey(sender) }
+  const { sessionName, instanceId, legacyHost } = ws.data
+  if (!sessionName || !instanceId || !legacyHost) return undefined
+  return { name: sessionName, instanceId, host: legacyHost }
+}
+
+function channelActorKey(actor: ChannelOwner): string {
+  return 'identity' in actor ? 'native:' + actor.identity : 'legacy:' + JSON.stringify([actor.host, actor.instanceId])
+}
+
 async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>, sender?: Target): Promise<void> {
-  // Admin sessions may (un)subscribe someone else (e.g. agents that lack the channel tools).
-  if (msg.session && ws.data.sessionName && msg.session !== ws.data.sessionName) {
-    if (!deps.admins?.has(ws.data.sessionName)) { sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session'); return }
+  // A legacy alias change cannot confer or carry administrative privileges.
+  const caller = ws.data.sessionName
+  const admin = caller && !ws.data.renamed && deps.admins?.has(caller)
+  if (msg.session && caller && msg.session !== caller && !admin) {
+    sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session')
+    return
   }
-  const me = (msg.session && deps.admins?.has(ws.data.sessionName ?? '') ? msg.session : null) ?? ws.data.sessionName
+  const me = (admin && msg.session) || caller
   const ops = deps.channelOps
   const subs = deps.subs
   if (!me) { sendToolResult(ws, msg.requestId, false, 'not registered'); return }
@@ -1819,13 +1850,11 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       return
     }
     if (msg.type === 'channelCreate') {
+      const creator = channelActor(ws, sender)
       if (!msg.name) { sendToolResult(ws, msg.requestId, false, 'channel_create requires name'); return }
       const existing = await ops.resolve(msg.name)
       const ch = existing ?? await ops.create(msg.name, msg.topic)
-      if (!existing) {
-        const creator: ChannelOwner = sender ? { identity: identityKey(sender) } : { name: ws.data.sessionName!, instanceId: ws.data.instanceId }
-        subs.recordChannelOwner(ch.id, creator)
-      }
+      if (!existing && creator) subs.recordChannelOwner(ch.id, creator)
       subs.add(me, ch.id, identity)
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, created: !existing, subscribed: true }))
       return
@@ -1849,14 +1878,23 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
         sendToolResult(ws, msg.requestId, false, 'not_channel_owner')
         return
       }
-      const actor: ChannelOwner = sender ? { identity: identityKey(sender) } : { name: caller, instanceId: ws.data.instanceId }
-      if (!deps.admins?.has(caller) && deps.channelOwners?.get(channel.id) !== caller && !subs.isChannelOwner(channel.id, actor)) {
+      const actor = channelActor(ws, sender)
+      const key = actor && channelActorKey(actor)
+      const topicAdmin = key && !ws.data.renamed && deps.topicAdmins?.has(key)
+      const protectedChannel = channel.id === deps.busChannelId || channel.id === deps.humanChannelId
+      const owner = !!actor && !!key && (deps.topicChannelOwners?.get(channel.id) === key || subs.isChannelOwner(channel.id, actor))
+      if (!topicAdmin && (protectedChannel || !owner)) {
         sendToolResult(ws, msg.requestId, false, 'not_channel_owner')
         return
       }
       if (!ops.setTopic) { sendToolResult(ws, msg.requestId, false, 'channel_topic_edit_unavailable'); return }
-      const updated = await ops.setTopic(channel.id, msg.topic, `agent-bus channel_set_topic requested by ${caller}`)
-      sendToolResult(ws, msg.requestId, true, JSON.stringify(updated))
+      const { previousTopic, ...updated } = await ops.setTopic(channel.id, msg.topic, `agent-bus channel_set_topic requested by ${caller}`)
+      const audit = `**Topic changed by ${caller}**\n${previousTopic || '(empty)'} → ${updated.topic || '(empty)'}`
+      let logged = true
+      for (const content of chunk(audit, deps.chunkLimit, deps.chunkMode)) {
+        if (!await sendToDiscord(deps.client, channel.id, content, undefined, undefined, true)) logged = false
+      }
+      sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...updated, ...(!logged && { audit: 'failed' }) }))
       return
     }
     const ch = msg.channel ? await ops.resolve(msg.channel) : null
