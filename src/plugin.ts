@@ -18,8 +18,9 @@ import { discoverSkills } from './skills.js'
 import { loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
-import { spawn as spawnProc } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
+import { tmuxWakeUnlatchMs, wakeTmux } from './tmux-wake.js'
 import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
@@ -296,12 +297,10 @@ export async function startPlugin(): Promise<void> {
   if (wakeMode === 'tmux' && !wakePane) wakePane = await findTmuxPane(tmuxBin)
   if (wakeMode === 'tmux') process.stderr.write(`discord plugin: tmux wake ${wakePane ? `-> pane ${wakePane}` : 'disabled (no pane found)'}\n`)
   const wakeText = process.env.DISCORD_WAKE_TEXT || 'New agent-bus/Discord message(s): call the discord check_inbox tool and handle them.'
+  const wakeUnlatchMs = tmuxWakeUnlatchMs(process.env.DISCORD_WAKE_UNLATCH_MS)
   let wakeTimer: ReturnType<typeof setTimeout> | null = null
   let wakeInFlight = false
   let wakeGen = 0
-  let flightTimer: ReturnType<typeof setTimeout> | null = null
-  // If check_inbox never acks, open the latch so a dropped turn cannot swallow later mail.
-  const maxInFlightMs = 15 * 60 * 1000
   // One nudge until check_inbox acks it. A second directed message stays queued (hold)
   // and is either included in that drain or nudges exactly once after the ack.
   function considerWake(): void {
@@ -310,42 +309,26 @@ export async function startPlugin(): Promise<void> {
     if (wakeMode !== 'tmux' || !wakePane || wakeTimer) return
     wakeInFlight = true
     const gen = ++wakeGen
-    if (flightTimer) clearTimeout(flightTimer)
-    flightTimer = setTimeout(() => {
-      flightTimer = null
-      if (!wakeInFlight) return
-      wakeInFlight = false
-      if (inbox.length > 0) considerWake()
-    }, maxInFlightMs)
     wakeTimer = setTimeout(() => {
       wakeTimer = null
       void flushWake(gen)
     }, 2000)
-    // Recheck the inbox immediately before typing. A drain during the debounce, or a
-    // failed tmux send, must not start an empty turn or leave the latch stuck.
-    async function flushWake(gen: number): Promise<void> {
-      const run = (args: string[]) => new Promise<boolean>(res => {
-        if (gen !== wakeGen || inbox.length === 0) { res(false); return }
-        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
-        p.on('error', () => res(false))
-        p.on('close', code => res(code === 0))
-      })
-      const typed = await run(['send-keys', '-t', wakePane!, '-l', wakeText])
-      if (gen !== wakeGen) return
-      if (!typed) {
+  }
+  async function flushWake(gen: number): Promise<void> {
+    const pane = wakePane
+    if (!pane) return
+    const isCurrent = () => !retired && !shuttingDown && gen === wakeGen && inbox.length > 0
+    await wakeTmux({
+      pane, text: wakeText, isCurrent, unlatchMs: wakeUnlatchMs,
+      run: args => new Promise(resolve => {
+        execFile(tmuxBin, args, { timeout: 5_000 }, err => resolve(!err))
+      }),
+      onUnconfirmed: () => process.stderr.write('discord plugin: tmux wake not confirmed by check_inbox yet\n'),
+      onUnlatch: () => {
+        process.stderr.write('discord plugin: tmux wake confirmation deadline expired; releasing wake latch\n')
         wakeInFlight = false
-        if (inbox.length > 0) considerWake()
-        return
-      }
-      await new Promise(r => setTimeout(r, 300))
-      if (gen !== wakeGen) return
-      const entered = await run(['send-keys', '-t', wakePane!, 'Enter'])
-      if (gen !== wakeGen) return
-      if (!entered) {
-        wakeInFlight = false
-        if (inbox.length > 0) considerWake()
-      }
-    }
+      },
+    })
   }
   function ackWake(): void {
     const remaining = inbox.length
@@ -353,7 +336,6 @@ export async function startPlugin(): Promise<void> {
     wakeInFlight = next.inFlight
     wakeGen++
     if (wakeTimer) { clearTimeout(wakeTimer); wakeTimer = null }
-    if (flightTimer) { clearTimeout(flightTimer); flightTimer = null }
     if (next.nudge) considerWake()
   }
 
