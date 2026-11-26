@@ -54,7 +54,7 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
   }
 
 
-  async function plugin() {
+  async function plugin(name = original, host = 'nas642') {
     const client = new Client({ name: 'rename-fixture', version: '1' })
     clients.push(client)
     await client.connect(new StdioClientTransport({
@@ -65,13 +65,13 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         HOME: stateDir,
         DISCORD_AGENT: 'agy',
-        DISCORD_HOST_LABEL: 'nas642',
-        DISCORD_SUPERVISOR_PID: 'fixture-supervisor',
+        DISCORD_HOST_LABEL: host,
+        DISCORD_SUPERVISOR_PID: 'fixture-supervisor-' + host,
         DISCORD_PARENT_PID: String(process.pid),
         DISCORD_CONVERSATION_ID: 'injection-conversation',
         DISCORD_STATE_DIR: stateDir,
         DISCORD_ROUTER_URL: `ws://127.0.0.1:${fixture.port}`,
-        DISCORD_SESSION_NAME: original,
+        DISCORD_SESSION_NAME: name,
         DISCORD_MODE: 'pull',
       },
     }))
@@ -116,6 +116,14 @@ test('bus_rename reports the collision suffix and keeps inbox and subscriptions 
     const inbox = await restarted.callTool({ name: 'check_inbox', arguments: {} })
     expect(JSON.stringify(inbox.content)).toContain('queued for the original name')
     expect(inboxes.count(renamed)).toBe(0)
+
+    const misconfigured = await plugin('agy@mac_mini:p1', 'mac_mini')
+    await waitFor(() => registrations.length === 4 && sockets.size === 1)
+    const denied = await misconfigured.callTool({ name: 'bus_rename', arguments: { name: 'new-name' } })
+    expect(denied.isError).toBe(true)
+    expect(JSON.stringify(denied.content)).toContain('Check DISCORD_SESSION_NAME and DISCORD_HOST_LABEL')
+    await new Promise(resolve => setTimeout(resolve, 1_100))
+    expect(registrations.length).toBe(4)
   } finally {
     await Promise.allSettled(clients.map(client => client.close()))
     await fixture.stop(true)

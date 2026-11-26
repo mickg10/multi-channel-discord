@@ -18,10 +18,9 @@ import { discoverSkills } from './skills.js'
 import { getStateDir, loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
 import { BUS_ALIAS_MAX, BusAlias, isBusAlias } from './bus-alias.js'
-import { wakeTmux } from './tmux-wake.js'
 import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
@@ -330,21 +329,31 @@ export async function startPlugin(): Promise<void> {
       wakeTimer = null
       void flushWake(gen)
     }, 2000)
-  }
-  async function flushWake(gen: number): Promise<void> {
-    const pane = wakePane
-    if (!pane) return
-    const isCurrent = () => !retired && !shuttingDown && gen === wakeGen && inbox.length > 0
-    const outcome = await wakeTmux({
-      pane, text: wakeText, isCurrent,
-      run: args => new Promise(resolve => {
-        execFile(tmuxBin, args, { timeout: 5_000, maxBuffer: 128 * 1024 }, (err, stdout) => resolve(err ? undefined : stdout))
-      }),
-    })
-    if (outcome !== 'failed' || !isCurrent()) return
-    process.stderr.write('discord plugin: tmux wake was not confirmed after two attempts; releasing wake latch\n')
-    wakeInFlight = false
-    if (flightTimer) { clearTimeout(flightTimer); flightTimer = null }
+    // Recheck the inbox immediately before typing. A drain during the debounce, or a
+    // failed tmux send, must not start an empty turn or leave the latch stuck.
+    async function flushWake(gen: number): Promise<void> {
+      const run = (args: string[]) => new Promise<boolean>(res => {
+        if (gen !== wakeGen || inbox.length === 0) { res(false); return }
+        const p = spawnProc(tmuxBin, args, { stdio: 'ignore' })
+        p.on('error', () => res(false))
+        p.on('close', code => res(code === 0))
+      })
+      const typed = await run(['send-keys', '-t', wakePane!, '-l', wakeText])
+      if (gen !== wakeGen) return
+      if (!typed) {
+        wakeInFlight = false
+        if (inbox.length > 0) considerWake()
+        return
+      }
+      await new Promise(r => setTimeout(r, 300))
+      if (gen !== wakeGen) return
+      const entered = await run(['send-keys', '-t', wakePane!, 'Enter'])
+      if (gen !== wakeGen) return
+      if (!entered) {
+        wakeInFlight = false
+        if (inbox.length > 0) considerWake()
+      }
+    }
   }
   function ackWake(): void {
     const remaining = inbox.length
@@ -367,6 +376,7 @@ export async function startPlugin(): Promise<void> {
   let currentWs: WebSocket | null = null
   let currentName = sessionName
   let renamePending = false
+  let registrationError: string | undefined
   let reconnectAttempt = 0
   let shuttingDown = false
   let retired = false
@@ -476,6 +486,11 @@ export async function startPlugin(): Promise<void> {
         currentWs = null
       }
     } catch (err: unknown) {
+      if (err instanceof Error && err.message === 'register rejected: invalid_bus_alias') {
+        registrationError = 'The router rejected the bus alias. Check DISCORD_SESSION_NAME and DISCORD_HOST_LABEL, then restart the client.'
+        process.stderr.write(`discord plugin: ${registrationError}\n`)
+        return
+      }
       process.stderr.write(`discord plugin: connection failed: ${err instanceof Error ? err.message : String(err)}\n`)
       if (!shuttingDown) scheduleReconnect()
     }
@@ -753,6 +768,9 @@ export async function startPlugin(): Promise<void> {
 
   mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const args = (req.params.arguments ?? {}) as Record<string, unknown>
+    if (registrationError) {
+      return { content: [{ type: 'text', text: registrationError }], isError: true }
+    }
     if (retired) {
       return { content: [{ type: 'text', text: `This client was retired: a newer session took over the name "${currentName}". Discord tools are unavailable from this thread; use the active session.` }], isError: true }
     }
