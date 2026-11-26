@@ -334,6 +334,10 @@ export function inboxError(err: unknown): string {
 }
 
 export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
+  deps.subs?.upgradeNativeAliases((deps.inboxes?.names() ?? []).flatMap<[string, string]>(name => {
+    const target = deps.inboxes?.target(name)
+    return target ? [[name, identityKey(target)]] : []
+  }))
   return {
     open(_ws: WsLike): void {},
 
@@ -494,7 +498,9 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     }
     const target: Target = { host, user: gateway.user, kind: frame.kind, conv: frame.conv, alias: frame.alias }
     const alreadyRegistered = [...gateway.agents.values()].some(agent => identityKey(agent) === identityKey(target))
+    const inheritSubscriptions = inboxes.canInheritLegacy(target)
     inboxes.bind(target)
+    if (inheritSubscriptions) deps.subs?.migrateToNative(target.alias, identityKey(target))
     gateway.agents.set(frame.alias, target)
     deps.conversations?.set(frame.alias, frame.conv)
     if (liveSession(deps, frame.alias)) {
@@ -743,7 +749,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         sendError(ws, 'channel operation requires requestId')
         return
       }
-      void handleChannelOp(ws, parsed, deps)
+      void handleChannelOp(ws, parsed, deps, sender)
       break
     case 'listSessions':
       if (!hasString(parsed, 'requestId')) {
@@ -920,6 +926,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     name => !!deps.inboxes?.target(name),
   )
   ws.data.sessionName = actualName
+  deps.subs?.reclaim(actualName, instanceId)
   ws.data.sendCallback = sendCb
   deps.history.record(actualName, projectPath)
 
@@ -945,6 +952,7 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>): void
     return
   }
   const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name))
+  deps.subs?.rename(oldName, actualName)
   if (pullSessions.delete(oldName)) pullSessions.add(actualName)
   const conv = deps.conversations?.get(oldName)
   if (conv) {
@@ -1380,11 +1388,33 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
   postToChannel(ws, deps.busChannelId, undefined, text, to, deps, files, publish, sender)
 }
 
+export function channelSubscribers(deps: Readonly<WsDeps>, channelId: string): string[] {
+  const subs = deps.subs
+  if (!subs) return []
+  const inboxes = deps.inboxes
+  const names = subs.subscribers(channelId).filter(name => !inboxes?.target(name))
+  if (!inboxes) return names
+  const keys = new Set(subs.nativeSubscribers(channelId))
+  if (!keys.size) return names
+  const aliases = new Map<string, { name: string; live: boolean }>()
+  for (const name of inboxes.names()) {
+    const target = inboxes.target(name)
+    if (!target) continue
+    const key = identityKey(target)
+    if (!keys.has(key)) continue
+    const previous = aliases.get(key)
+    if (previous?.live) continue
+    const live = !!nativeConnection(inboxes, target)
+    if (!previous || live) aliases.set(key, { name, live })
+  }
+  return [...names, ...[...aliases.values()].map(alias => alias.name)]
+}
+
 /** Sessions that receive untargeted traffic in a channel: everyone for the default bus, else subscribers. */
 function audience(channelId: string, deps: Readonly<WsDeps>): string[] {
   const live = allNames(deps)
   if (channelId === deps.busChannelId || channelId === deps.humanChannelId) return live
-  const subs = new Set(deps.subs?.subscribers(channelId) ?? [])
+  const subs = new Set(channelSubscribers(deps, channelId))
   return live.filter(n => subs.has(n))
 }
 
@@ -1495,7 +1525,8 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   if (routed.passive) deps.unread?.bump(heard)
   deps.activity?.markPost(from)
 
-  const toHuman = toLabel === 'human' && deps.humanChannelId && deps.humanChannelId !== channelId
+  const toHuman = toLabel === 'human' && deps.humanChannelId && deps.humanChannelId !== channelId &&
+    (!channelName || channelId === deps.busChannelId)
   const where = toHuman ? deps.humanChannelId! : channelId
   const origin = toHuman ? ` (from ${channelName ? `#${channelName}` : channelId === deps.busChannelId ? '#general' : channelId})` : ''
   const meta: ChannelMeta = {
@@ -1720,7 +1751,7 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
   return []
 }
 
-async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>): Promise<void> {
+async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>, sender?: Target): Promise<void> {
   // Admin sessions may (un)subscribe someone else (e.g. agents that lack the channel tools).
   if (msg.session && ws.data.sessionName && msg.session !== ws.data.sessionName) {
     if (!deps.admins?.has(ws.data.sessionName)) { sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session'); return }
@@ -1730,6 +1761,8 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
   const subs = deps.subs
   if (!me) { sendToolResult(ws, msg.requestId, false, 'not registered'); return }
   if (!ops || !subs) { sendToolResult(ws, msg.requestId, false, 'channels disabled: router has no DISCORD_BUS_CHANNEL'); return }
+  const target = sender?.alias === me ? sender : deps.inboxes?.target(me)
+  const identity = target && identityKey(target)
   try {
     if (msg.type === 'channelList') {
       const list = await ops.list()
@@ -1737,8 +1770,8 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
         id: c.id, name: c.name, topic: c.topic ?? undefined,
         default: c.id === deps.busChannelId,
         human: c.id === deps.humanChannelId,
-        subscribed: c.id === deps.busChannelId || c.id === deps.humanChannelId || subs.has(me, c.id),
-        subscribers: c.id === deps.busChannelId || c.id === deps.humanChannelId ? ['(everyone)'] : subs.subscribers(c.id),
+        subscribed: c.id === deps.busChannelId || c.id === deps.humanChannelId || subs.has(me, c.id, identity),
+        subscribers: c.id === deps.busChannelId || c.id === deps.humanChannelId ? ['(everyone)'] : channelSubscribers(deps, c.id),
       }))
       sendToolResult(ws, msg.requestId, true, JSON.stringify(out))
       return
@@ -1747,7 +1780,7 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       if (!msg.name) { sendToolResult(ws, msg.requestId, false, 'channel_create requires name'); return }
       const existing = await ops.resolve(msg.name)
       const ch = existing ?? await ops.create(msg.name, msg.topic)
-      subs.add(me, ch.id)
+      subs.add(me, ch.id, identity)
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, created: !existing, subscribed: true }))
       return
     }
@@ -1764,13 +1797,13 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       if (repl?.id === ch.id) { sendToolResult(ws, msg.requestId, false, 'replacement is the same channel'); return }
       const note = `ARCHIVED by ${me}${repl ? ` — continue in #${repl.name} (${repl.id})` : ''}`
       if (ops.archive) await ops.archive(ch.id, note)
-      const moved = subs.subscribers(ch.id)
-      for (const n of moved) { subs.remove(n, ch.id); if (repl) subs.add(n, repl.id) }
+      const moved = channelSubscribers(deps, ch.id)
+      subs.moveChannel(ch.id, repl?.id)
       sendToDiscord(deps.client, ch.id, `**${note}**`)
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, archived: true, movedSubscribers: moved, ...(repl && { replacement: repl }) }))
       return
     }
-    const changed = msg.type === 'channelSubscribe' ? subs.add(me, ch.id) : subs.remove(me, ch.id)
+    const changed = msg.type === 'channelSubscribe' ? subs.add(me, ch.id, identity) : subs.remove(me, ch.id, identity)
     sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, subscribed: msg.type === 'channelSubscribe', changed }))
   } catch (err: unknown) {
     sendToolResult(ws, msg.requestId, false, `${msg.type} failed: ${err instanceof Error ? err.message : String(err)}`)

@@ -10,7 +10,7 @@
 import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './access.js'
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
-import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, inboxError, deliver as deliverFn } from './ws.js'
+import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, inboxError, deliver as deliverFn } from './ws.js'
 import { Activity, Conversations, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
@@ -412,7 +412,7 @@ async function handleBusInbound(msg: Message): Promise<void> {
     const bound = msg.reference?.messageId ? { ...fullMeta, unbound_reply: msg.reference.messageId } : fullMeta
     const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
     try {
-      delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : subs.subscribers(msg.channelId), wsDepsRef)
+      delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : channelSubscribers(wsDepsRef, msg.channelId), wsDepsRef)
     } catch (err) {
       await msg.reply(inboxError(err)).catch(() => {})
       return

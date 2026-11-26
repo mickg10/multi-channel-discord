@@ -4,7 +4,7 @@ import { CostClasses, HumanMail, Unread } from '../wake.js'
 import { NodeRegistry } from '../nodes.js'
 import type { WsData, WsDeps } from '../ws.js'
 import { SessionManager, ProjectHistory } from '../sessions.js'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -365,6 +365,41 @@ describe('channels', () => {
     expect(synth[0]).toBe('cheap@x')
     expect(msgs(cheap).filter(x => x.type === 'message').at(-1).content).toContain('synthesis: read this channel')
     expect(msgs(cheap).filter(x => x.type === 'message').at(-1).content).not.toContain('[claude')
+  })
+
+  test('legacy subscriptions follow a rename and a same-instance reclaim across router restart', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'subs-reclaim-'))
+    const subs = Subscriptions.inStateDir(dir)
+    const d = chDeps(subs)
+    const h = createWsHandlers(d)
+    const ws = makeWs()
+    const instanceId = 'same-instance'
+    h.message(ws, JSON.stringify({ type: 'register', name: 'claude@mac:bbq-2', projectPath: '/p', instanceId }))
+    h.message(ws, JSON.stringify({ type: 'channelSubscribe', requestId: 's', channel: 'photos-debug' }))
+    await tick()
+    expect(subs.subscribers('c2')).toEqual(['claude@mac:bbq-2'])
+    h.message(ws, JSON.stringify({ type: 'rename', name: 'claude@mac:bbq-tmp' }))
+    expect(subs.subscribers('c2')).toEqual(['claude@mac:bbq-tmp'])
+    h.close(ws)
+
+    const restarted = Subscriptions.inStateDir(dir)
+    const next = createWsHandlers({ ...d, sessions: new SessionManager(), subs: restarted })
+    const reconnect = makeWs()
+    next.message(reconnect, JSON.stringify({ type: 'register', name: 'claude@mac:bbq', projectPath: '/p', instanceId }))
+    expect(restarted.subscribers('c2')).toEqual(['claude@mac:bbq'])
+    expect(Subscriptions.inStateDir(dir).subscribers('c2')).toEqual(['claude@mac:bbq'])
+  })
+
+  test('old alias-keyed files migrate existing native bindings and preserve legacy names', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'subs-migration-'))
+    await writeFile(join(dir, 'subscriptions.json'), JSON.stringify({ 'old-native': ['c2'], legacy: ['c2'] }))
+    const subs = Subscriptions.inStateDir(dir)
+    subs.upgradeNativeAliases([['old-native', 'native-identity']])
+    const restarted = Subscriptions.inStateDir(dir)
+    expect(restarted.subscribers('c2')).toEqual(['legacy'])
+    expect(restarted.nativeSubscribers('c2')).toEqual(['native-identity'])
+    restarted.upgradeNativeAliases([['legacy', 'another-identity']])
+    expect(restarted.subscribers('c2')).toEqual(['legacy'])
   })
 
   test('subscriptions persist to disk', async () => {

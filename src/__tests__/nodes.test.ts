@@ -195,6 +195,24 @@ describe('human channel + rules + archive', () => {
     expect(msgs(b).some(m => m.type === 'message')).toBe(false)
   })
 
+  test('channel_post to human stays in its topic while #general still redirects', async () => {
+    const channels = [{ id: 'bbq-topic', name: 'bbq' }, { id: 'bus1', name: 'general' }]
+    const h = createWsHandlers(deps({ channelOps: {
+      resolve: async name => channels.find(channel => channel.name === name) ?? null,
+      list: async () => channels,
+      create: async name => ({ id: name, name }),
+    } }))
+    const a = reg(h, 'claude@mac:bbq')
+    h.message(a, JSON.stringify({ type: 'channelPost', channel: 'bbq', text: 'answer', to: 'human' }))
+    await tick()
+    h.message(a, JSON.stringify({ type: 'channelPost', channel: 'general', text: 'new question', to: 'human' }))
+    await tick()
+    expect(posted).toEqual([
+      ['bbq-topic', '**[claude@mac:bbq → human]** answer'],
+      ['hq1', '**[claude@mac:bbq → human]** (from #general) new question'],
+    ])
+  })
+
   test('rules are delivered once per session name', () => {
     const seen = new Set<string>()
     const h = createWsHandlers(deps({ rules: () => ({ text: 'RULES', seen: n => seen.has(n), markSeen: n => { seen.add(n) } }) }))

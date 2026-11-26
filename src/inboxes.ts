@@ -310,13 +310,17 @@ export class Inboxes {
     if (this.aliases.has(alias)) this.append({ op: 'release', alias })
   }
 
+  canInheritLegacy(target: Target): boolean {
+    const legacyConversation = this.conversation(target.alias)
+    return legacyConversation === undefined ? !this.seenAliases.has(target.alias) : legacyConversation === target.conv
+  }
+
   bind(target: Target): void {
     const previous = this.target(target.alias)
     if (previous && identityKey(previous) === identityKey(target)) return
     // Legacy mail remains name-addressed until migration. If the legacy owner
     // is known, only its conversation can migrate that mail into a native inbox.
-    const legacyConversation = this.conversation(target.alias)
-    const inherit = legacyConversation === undefined ? !this.seenAliases.has(target.alias) : legacyConversation === target.conv
+    const inherit = this.canInheritLegacy(target)
     const ids = this.list(target.alias).filter(({ meta }) => {
       const approval = meta.from_human === 'true' && meta.question_id && meta.conversation_id
       return approval ? meta.conversation_id === target.conv : inherit

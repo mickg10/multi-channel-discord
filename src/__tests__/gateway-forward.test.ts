@@ -9,7 +9,7 @@ import { Claims, NodeRegistry } from '../nodes.js'
 import { ProjectHistory, SessionManager } from '../sessions.js'
 import { Subscriptions } from '../subscriptions.js'
 import type { GatewayToolCall, WsToolResult } from '../types.js'
-import { createWsHandlers, resetBusRateLimit, type WsDeps, type WsLike } from '../ws.js'
+import { channelSubscribers, createWsHandlers, resetBusRateLimit, type WsDeps, type WsLike } from '../ws.js'
 
 const alias = 'codex@mac:caller'
 const foreignAlias = 'codex@nas:foreign'
@@ -98,7 +98,7 @@ function setup() {
     }
     return ws
   }
-  return { connect, register, outbound, grants, subs, claims }
+  return { connect, register, outbound, grants, subs, claims, deps }
 }
 
 async function response(socket: ReturnType<ReturnType<typeof setup>['connect']>, requestId: string): Promise<WsToolResult> {
@@ -108,7 +108,7 @@ async function response(socket: ReturnType<ReturnType<typeof setup>['connect']>,
 }
 
 test.each([false, true])('A8 shares legacy handling for every operation (gateway=%s)', async gateway => {
-  const { register, outbound, grants, subs, claims } = setup()
+  const { register, outbound, grants, deps, claims } = setup()
   const ws = register(alias, gateway)
   let count = 0
   async function call(op: GatewayToolCall['op'], args: Record<string, unknown> = {}) {
@@ -167,7 +167,7 @@ test.each([false, true])('A8 shares legacy handling for every operation (gateway
   expect(await call('channelSubscribe', { channel: 'topic', session: foreignAlias })).toMatchObject({ success: false, data: 'only admin sessions may act for another session' })
   expect(await call('channelSubscribe', { channel: 'missing' })).toMatchObject({ success: false })
   expect(await call('channelSubscribe', { channel: 'topic' })).toMatchObject({ success: true })
-  expect(subs.has(alias, 'topic-id')).toBe(true)
+  expect(channelSubscribers(deps, 'topic-id')).toEqual([alias])
   const channels = await call('channelList')
   expect(channels.success).toBe(true)
   expect(JSON.parse(channels.data)).toMatchObject([{ id: 'topic-id', subscribed: true }])
@@ -236,4 +236,22 @@ test('both rosters expose gateway aliases once and track disconnect and release'
   node.close()
   observer.send({ type: 'listSessions', requestId: 'released' })
   expect(rows(await response(observer, 'released'))).toEqual([])
+})
+
+test('native subscriptions follow the conversation across aliases without duplicate delivery', async () => {
+  const { register, deps } = setup()
+  const gw = register(alias, true)
+  gw.send({ type: 'gatewayOp', as: alias, op: 'channelSubscribe', requestId: 'sub', channel: 'topic' })
+  expect((await response(gw, 'sub')).success).toBe(true)
+  const renamed = 'codex@mac:renamed'
+  gw.send({ type: 'registerAgent', alias: renamed, kind: 'codex', conv: instance })
+  expect(channelSubscribers(deps, 'topic-id')).toEqual([alias])
+  gw.send({ type: 'releaseAgent', alias })
+  expect(channelSubscribers(deps, 'topic-id')).toEqual([renamed])
+  gw.send({ type: 'registerAgent', alias: renamed, kind: 'codex', conv: 'other-conversation' })
+  expect(channelSubscribers(deps, 'topic-id')).toEqual([])
+  gw.send({ type: 'gatewayOp', as: renamed, op: 'channelList', requestId: 'other' })
+  expect(JSON.parse((await response(gw, 'other')).data)).toMatchObject([{ subscribed: false }])
+  gw.send({ type: 'registerAgent', alias: renamed, kind: 'codex', conv: instance })
+  expect(channelSubscribers(deps, 'topic-id')).toEqual([renamed])
 })
