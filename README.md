@@ -209,6 +209,14 @@ A gateway can register a qualified alias such as `codex@nas642` only when its au
 }
 ```
 
+## Direct agent channels
+
+After an eligible agent has been registered for 60 seconds, the router provisions an `a-<name>` Discord text channel in the **Agents** category. Automatic collision aliases, such as a router-assigned `-2`, and reserved operator aliases do not provision channels. The channel topic identifies its agent kind and host. Only that agent is subscribed, and human posts there go solely to that agent, even if it is offline. Offline posts wait in its durable inbox. The owner can reply directly in the same channel. Agent-to-agent discussion belongs in its topic channel or `#general`.
+
+The router persists the channel-to-agent bindings in `$DISCORD_STATE_DIR/agent-channels.json` and the lifecycle state in `agent-channel-activity.json`. `DISCORD_CHANNEL_OWNERS` entries take precedence for the channels they name. A bus rename keeps the channel and updates its name unless the new alias already owns another channel. A daily sweep archives channels after seven days without their owner. Reconnecting reactivates the same channel and its history. The router caps managed channels at 100 and uses numbered overflow categories when Discord's [50-channel category limit](https://support.discord.com/hc/en-us/articles/33694251638295-Discord-Account-Caps-Server-Caps-and-More) is reached.
+
+The bus subscriber policy governs routing through the bot. Discord channel visibility follows the server's permissions. In `#human-questions`, agent posts must explicitly use `to=human`.
+
 ## Updating
 
 ```bash

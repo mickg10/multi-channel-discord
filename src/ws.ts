@@ -19,6 +19,7 @@ import type { WsMcpOp, PluginToRouterMessage, WsRegistered, WsRenamed, WsError, 
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
+import type { AgentChannelRegistration, AgentChannels } from './agent-channels.js'
 import { isBusAlias } from './bus-alias.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
@@ -86,6 +87,7 @@ export interface WsDeps {
   /** Channel subscriptions (agent bus beyond the default channel). */
   readonly subs?: Subscriptions
   readonly channelOps?: ChannelOps
+  readonly agentChannels?: AgentChannels
   /** Durable per-agent inboxes and node-owned (headless) agents. */
   readonly inboxes?: Inboxes
   readonly nodes?: NodeRegistry
@@ -169,12 +171,34 @@ function liveSession(deps: Readonly<WsDeps>, name: string): boolean {
   return deps.sessions.getSessions().some(session => session.name === name)
 }
 
+export function directChannelOwner(deps: Readonly<WsDeps>, channelId: string): string | undefined {
+  const owner = deps.agentChannels?.owner(channelId)
+  return owner ? deps.channelOwners?.get(channelId) ?? owner : undefined
+}
+
+export function onlineBusAgent(deps: Readonly<WsDeps>, name: string): boolean {
+  const target = deps.inboxes?.target(name)
+  return target && deps.inboxes ? !!nativeConnection(deps.inboxes, target) : liveSession(deps, name) || !!deps.nodes?.get(name)
+}
+
+function observeDirectChannel(deps: Readonly<WsDeps>, info: AgentChannelRegistration, collision = false): void {
+  const { name } = info
+  if (!deps.agentChannels || collision || !isBusAlias(name) ||
+      !aliasAllowedOnHost(name, qualifiedAliasHost(name)) || protectedRenameAlias(deps, name)) return
+  deps.agentChannels.register(info)
+}
+
+function offlineDirectChannel(deps: Readonly<WsDeps>, name: string): void {
+  if (!onlineBusAgent(deps, name)) deps.agentChannels?.disconnect(name)
+}
+
 function admission(deps: Readonly<WsDeps>, name: string, meta: ChannelMeta): ChannelMeta | undefined {
   const target = deps.inboxes?.target(name)
   const live = liveSession(deps, name)
   const node = deps.nodes?.get(name)
   const conv = target?.conv ?? deps.conversations?.get(name) ?? (!live ? deps.inboxes?.conversation(name) : undefined)
-  if (!target && !live && !node && !conv) return undefined
+  const direct = meta.chat_id && directChannelOwner(deps, meta.chat_id) === name
+  if (!target && !live && !node && !conv && !direct) return undefined
   if (meta.conversation_id && target && meta.conversation_id !== target.conv) return undefined
   return conv && (target || (meta.from_human === 'true' && meta.question_id)) ? { ...meta, conversation_id: conv } : meta
 }
@@ -372,13 +396,17 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
       if (ws.data.gateway && ws.data.nodeName && deps.inboxes) {
         const hosts = gateways.get(deps.inboxes)
         if (hosts?.get(ws.data.nodeName)?.data === ws.data) hosts.delete(ws.data.nodeName)
+        const aliases = [...ws.data.gateway.agents.keys()]
         ws.data.gateway = undefined
         ws.data.nodeName = undefined
         ws.data.authed = false
+        for (const alias of aliases) offlineDirectChannel(deps, alias)
         return
       }
       if (ws.data.nodeName && ws.data.sendCallback) {
+        const names = deps.nodes?.list().filter(agent => agent.node === ws.data.nodeName).map(agent => agent.name) ?? []
         deps.nodes?.unregister(ws.data.nodeName, ws.data.sendCallback)
+        for (const name of names) offlineDirectChannel(deps, name)
         deps.onSessionChange?.()
         return
       }
@@ -408,6 +436,7 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
             deps.sessions.deregisterSession(ws.data.sessionName)
           } catch {}
         }
+        offlineDirectChannel(deps, ws.data.sessionName)
         ws.data.sessionName = null
         ws.data.sendCallback = null
         deps.onSessionChange?.()
@@ -537,6 +566,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     }
     ws.send(JSON.stringify({ type: 'agentRegistered', as: frame.alias, target }))
     reply(true, JSON.stringify({ as: frame.alias, target }))
+    observeDirectChannel(deps, { name: target.alias, kind: target.kind, host: target.host })
     if (alreadyRegistered) return
     for (const entry of inboxes.list(identityKey(target))) {
       if (entry.state === 'uncertain') wakeNative(deps, target, entry, true)
@@ -551,6 +581,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     if (target?.host !== host || target.user !== gateway.user) { reply(false, 'invalid_as'); return }
     inboxes.release(frame.alias)
     gateway.agents.delete(frame.alias)
+    offlineDirectChannel(deps, frame.alias)
     deps.conversations?.set(frame.alias, '')
     ws.send(JSON.stringify({ type: 'agentReleased', alias: frame.alias }))
     reply(true, '{}')
@@ -680,6 +711,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       deps.nodes.register(parsed.node, send, parsed.agents)
       ws.send(JSON.stringify({ type: 'nodeRegistered', node: parsed.node, agents: parsed.agents.map(a => a.name) }))
       for (const a of parsed.agents) {
+        observeDirectChannel(deps, { name: a.name, kind: a.kind, host: parsed.node })
         sendRulesOnce(deps, a.name)
         // Wake agents that have mail waiting from while the node was away.
         const n = deps.inboxes?.count(a.name) ?? 0
@@ -863,6 +895,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       ws.data.legacyHost = host
       handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, { agent, conversationId })
       if (ws.data.sessionName) {
+        observeDirectChannel(deps, { name: ws.data.sessionName, kind: agent ?? (host ? normalized.split('@')[0] : undefined), host }, ws.data.sessionName !== normalized)
         deps.conversations?.set(ws.data.sessionName, conversationId)
         if (conversationId) deps.inboxes?.remember(ws.data.sessionName, conversationId)
         const cid = deps.conversations ? (deps.conversations.get(ws.data.sessionName) ?? null) : undefined
@@ -904,7 +937,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         handleBusPost(ws, parsed.text, undefined, deps, files, requestId ? { requestId } : undefined, sender)
         break
       }
-      void handleReply(ws, parsed.text, parsed.replyTo, files, deps, parsed.chatId, requestId)
+      void handleReply(ws, parsed.text, parsed.replyTo, files, deps, parsed.chatId, requestId, sender)
       break
     }
     case 'react':
@@ -912,35 +945,43 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         sendError(ws, 'react requires chatId, messageId, and emoji')
         return
       }
-      handleReact(parsed.chatId, parsed.messageId, parsed.emoji, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, undefined, sender)) handleReact(parsed.chatId, parsed.messageId, parsed.emoji, deps)
       break
     case 'editMessage':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'chatId') || !hasString(parsed, 'messageId') || !hasString(parsed, 'text')) {
         sendError(ws, 'editMessage requires requestId, chatId, messageId, and text')
         return
       }
-      handleEditMessage(ws, parsed.requestId, parsed.chatId, parsed.messageId, parsed.text, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, parsed.requestId, sender)) {
+        handleEditMessage(ws, parsed.requestId, parsed.chatId, parsed.messageId, parsed.text, deps)
+      }
       break
     case 'downloadAttachment':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'chatId') || !hasString(parsed, 'messageId')) {
         sendError(ws, 'downloadAttachment requires requestId, chatId, and messageId')
         return
       }
-      handleDownloadAttachment(ws, parsed.requestId, parsed.chatId, parsed.messageId, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, parsed.requestId, sender)) {
+        handleDownloadAttachment(ws, parsed.requestId, parsed.chatId, parsed.messageId, deps)
+      }
       break
     case 'fetchMessages':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'channel')) {
         sendError(ws, 'fetchMessages requires requestId and channel')
         return
       }
-      handleFetchMessages(ws, parsed.requestId, parsed.channel, parsed.limit, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.channel, parsed.requestId, sender)) {
+        handleFetchMessages(ws, parsed.requestId, parsed.channel, parsed.limit, deps)
+      }
       break
     case 'askUser':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'chatId') || !hasString(parsed, 'question')) {
         sendError(ws, 'askUser requires requestId, chatId, and question')
         return
       }
-      handleAskUser(ws, parsed.requestId, parsed.chatId, parsed.question, parsed.options ?? [], deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, parsed.requestId, sender)) {
+        handleAskUser(ws, parsed.requestId, parsed.chatId, parsed.question, parsed.options ?? [], deps)
+      }
       break
     case 'permissionRequest':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'toolName') || !hasString(parsed, 'description') || !hasString(parsed, 'inputPreview')) {
@@ -987,6 +1028,7 @@ function handleDeregister(ws: WsLike, deps: Readonly<WsDeps>): void {
     try {
       deps.sessions.deregisterSession(ws.data.sessionName)
     } catch {}
+    offlineDirectChannel(deps, ws.data.sessionName)
     ws.data.sessionName = null
     deps.onSessionChange?.()
   }
@@ -1002,16 +1044,20 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>, reque
   const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name) || protectedRenameAlias(deps, name),
     name => deps.inboxes?.renameLegacy(oldName, name, conv))
   deps.subs?.rename(oldName, actualName)
+  deps.agentChannels?.rename(oldName, actualName, Date.now(), actualName === newName)
   if (pullSessions.delete(oldName)) pullSessions.add(actualName)
   if (conv) deps.conversations?.set(actualName, conv)
   ws.data.sessionName = actualName
-  if (actualName !== oldName) ws.data.renamed = true
+  if (actualName !== oldName) {
+    ws.data.renamed = true
+    observeDirectChannel(deps, { name: actualName, kind: deps.sessions.registeredIdentity(actualName)?.agent ?? (oldName.includes('@') ? oldName.split('@')[0] : undefined), host: ws.data.legacyHost }, actualName !== newName)
+  }
 
   const response: WsRenamed = { type: 'renamed', oldName, newName: actualName, ...(requestId && { requestId }) }
   ws.send(JSON.stringify(response))
 }
 
-async function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: DiscordFile[], deps: Readonly<WsDeps>, explicitChatId?: string, requestId?: string): Promise<void> {
+async function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: DiscordFile[], deps: Readonly<WsDeps>, explicitChatId?: string, requestId?: string, sender?: Target): Promise<void> {
   const sessionName = ws.data.sessionName
   if (!sessionName) {
     sendOperationError(ws, requestId, 'Cannot reply: not registered')
@@ -1023,7 +1069,10 @@ async function handleReply(ws: WsLike, text: string, replyTo: string | undefined
     return
   }
 
-  const activeChat = chatId === deps.chatId()
+  const restriction = agentPostError(deps, chatId, sessionName)
+  if (restriction) { sendOperationError(ws, requestId, restriction); return }
+  if (!canAccessDirectChannel(ws, deps, chatId, requestId, sender)) return
+  const activeChat = !directChannelOwner(deps, chatId) && chatId === deps.chatId()
   const sends: Promise<boolean>[] = []
   if (activeChat && deps.sessions.getActive() !== sessionName) {
     const count = deps.sessions.bufferReply(sessionName, text)
@@ -1416,6 +1465,28 @@ const busPostTimes = new Map<string, number[]>()
 /** Tests share one process. Production never calls this. */
 export function resetBusRateLimit(): void { busPostTimes.clear() }
 const HUMAN_TARGETS = new Set(['human', 'admin', 'user', 'me'])
+const HUMAN_CHANNEL_POST_ERROR = 'Only posts to=human can use #human-questions. Use the topic channel or #general.'
+
+function agentPostError(deps: Readonly<WsDeps>, channel: string, from: string, to?: string): string | undefined {
+  const recipient = to?.toLowerCase()
+  if (channel === deps.humanChannelId && recipient !== 'human') return HUMAN_CHANNEL_POST_ERROR
+  const owner = directChannelOwner(deps, channel)
+  if (owner && (owner !== from || (recipient && !HUMAN_TARGETS.has(recipient)))) {
+    return 'This direct channel is reserved for its owner and the human. Use the topic channel or #general.'
+  }
+  return undefined
+}
+
+function canAccessDirectChannel(ws: WsLike, deps: Readonly<WsDeps>, channel: string, requestId?: string, sender?: Target): boolean {
+  const owner = directChannelOwner(deps, channel)
+  if (!owner) return true
+  const current = sender
+    ? deps.inboxes && nativeConnection(deps.inboxes, sender)
+    : ws.data.sendCallback && deps.sessions.ownsSender(owner, ws.data.sendCallback)
+  if (current && owner === ws.data.sessionName) return true
+  sendOperationError(ws, requestId, 'This direct channel is reserved for its owner and the human. Use the topic channel or #general.')
+  return false
+}
 
 /**
  * Post `[from → to] text` to the bus channel (so humans see the conversation).
@@ -1435,6 +1506,8 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
 }
 
 export function channelSubscribers(deps: Readonly<WsDeps>, channelId: string): string[] {
+  const direct = directChannelOwner(deps, channelId)
+  if (direct) return [direct]
   const subs = deps.subs
   if (!subs) return []
   const inboxes = deps.inboxes
@@ -1537,6 +1610,9 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     } catch { /* A caller can retry with the same publish id. */ }
   }
   if (to !== undefined && typeof to !== 'string') { reply(false, 'invalid_target'); return }
+  const restriction = agentPostError(deps, channelId, from, to)
+  if (restriction) { reply(false, restriction); return }
+  if (!canAccessDirectChannel(ws, deps, channelId, requestId, sender)) return
   const now = Date.now()
   const id = publish?.publish_id === undefined ? `pub_${now}_${randomUUID()}` : publish.publish_id
   if (typeof id !== 'string' || !id || id.length > 256) { reply(false, 'invalid_publish_id'); return }
@@ -1549,6 +1625,8 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
       reply(false, 'publish_payload_mismatch')
       return
     }
+    const retryRestriction = agentPostError(deps, retry.mirror.where, retry.mirror.from, retry.mirror.label)
+    if (retryRestriction) { reply(false, retryRestriction); return }
     const copyOnly = retry.mirror.copyOnly
     const attemptKey = JSON.stringify([key, copyOnly ? 'uncommitted' : retry.at])
     void tryPublishMirror(deps, retry.mirror, text, files, attemptKey).then(({ messageId, copyId }) => {
@@ -1586,7 +1664,8 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   if (routed.passive) deps.unread?.bump(heard)
   deps.activity?.markPost(from)
 
-  const humanChannel = toLabel === 'human' && deps.humanChannelId !== channelId ? deps.humanChannelId : undefined
+  const humanChannel = toLabel === 'human' && deps.humanChannelId !== channelId &&
+    !directChannelOwner(deps, channelId) ? deps.humanChannelId : undefined
   const redirect = humanChannel && (!channelName || channelId === deps.busChannelId)
   const source = channelName ? `#${channelName}` : '#general'
   const where = redirect ? humanChannel : channelId
@@ -1768,6 +1847,10 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
     else sessions.routeToSession(n, t, m)
   }
   const pool = audienceNames ? names.filter(n => audienceNames.includes(n)) : names
+  const direct = deps && meta.chat_id ? directChannelOwner(deps, meta.chat_id) : undefined
+  if (direct && deps) {
+    return deliver(deps, direct, content, { ...meta, to: direct, routed: 'direct-channel' }) ? [direct] : []
+  }
   deps?.humanMail?.remember(content, meta)
   const replyMeta: ChannelMeta = meta.unbound_reply
     ? { in_reply_to: meta.unbound_reply, question_id: meta.question_id ?? meta.unbound_reply }
@@ -1840,7 +1923,8 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
         id: c.id, name: c.name, topic: c.topic ?? undefined,
         default: c.id === deps.busChannelId,
         human: c.id === deps.humanChannelId,
-        subscribed: c.id === deps.busChannelId || c.id === deps.humanChannelId || subs.has(me, c.id, identity),
+        subscribed: c.id === deps.busChannelId || c.id === deps.humanChannelId ||
+          (directChannelOwner(deps, c.id) ? directChannelOwner(deps, c.id) === me : subs.has(me, c.id, identity)),
         subscribers: c.id === deps.busChannelId || c.id === deps.humanChannelId ? ['(everyone)'] : channelSubscribers(deps, c.id),
       }))
       sendToolResult(ws, msg.requestId, true, JSON.stringify(out))
@@ -1850,12 +1934,20 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       if (!msg.name) { sendToolResult(ws, msg.requestId, false, 'channel_create requires name'); return }
       const existing = await ops.resolve(msg.name)
       const ch = existing ?? await ops.create(msg.name, msg.topic)
+      if (directChannelOwner(deps, ch.id)) {
+        sendToolResult(ws, msg.requestId, false, 'direct_channel_managed')
+        return
+      }
       subs.add(me, ch.id, identity)
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, created: !existing, subscribed: true }))
       return
     }
     const ch = msg.channel ? await ops.resolve(msg.channel) : null
     if (!ch) { sendToolResult(ws, msg.requestId, false, `Unknown channel "${msg.channel ?? ''}" (use channel_list)`); return }
+    if (directChannelOwner(deps, ch.id)) {
+      sendToolResult(ws, msg.requestId, false, 'direct_channel_managed')
+      return
+    }
     if (ch.id === deps.busChannelId) {
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, note: 'default bus channel: every session always receives it' }))
       return
