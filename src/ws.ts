@@ -861,7 +861,11 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       }
       ws.data.authed = true
       ws.data.legacyHost = host
-      handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, { agent, conversationId })
+      // A takeover, or a reclaim of a name this client was moved off, asks for that exact
+      // name: another instance's lease does not hold it. Any other registration is steered
+      // by leases (see name-leases.ts).
+      handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, { agent, conversationId },
+        takeover || parsed.reclaimOnly === true)
       if (ws.data.sessionName) {
         deps.conversations?.set(ws.data.sessionName, conversationId)
         if (conversationId) deps.inboxes?.remember(ws.data.sessionName, conversationId)
@@ -961,7 +965,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
   }
 }
 
-function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>, identity: { agent?: string; conversationId?: string }): void {
+function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>, identity: { agent?: string; conversationId?: string }, exact = false): void {
   const sendCb = (msg: string) => ws.send(msg)
   ws.data.instanceId = instanceId
   const actualName = deps.sessions.registerSession(
@@ -971,6 +975,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     instanceId,
     name => !!deps.inboxes?.target(name),
     identity,
+    exact,
   )
   ws.data.sessionName = actualName
   deps.subs?.reclaim(actualName, instanceId)
