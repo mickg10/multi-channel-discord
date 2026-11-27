@@ -10,8 +10,9 @@
 import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './access.js'
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
-import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, inboxError, deliver as deliverFn } from './ws.js'
+import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, directChannelOwner, onlineBusAgent, inboxError, deliver as deliverFn } from './ws.js'
 import { Activity, Conversations, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
+import { AgentChannels, agentChannelSlug, agentChannelTopic, type AgentChannelOps } from './agent-channels.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete, updateSkillCommands, isSkillCommand } from './slash-commands.js'
@@ -159,6 +160,8 @@ for (const pair of (process.env.DISCORD_CHANNEL_OWNERS ?? '').split(',')) {
   if (id && owner) channelOwners.set(id, owner)
 }
 
+const agentChannels = BUS_CHANNEL ? new AgentChannels(STATE_DIR, Date.now(), channelOwners) : undefined
+
 // Remote MCP over the bus: git-declared registry (MCP_REGISTRY or state dir), runtime in state dir.
 // A missing registry file = feature present but empty (mcp_list returns []); a malformed file
 // fails startup closed — a broken declaration must not silently widen admission.
@@ -200,12 +203,13 @@ async function busGuild(): Promise<Guild> {
 // on create/update/delete). Hitting REST on every channel op exhausted Discord's per-route
 // rate limit (10/window) once several agents used channels, so tool calls queued and timed out.
 let lastChannelFetch = 0
-type ChanInfo = { id: string; name: string; type: ChannelType; topic: string | null }
+type ChanInfo = { id: string; name: string; type: ChannelType; topic: string | null; parentId: string | null }
 async function guildChannels(guild: Guild, forceRefresh = false): Promise<ChanInfo[]> {
   const fresh = guild.channels.cache.size === 0 || (forceRefresh && Date.now() - lastChannelFetch > 30_000)
   if (fresh) { lastChannelFetch = Date.now(); await guild.channels.fetch() }
   return [...guild.channels.cache.values()].map(c => ({
     id: c.id, name: c.name, type: c.type, topic: 'topic' in c ? (c as { topic: string | null }).topic : null,
+    parentId: 'parentId' in c ? c.parentId : null,
   }))
 }
 
@@ -249,6 +253,62 @@ const channelOps: ChannelOps = {
   },
 }
 
+const ACTIVE_AGENT_CATEGORY = 'Agents'
+const ARCHIVED_AGENT_CATEGORY = 'Agents (archived)'
+
+function agentCategory(name: string, base: string): boolean {
+  return name === base || (name.startsWith(base + ' ') && /^\d+$/.test(name.slice(base.length + 1)))
+}
+
+async function agentCategoryId(guild: Guild, categories: ChanInfo[], base: string, currentParent?: string | null): Promise<string> {
+  // Discord limits each category to 50 channels.
+  const matching = categories.filter(c => c.type === ChannelType.GuildCategory && agentCategory(c.name, base))
+  const current = matching.find(c => c.id === currentParent)
+  if (current) return current.id
+  const available = matching.find(c => categories.filter(child => child.parentId === c.id).length < 50)
+  if (available) return available.id
+  let suffix = 1
+  let name = base
+  while (matching.some(c => c.name === name)) name = `${base} ${++suffix}`
+  return (await guild.channels.create({ type: ChannelType.GuildCategory, name, reason: 'agent-bus direct channels' })).id
+}
+
+const agentChannelOps: AgentChannelOps = {
+  async ensure(info) {
+    const guild = await busGuild()
+    const channels = await guildChannels(guild)
+    const categoryIds = new Set(channels.filter(c => c.type === ChannelType.GuildCategory &&
+      (agentCategory(c.name, ACTIVE_AGENT_CATEGORY) || agentCategory(c.name, ARCHIVED_AGENT_CATEGORY))).map(c => c.id))
+    const existing = channels.find(c => c.type === ChannelType.GuildText && c.parentId && categoryIds.has(c.parentId) &&
+      c.name.startsWith('a-') && c.topic?.startsWith(`Direct line to ${info.name} (`))
+    if (existing) {
+      await this.update(existing.id, info, false)
+      return existing.id
+    }
+    const parent = await agentCategoryId(guild, channels, ACTIVE_AGENT_CATEGORY)
+    const slug = agentChannelSlug(info.name)
+    const name = channels.some(c => c.name === slug) ? agentChannelSlug(info.name, true) : slug
+    const created = await guild.channels.create({
+      name, type: ChannelType.GuildText, parent, topic: agentChannelTopic(info), reason: 'agent-bus direct channel provision',
+    })
+    return created.id
+  },
+  async update(id, info, archived) {
+    const guild = await busGuild()
+    const channel = guild.channels.cache.get(id) ?? await guild.channels.fetch(id)
+    if (!channel || channel.type !== ChannelType.GuildText) throw new Error('direct channel is unavailable')
+    const channels = await guildChannels(guild)
+    const parent = await agentCategoryId(guild, channels, archived ? ARCHIVED_AGENT_CATEGORY : ACTIVE_AGENT_CATEGORY, channel.parentId)
+    const slug = agentChannelSlug(info.name)
+    const name = channels.some(c => c.id !== id && c.name === slug) ? agentChannelSlug(info.name, true) : slug
+    const updated = await channel.edit({
+      name, parent, topic: agentChannelTopic(info),
+      reason: archived ? 'agent-bus idle direct channel archive' : 'agent-bus direct channel registration',
+    })
+    guild.channels.cache.set(id, updated)
+  },
+}
+
 let wsDepsRef: Parameters<typeof createWsHandlers>[0]
 let routeError: string | undefined
 let routeNote: string | undefined
@@ -284,6 +344,7 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   budget: wakeBudget,
   dispatcher: process.env.DISCORD_DISPATCHER || undefined,
   channelOwners,
+  agentChannels,
   staggerMs: parseInt(process.env.DISCORD_ALL_STAGGER_MS ?? '0', 10),
   onRoutingError: (message: string) => { routeError = message },
   onRouteNote: (message: string) => { routeNote = message },
@@ -388,7 +449,7 @@ async function handleBusInbound(msg: Message): Promise<void> {
   // A Discord reply to an agent's post goes to that agent only ("**[name → ...]**" prefix).
   let delivered: string[] = []
   let boundMiss: string | undefined
-  if (msg.reference?.messageId) {
+  if (msg.reference?.messageId && !directChannelOwner(wsDepsRef, msg.channelId)) {
     try {
       const ref = await msg.channel.messages.fetch(msg.reference.messageId)
       const m = ref.author.id === client.user?.id ? ref.content.match(/^\*\*\[([^\]\s]+) →/) : null
@@ -409,7 +470,9 @@ async function handleBusInbound(msg: Message): Promise<void> {
   if (boundMiss) {
     routeNote = `not delivered to ${boundMiss}: that session is offline and has no conversation id. Reply again when they are back, or name a live session with @name.`
   } else if (delivered.length === 0) {
-    const bound = msg.reference?.messageId ? { ...fullMeta, unbound_reply: msg.reference.messageId } : fullMeta
+    const bound = msg.reference?.messageId
+      ? { ...fullMeta, unbound_reply: msg.reference.messageId, in_reply_to: msg.reference.messageId }
+      : fullMeta
     const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
     try {
       delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : channelSubscribers(wsDepsRef, msg.channelId), wsDepsRef)
@@ -429,7 +492,7 @@ async function handleBusInbound(msg: Message): Promise<void> {
 }
 
 async function handleInbound(msg: Message): Promise<void> {
-  if (BUS_CHANNEL && (msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL || subs.channels().has(msg.channelId))) return handleBusInbound(msg)
+  if (BUS_CHANNEL && (msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL || directChannelOwner(wsDepsRef, msg.channelId) || subs.channels().has(msg.channelId))) return handleBusInbound(msg)
   process.stderr.write(`discord: inbound from ${msg.author.username}: "${msg.content.slice(0, 50)}" action=`)
   const result = await gate(msg)
   process.stderr.write(`${result.action}\n`)
@@ -545,6 +608,12 @@ client.once('clientReady', c => {
 setInterval(() => checkApprovals(client), 5000).unref()
 
 // Periodic buffer persistence
+const agentChannelInterval = setInterval(() => {
+  if (client.isReady()) void agentChannels?.maintain(agentChannelOps, name => onlineBusAgent(wsDepsRef, name))
+    .catch(() => process.stderr.write('agent channels: maintenance failed\n'))
+}, 5_000)
+agentChannelInterval.unref()
+
 const bufferInterval = setInterval(() => {
   sessions.saveBuffers().catch(() => {})
 }, 30_000)
@@ -559,6 +628,7 @@ async function shutdown(): Promise<void> {
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
   clearInterval(bufferInterval)
+  clearInterval(agentChannelInterval)
   // Clear all typing intervals
   typingManager.stopAll()
   try {
