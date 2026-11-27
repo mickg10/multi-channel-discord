@@ -197,3 +197,25 @@ test('human-questions rejects agent posts without to=human and allows explicit h
     expect(sameChannel.sends).toEqual([])
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+
+test('archive failure retries on the next maintenance tick', async () => {
+  const channels = new AgentChannels()
+  const fake = discordOperations()
+  channels.register(registration, now)
+  const created = now + AGENT_CHANNEL_DELAY_MS
+  await channels.maintain(fake.ops, () => true, created)
+  channels.disconnect(owner, created)
+  let attempts = 0
+  const flaky = {
+    ...fake.ops,
+    async update(id: string, info: AgentChannelRegistration, archived: boolean) {
+      if (archived && ++attempts === 1) throw new Error('temporary Discord failure')
+      await fake.ops.update(id, info, archived)
+    },
+  }
+  await channels.maintain(flaky, () => false, created + AGENT_CHANNEL_IDLE_MS)
+  expect(attempts).toBe(1)
+  await channels.maintain(flaky, () => false, created + AGENT_CHANNEL_IDLE_MS + 5_000)
+  expect(attempts).toBe(2)
+  expect(fake.updates.at(-1)).toMatchObject({ archived: true })
+})

@@ -46,6 +46,7 @@ export class AgentChannels {
   private readonly bindings = new Map<string, string>()
   private readonly states = new Map<string, ChannelState>()
   private readonly candidates = new Map<string, Candidate>()
+  private readonly pendingArchives = new Set<string>()
   private readonly ownersFile?: string
   private readonly stateFile?: string
   private nextSweep = 0
@@ -145,8 +146,10 @@ export class AgentChannels {
           state.lastSeen = now
           this.save(this.stateFile, this.states)
         }
-        const shouldArchive = sweep && !online && now - state.lastSeen >= AGENT_CHANNEL_IDLE_MS
-        const archived = !online && (state.archived || shouldArchive)
+        if (online) this.pendingArchives.delete(id)
+        else if (sweep && !state.archived && now - state.lastSeen >= AGENT_CHANNEL_IDLE_MS) this.pendingArchives.add(id)
+        // A failed Discord update remains due on the next maintenance tick.
+        const archived = !online && (state.archived || this.pendingArchives.has(id))
         const info = { ...state, name: owner }
         const topic = agentChannelTopic(info)
         if (state.appliedName === owner && state.appliedTopic === topic && state.archived === archived) continue
@@ -155,6 +158,7 @@ export class AgentChannels {
           const current = this.states.get(id)!
           this.states.set(id, { ...current, archived, appliedName: owner, appliedTopic: topic })
           this.save(this.stateFile, this.states)
+          this.pendingArchives.delete(id)
         } catch {
           process.stderr.write(`agent channels: could not update channel ${id}\n`)
         }
