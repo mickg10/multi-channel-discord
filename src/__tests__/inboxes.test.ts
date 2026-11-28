@@ -316,6 +316,16 @@ test.each([{ records: 3, bytes: Infinity }, { records: Infinity, bytes: 1 }])(
   },
 )
 
+test('a human copy link survives compaction and a restart', () => {
+  const dir = directory()
+  const inboxes = Inboxes.inStateDir(dir, { records: 1, bytes: 1 })
+  inboxes.rememberCopy('copy-1', { channelId: 'topic', originId: 'origin-1', agent: 'claude@mac:bbq' })
+  inboxes.rememberCopy('copy-1', { channelId: 'topic', originId: 'origin-1', agent: 'claude@mac:bbq' })
+  const restarted = Inboxes.inStateDir(dir)
+  expect(restarted.copyLink('copy-1')).toEqual({ channelId: 'topic', originId: 'origin-1', agent: 'claude@mac:bbq' })
+  expect(readFileSync(join(dir, 'inboxes.jsonl'), 'utf8').split('\n').filter(line => line.includes('"copyLink"'))).toHaveLength(1)
+})
+
 test('startup reports the path and line of corrupt records and saves an intact copy', () => {
   const dir = directory()
   const path = join(dir, 'inboxes.jsonl')

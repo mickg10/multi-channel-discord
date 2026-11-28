@@ -20,7 +20,7 @@ import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
 import { isBusAlias } from './bus-alias.js'
-import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
+import { identityKey, type HumanCopyLink, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
@@ -103,6 +103,8 @@ export interface WsDeps {
   readonly admins?: ReadonlySet<string>
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
   readonly humanChannelId?: string
+  /** Guild of the bus, so a human-questions copy can link to the topic message. */
+  guildId?: string
   /** Bus rules sent once to every session on (first) register. */
   readonly rules?: () => { text: string; seen(name: string): boolean; markSeen(name: string): void } | null
   /** Passive chatter. Not the durable inbox, and not saved across a router restart. */
@@ -233,6 +235,19 @@ function transport(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): voi
     pushLegacy(deps, name, entry)
   } else if (!live) deps.nodes?.wake(name, pending)
   deps.wakeLog?.record({ name, messageId: entry.meta.message_id, pending, cold, at: Date.now() })
+}
+
+/** Mick replied to a #human-questions copy. Deliver it to the agent and show it in the topic channel. */
+export function acceptHumanReply(deps: Readonly<WsDeps>, link: HumanCopyLink, content: string, meta: ChannelMeta, speaker: string): boolean {
+  const ok = deliver(deps, link.agent, content, {
+    ...meta,
+    chat_id: link.channelId,
+    to: link.agent,
+    question_id: link.originId,
+    in_reply_to: meta.message_id,
+  })
+  void sendToDiscord(deps.client, link.channelId, `**[${speaker} → ${link.agent}]** ${content}`, link.originId)
+  return ok
 }
 
 export function deliver(deps: Readonly<WsDeps>, name: string, text: string, meta: ChannelMeta, target?: Target): boolean {
@@ -1416,6 +1431,13 @@ const busPostTimes = new Map<string, number[]>()
 /** Tests share one process. Production never calls this. */
 export function resetBusRateLimit(): void { busPostTimes.clear() }
 const HUMAN_TARGETS = new Set(['human', 'admin', 'user', 'me'])
+export const NO_TOPIC_WARNING = 'No topic channel. Use channel_post so this question stays with its topic.'
+
+/** First line of a #human-questions copy. Empty when the guild or the topic message is unknown. */
+export function humanJumpLink(guildId: string | undefined, channelId: string, messageId: string | undefined): string {
+  if (!guildId || !messageId) return ''
+  return `https://discord.com/channels/${guildId}/${channelId}/${messageId}\n`
+}
 
 /**
  * Post `[from → to] text` to the bus channel (so humans see the conversation).
@@ -1503,8 +1525,8 @@ function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: str
   const timeout = new Promise<MirrorDelivery>(resolve => {
     deadline = setTimeout(() => { expired = true; resolve({ ...delivered }) }, 2_000)
   })
-  const send = async (destination: { where: string; origin: string }, field: keyof MirrorDelivery) => {
-    const chunks = chunk(`**[${plan.from} → ${plan.label}]**${destination.origin} ${text}`, deps.chunkLimit, deps.chunkMode)
+  const send = async (destination: { where: string; origin: string }, field: keyof MirrorDelivery, lead = '') => {
+    const chunks = chunk(`${lead}**[${plan.from} → ${plan.label}]**${destination.origin} ${text}`, deps.chunkLimit, deps.chunkMode)
     let first: string | undefined
     for (const [index, content] of chunks.entries()) {
       if (expired) return
@@ -1516,9 +1538,12 @@ function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: str
     }
     delivered[field] = first
   }
-  const sends = plan.copyOnly ? [] : [send(plan, 'messageId')]
-  if (plan.copy) sends.push(send(plan.copy, 'copyId'))
-  const attempt = Promise.race([Promise.all(sends).then(() => delivered), timeout]).finally(() => {
+  const run = async () => {
+    if (!plan.copyOnly) await send(plan, 'messageId')
+    if (plan.copy) await send(plan.copy, 'copyId', humanJumpLink(plan.guildId, plan.where, delivered.messageId ?? plan.originId))
+    return delivered
+  }
+  const attempt = Promise.race([run(), timeout]).finally(() => {
     clearTimeout(deadline)
     attempts?.delete(attemptKey)
   })
@@ -1553,6 +1578,10 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     const attemptKey = JSON.stringify([key, copyOnly ? 'uncommitted' : retry.at])
     void tryPublishMirror(deps, retry.mirror, text, files, attemptKey).then(({ messageId, copyId }) => {
       const delivered = copyOnly ? copyId : messageId
+      const originId = messageId ?? retry.mirror!.originId
+      if (copyId && retry.mirror!.copy && originId) {
+        inboxes!.rememberCopy(copyId, { channelId: retry.mirror!.where, originId, agent: retry.mirror!.from })
+      }
       if (delivered) inboxes!.publishMirrored(key, retry.at, delivered)
       const result: PublishResult = delivered ? retry.result : copyOnly
         ? { ...retry.result, copy: 'failed' }
@@ -1587,10 +1616,11 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   deps.activity?.markPost(from)
 
   const humanChannel = toLabel === 'human' && deps.humanChannelId !== channelId ? deps.humanChannelId : undefined
-  const redirect = humanChannel && (!channelName || channelId === deps.busChannelId)
-  const source = channelName ? `#${channelName}` : '#general'
-  const where = redirect ? humanChannel : channelId
-  const origin = redirect ? ` (from ${source})` : ''
+  const noTopic = toLabel === 'human' && !channelName
+  const redirect = humanChannel && (noTopic || channelId === deps.busChannelId)
+  const source = channelName ? `#${channelName}` : ''
+  const origin = !redirect ? '' : noTopic ? ` (from ${from}, no topic)` : ` (from ${source})`
+  const where = redirect ? humanChannel! : channelId
   const copy = humanChannel && !redirect ? { where: humanChannel, origin: ` (from ${source})` } : undefined
   const meta: ChannelMeta = {
     ...(files?.length && { attachments: files.map(f => f.name).join('; '), attachment_count: String(files.length) }),
@@ -1605,8 +1635,8 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   }
 
   const body = allMode === 'synthesis' ? `${text}\n\n(synthesis: read this channel for earlier replies before adding anything)` : text
-  const result: PublishResult = { publish_id: id, committed: targets }
-  const mirror: PublishMirror = { where, label: toLabel, origin, copy, from, fingerprint: mirrorFingerprint(text, files), sender }
+  const result: PublishResult = { publish_id: id, committed: targets, ...(noTopic && { warning: NO_TOPIC_WARNING }) }
+  const mirror: PublishMirror = { where, label: toLabel, origin, copy, from, fingerprint: mirrorFingerprint(text, files), sender, ...(deps.guildId && { guildId: deps.guildId }) }
   const messages = targets.map(name => {
     const stamped = admission(deps, name, meta)
     if (!stamped) throw new Error('unknown_target')
@@ -1620,13 +1650,16 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   const attemptKey = JSON.stringify([key, record ? now : 'uncommitted'])
   void tryPublishMirror(deps, mirror, text, files, attemptKey).then(({ messageId, copyId }) => {
     const copyFailed = !!copy && !copyId
-    if (copyId) inboxes?.setMirror([], copyId, sender)
+    if (copyId) {
+      inboxes?.setMirror([], copyId, sender)
+      if (messageId && mirror.copy) inboxes?.rememberCopy(copyId, { channelId: mirror.where, originId: messageId, agent: from })
+    }
     if (messageId) {
       if (record) inboxes?.publishMirrored(key, now, messageId)
       else {
         inboxes?.setMirror(entries.map(entry => entry.id), messageId, sender)
         if (publish && (publish.publish_id !== undefined || requestId) && !inboxes?.publish(key)) {
-          const pendingCopy = copyFailed ? { ...mirror, copyOnly: true as const } : undefined
+          const pendingCopy = copyFailed ? { ...mirror, copyOnly: true as const, originId: messageId } : undefined
           inboxes?.commit([], { key, result, at: now, mirror: pendingCopy })
         }
       }
