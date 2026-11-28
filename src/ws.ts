@@ -404,6 +404,7 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
         // Only deregister the session if this WS is the primary sender.
         // Duplicate connections (extraSends) just remove their callback.
         if (isPrimary) {
+          process.stderr.write(`discord: deregister ${ws.data.sessionName}\n`)
           try {
             deps.sessions.deregisterSession(ws.data.sessionName)
           } catch {}
@@ -854,6 +855,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         const kind = agent ?? incumbent.agent ?? normalized.toLowerCase().split('@', 1)[0]!
         const codex = kind === 'codex' || kind.startsWith('codex-') || kind === 'chatgpt-codex'
         const reclaimable = !differentConversation && (!codex || sameInstance || sameConversation)
+        process.stderr.write(`discord: replace ${normalized}\n`)
         deps.sessions.notifySession(normalized, JSON.stringify({
           type: 'replaced', name: normalized, ...(!reclaimable && { reclaim: false }),
         }))
@@ -972,6 +974,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     name => !!deps.inboxes?.target(name),
     identity,
   )
+  process.stderr.write(`discord: register ${actualName}\n`)
   ws.data.sessionName = actualName
   deps.subs?.reclaim(actualName, instanceId)
   ws.data.sendCallback = sendCb
@@ -984,6 +987,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
 
 function handleDeregister(ws: WsLike, deps: Readonly<WsDeps>): void {
   if (ws.data.sessionName) {
+    process.stderr.write(`discord: deregister ${ws.data.sessionName}\n`)
     try {
       deps.sessions.deregisterSession(ws.data.sessionName)
     } catch {}
