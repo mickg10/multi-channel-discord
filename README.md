@@ -164,6 +164,8 @@ The **router** runs the Discord bot, handles access control, manages sessions, a
 
 Sessions are named from your git branch, `package.json` name, or directory. Collisions get suffixes (`frontend`, `frontend-2`).
 
+A suffix stays with the instance it was given to. The router keeps a lease of each name per instance id for ten minutes after it last saw the holder (`name-leases.json` in its state directory) and passes over names leased to other instances when it hands one out, so after a router restart every instance gets its own name back, whatever order it reconnects in. The plugin also saves a collision name it was given (`assigned-aliases/` in its state directory) and asks for it again. Takeovers, reclaiming a name you were moved off, and clients that send no instance id are named as before.
+
 ## Tools
 
 These are MCP tools Claude can call when responding to Discord messages:

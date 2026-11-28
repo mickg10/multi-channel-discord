@@ -10,6 +10,7 @@
 import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './access.js'
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
+import { NameLeases } from './name-leases.js'
 import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, directChannelOwner, onlineBusAgent, inboxError, deliver as deliverFn } from './ws.js'
 import { Activity, Conversations, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
 import { AgentChannels, agentChannelSlug, agentChannelTopic, type AgentChannelOps } from './agent-channels.js'
@@ -91,7 +92,7 @@ process.on('uncaughtException', (err: unknown) => {
 // Session management
 // ============================================================
 
-const sessions = new SessionManager()
+const sessions = new SessionManager(NameLeases.inStateDir(STATE_DIR))
 const history = new ProjectHistory()
 const startedAt = Date.now()
 
@@ -618,6 +619,9 @@ const bufferInterval = setInterval(() => {
   sessions.saveBuffers().catch(() => {})
 }, 30_000)
 
+// A name lease lasts as long as its holder stays connected (name-leases.ts)
+const leaseInterval = setInterval(() => sessions.refreshLeases(), 60_000)
+
 // ============================================================
 // Shutdown
 // ============================================================
@@ -629,6 +633,7 @@ async function shutdown(): Promise<void> {
   process.stderr.write('discord channel: shutting down\n')
   clearInterval(bufferInterval)
   clearInterval(agentChannelInterval)
+  clearInterval(leaseInterval)
   // Clear all typing intervals
   typingManager.stopAll()
   try {

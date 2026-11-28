@@ -9,11 +9,15 @@ import type { SessionEntry, BufferedMessage, WsMessage, ProjectHistoryEntry, Cha
 import { SessionNotFoundError } from './errors.js'
 import { getStateDir } from './access.js'
 import { BUS_ALIAS_MAX } from './bus-alias.js'
+import type { NameLeases } from './name-leases.js'
 
 interface SessionSlot {
   readonly name: string
   readonly projectPath: string
   readonly instanceId: string
+  /** The client presented `instanceId` itself. One was made up otherwise, and such a
+   *  client takes no part in name leases: it is named exactly as before. */
+  readonly identified: boolean
   readonly agent?: string
   readonly conversationId?: string
   readonly connectedAt: number
@@ -29,27 +33,36 @@ export class SessionManager {
   private unrouted: BufferedMessage[] = []
   private buffers = new Map<string, BufferedMessage[]>()
 
+  /** With `leases`, a `-N` name follows the instance the router gave it to (see name-leases.ts). */
+  constructor(private readonly leases?: NameLeases) {}
+
   /** Register a session. Returns the actual name (may differ due to collision suffix).
    *  If a session with the same instanceId already exists, adds this send callback
    *  to extraSends (dedup for multiple MCP spawns from the same Claude Code process).
-   *  Different Claude Code instances on the same project get separate sessions with collision suffixes. */
-  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string }): string {
+   *  Different Claude Code instances on the same project get separate sessions with collision suffixes.
+   *
+   *  A plain registration is kept off names leased to other instances. An `exact` one
+   *  (a takeover, or reclaiming a name the client was moved off) asks for that name and
+   *  is held by nothing but a live session. */
+  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string }, exact = false): string {
     // Deduplicate: if same instanceId is already registered, add send callback to existing.
     // This handles Claude Code spawning multiple MCP plugin processes for one session.
     if (instanceId) {
       for (const [existingName, slot] of this.sessions) {
         if (slot.instanceId === instanceId) {
           slot.extraSends.push(send)
+          this.leases?.touch(existingName, instanceId)
           return existingName
         }
       }
     }
 
-    const actualName = this.resolveCollision(name, reserved)
+    const actualName = this.resolveCollision(name, reserved, undefined, exact ? undefined : instanceId)
     this.sessions.set(actualName, {
       name: actualName,
       projectPath,
       instanceId: instanceId ?? `anon-${Date.now()}`,
+      identified: !!instanceId,
       agent: identity?.agent,
       conversationId: identity?.conversationId,
       connectedAt: Date.now(),
@@ -57,6 +70,7 @@ export class SessionManager {
       send,
       extraSends: [],
     })
+    if (instanceId) this.leases?.touch(actualName, instanceId)
     return actualName
   }
 
@@ -69,6 +83,9 @@ export class SessionManager {
     const deadSend = slot.send
     this.sessions.delete(name)
     this.buffers.delete(name)
+    // The lease outlives the connection: a client that is coming back (or a router that is
+    // restarting) finds its name held, until the lease expires.
+    if (slot.identified) this.leases?.touch(name, slot.instanceId)
     if (this.active === name) {
       this.active = null
     }
@@ -115,7 +132,10 @@ export class SessionManager {
     const actualName = this.resolveCollision(newName, reserved, oldName)
     beforeRename?.(actualName)
     this.sessions.delete(oldName)
-    this.sessions.set(actualName, { ...slot, name: actualName })
+    const moved = { ...slot, name: actualName }
+    this.sessions.set(actualName, moved)
+    // the lease follows the session, and leaves the old name with it
+    if (moved.identified) this.leases?.touch(actualName, moved.instanceId)
 
     const buf = this.buffers.get(oldName)
     if (buf) {
@@ -247,8 +267,17 @@ export class SessionManager {
     }
   }
 
-  private resolveCollision(name: string, reserved?: (name: string) => boolean, previous?: string): string {
-    const inUse = (candidate: string) => (candidate !== previous && this.sessions.has(candidate)) || reserved?.(candidate)
+  /** Mark every connected instance as seen, so that its lease lasts as long as it stays connected. */
+  refreshLeases(): void {
+    this.leases?.touchAll(
+      [...this.sessions].flatMap(([name, slot]) => slot.identified ? [[name, slot.instanceId] as const] : []),
+    )
+  }
+
+  private resolveCollision(name: string, reserved?: (name: string) => boolean, previous?: string, claimant?: string): string {
+    const inUse = (candidate: string) =>
+      (candidate !== previous && this.sessions.has(candidate)) || reserved?.(candidate) ||
+      this.leases?.heldByAnother(candidate, claimant) === true
     if (!inUse(name)) return name
     let suffix = 2
     let candidate: string
