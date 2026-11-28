@@ -22,6 +22,7 @@ import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
 import { BUS_ALIAS_MAX, BusAlias, isBusAlias } from './bus-alias.js'
 import { afterDrain, formatInboxLine, latchDecision } from './wake.js'
+import { replacedToolText } from './plugin-replaced.js'
 
 export const CHANNEL_INSTRUCTIONS = `You are connected to Discord via the claude/channel capability.
 
@@ -464,8 +465,14 @@ export async function startPlugin(): Promise<void> {
         onPermissionVerdict,
         onReplaced: (n: string, reclaim: boolean) => {
           reclaimAllowed = reclaim
-          process.stderr.write(`discord plugin: name "${n}" taken over${reclaim ? '; waiting for it to become free' : '; conversation superseded'}\n`)
+          process.stderr.write(`discord plugin: replaced "${n}"${reclaim ? '; waiting for it to become free' : '; conversation superseded'}\n`)
           retired = true
+          const error = new Error(replacedToolText(n, reclaim, routerSupportsReclaim))
+          for (const [id, pending] of pendingRequests) {
+            clearTimeout(pending.timer)
+            pendingRequests.delete(id)
+            pending.reject(error)
+          }
           ackWake()
           try { currentWs?.close() } catch {}
         },
@@ -549,6 +556,10 @@ export async function startPlugin(): Promise<void> {
   }
 
   function sendWs(msg: string): void {
+    if (retired) {
+      process.stderr.write(`discord plugin: ${replacedToolText(currentName, reclaimAllowed, routerSupportsReclaim)}\n`)
+      return
+    }
     if (currentWs && currentWs.readyState === WebSocket.OPEN) {
       currentWs.send(msg)
     }
@@ -798,11 +809,7 @@ export async function startPlugin(): Promise<void> {
       return { content: [{ type: 'text', text: registrationError }], isError: true }
     }
     if (retired) {
-      return { content: [{ type: 'text', text: !reclaimAllowed
-        ? `A newer conversation superseded the bus name "${currentName}".`
-        : routerSupportsReclaim
-        ? `Waiting to reclaim the bus name "${currentName}". Discord tools are unavailable until the active holder disconnects.`
-        : `A newer session took over the bus name "${currentName}". This router does not support automatic reclaim.` }], isError: true }
+      return { content: [{ type: 'text', text: replacedToolText(currentName, reclaimAllowed, routerSupportsReclaim) }], isError: true }
     }
     try {
       switch (req.params.name) {

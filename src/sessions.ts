@@ -25,6 +25,7 @@ interface SessionSlot {
 /** Manages the routing table, active session, message buffers, and unrouted inbox. */
 export class SessionManager {
   private sessions = new Map<string, SessionSlot>()
+  private displaced = new WeakSet<(msg: string) => void>()
   private active: string | null = null
   private unrouted: BufferedMessage[] = []
   private buffers = new Map<string, BufferedMessage[]>()
@@ -158,6 +159,18 @@ export class SessionManager {
     for (const extra of slot.extraSends) { try { extra(json) } catch {} }
     slot.messageCount++
     return true
+  }
+
+  /** The name moved to another connection. Later sends from these callbacks are refused. */
+  displace(name: string): void {
+    const slot = this.sessions.get(name)
+    if (!slot) return
+    this.displaced.add(slot.send)
+    for (const extra of slot.extraSends) this.displaced.add(extra)
+  }
+
+  wasDisplaced(send: (msg: string) => void): boolean {
+    return this.displaced.has(send)
   }
 
   /** Send a raw protocol message (not a channel message) to every connection of a session. */

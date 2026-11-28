@@ -531,6 +531,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     gateway.agents.set(frame.alias, target)
     deps.conversations?.set(frame.alias, frame.conv)
     if (liveSession(deps, frame.alias)) {
+      deps.sessions.displace(frame.alias)
       deps.sessions.notifySession(frame.alias, JSON.stringify({ type: 'replaced', name: frame.alias }))
       deps.sessions.deregisterSession(frame.alias)
       pullSessions.delete(frame.alias)
@@ -639,6 +640,14 @@ function agentStatus(deps: Readonly<WsDeps>, name: string) {
 }
 
 function dispatchMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: Readonly<WsDeps>): void {
+  if (parsed.type !== 'register' && parsed.type !== 'registerNode' &&
+      ws.data.sendCallback && deps.sessions.wasDisplaced(ws.data.sendCallback)) {
+    const requestId = typeof (parsed as { requestId?: unknown }).requestId === 'string'
+      ? (parsed as { requestId: string }).requestId : undefined
+    if (requestId) sendToolResult(ws, requestId, false, 'replaced')
+    else sendError(ws, 'replaced')
+    return
+  }
   if (ws.data.gateway || ['registerGateway', 'registerAgent', 'releaseAgent', 'lease', 'ack', 'mark', 'wakeResult', 'gatewayOp'].includes(parsed.type)) {
     handleGateway(ws, parsed as GatewayToRouterMessage, deps)
     return
@@ -854,6 +863,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         const kind = agent ?? incumbent.agent ?? normalized.toLowerCase().split('@', 1)[0]!
         const codex = kind === 'codex' || kind.startsWith('codex-') || kind === 'chatgpt-codex'
         const reclaimable = !differentConversation && (!codex || sameInstance || sameConversation)
+        deps.sessions.displace(normalized)
         deps.sessions.notifySession(normalized, JSON.stringify({
           type: 'replaced', name: normalized, ...(!reclaimable && { reclaim: false }),
         }))
