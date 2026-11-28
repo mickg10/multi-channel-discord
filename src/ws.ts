@@ -324,6 +324,7 @@ export interface WsLike {
   data: WsData
   send(msg: string): void
   close?(): void
+  ping?(): void
 }
 
 function logLifecycle(deps: Readonly<WsDeps>, ws: WsLike, event: string, reason: string, fields: Partial<LifecycleFields> = {}): void {
@@ -377,7 +378,10 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
           c.ws.close?.()
         } else if (now - c.ping >= PING_MS) {
           c.ping = now
-          try { c.ws.send(JSON.stringify({ type: 'ping' })) } catch {
+          try {
+            c.ws.ping?.()
+            c.ws.send(JSON.stringify({ type: 'ping' }))
+          } catch {
             data.closeReason = 'send_failed'
             this.close(c.ws)
             c.ws.close?.()
