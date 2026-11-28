@@ -103,6 +103,20 @@ export class Claims {
     return { ok: true, claim: this.map.get(k) }
   }
   list(): Claim[] { this.expire(); return [...this.map.values()] }
+  hasOwner(owner: string): boolean {
+    this.expire()
+    for (const c of this.map.values()) if (c.owner === owner) return true
+    return false
+  }
+  dropByOwner(owner: string): number {
+    this.expire()
+    let dropped = 0
+    for (const [k, c] of this.map) {
+      if (c.owner === owner) { this.map.delete(k); dropped++ }
+    }
+    if (dropped > 0) this.save()
+    return dropped
+  }
   private save(): void {
     if (!this.file) return
     try { mkdirSync(dirname(this.file), { recursive: true }); writeFileSync(this.file, JSON.stringify(this.list(), null, 2)) } catch {}

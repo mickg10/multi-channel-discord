@@ -24,6 +24,7 @@ export const NAME_LEASE_MS = 10 * 60_000
 
 export interface NameLease {
   readonly instanceId: string
+  readonly host?: string
   /** Epoch milliseconds of the last time the router saw the holder connected. */
   readonly lastSeen: number
 }
@@ -45,7 +46,10 @@ export class NameLeases {
       for (const [name, lease] of Object.entries(raw)) {
         if (isBusAlias(name) && lease && typeof lease.instanceId === 'string' &&
             typeof lease.lastSeen === 'number') {
-          this.leases.set(name, { instanceId: lease.instanceId, lastSeen: lease.lastSeen })
+          const host = typeof lease.host === 'string' && lease.host.length > 0 ? lease.host : undefined
+          this.leases.set(name, host !== undefined
+            ? { instanceId: lease.instanceId, host, lastSeen: lease.lastSeen }
+            : { instanceId: lease.instanceId, lastSeen: lease.lastSeen })
         }
       }
     } catch {}
@@ -56,27 +60,30 @@ export class NameLeases {
     return new NameLeases(join(stateDir, 'name-leases.json'), ttlMs, now)
   }
 
-  /** `instanceId` holds `name` from now on. An instance holds one name, so its other leases end. */
-  touch(name: string, instanceId: string): void {
-    this.hold(name, instanceId)
+  /** `instanceId` (optionally scoped by `host`) holds `name` from now on. An instance holds one name, so its other leases end. */
+  touch(name: string, instanceId: string, host?: string): void {
+    this.hold(name, instanceId, host)
     this.save()
   }
 
   /** Several holders seen at once (the periodic refresh); the file is written once. */
-  touchAll(holders: Iterable<readonly [name: string, instanceId: string]>): void {
+  touchAll(holders: Iterable<readonly [name: string, instanceId: string, host?: string]>): void {
     let any = false
-    for (const [name, instanceId] of holders) {
-      this.hold(name, instanceId)
+    for (const [name, instanceId, host] of holders) {
+      this.hold(name, instanceId, host)
       any = true
     }
     if (any) this.save()
   }
 
-  /** Whether `name` is leased to an instance other than `instanceId` that was seen within the lease time. */
-  heldByAnother(name: string, instanceId: string | undefined): boolean {
-    if (!instanceId) return false
+  /** Whether `name` is leased to an instance other than `(host, instanceId)` that was seen within the lease time.
+   *  A pre-PR1 row without `host` matches any host (§10.3).
+   *  When `strictUnidentified` is true (swarm config active), callers without `instanceId` cannot steal a leased name. */
+  heldByAnother(name: string, instanceId: string | undefined, host?: string, strictUnidentified = false): boolean {
     const lease = this.leases.get(name)
-    return !!lease && lease.instanceId !== instanceId && this.now() - lease.lastSeen < this.ttlMs
+    if (!lease || this.now() - lease.lastSeen >= this.ttlMs) return false
+    if (!instanceId) return strictUnidentified
+    return !this.sameHolder(lease, instanceId, host)
   }
 
   /** End every lease whose holder has not been seen within the lease time. Returns how many. */
@@ -99,11 +106,18 @@ export class NameLeases {
     return this.leases.size
   }
 
-  private hold(name: string, instanceId: string): void {
+  private sameHolder(lease: NameLease, instanceId: string, host?: string): boolean {
+    if (lease.instanceId !== instanceId) return false
+    return !lease.host || !host || lease.host === host
+  }
+
+  private hold(name: string, instanceId: string, host?: string): void {
     for (const [held, lease] of this.leases) {
-      if (lease.instanceId === instanceId && held !== name) this.leases.delete(held)
+      if (this.sameHolder(lease, instanceId, host) && held !== name) this.leases.delete(held)
     }
-    this.leases.set(name, { instanceId, lastSeen: this.now() })
+    this.leases.set(name, host !== undefined
+      ? { instanceId, host, lastSeen: this.now() }
+      : { instanceId, lastSeen: this.now() })
   }
 
   private save(): void {

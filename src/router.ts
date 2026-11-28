@@ -11,7 +11,9 @@ import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './ac
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
 import { NameLeases } from './name-leases.js'
-import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, directChannelOwner, onlineBusAgent, inboxError, deliver as deliverFn } from './ws.js'
+import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, directChannelOwner, onlineBusAgent, inboxError, deliver as deliverFn, applySwarmConfigReload } from './ws.js'
+import { SwarmConfig } from './swarm-config.js'
+import { SwarmJournal } from './swarm-journal.js'
 import { Activity, Conversations, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
 import { AgentChannels, agentChannelSlug, agentChannelTopic, type AgentChannelOps } from './agent-channels.js'
 import type { WsData, WsLike } from './ws.js'
@@ -315,6 +317,8 @@ let routeError: string | undefined
 let routeNote: string | undefined
 const humanMail = new HumanMail()
 const conversations = new Conversations()
+const swarmConfig = SwarmConfig.inStateDir(STATE_DIR)
+const swarmJournal = SwarmJournal.inStateDir(STATE_DIR)
 const wsHandlers = createWsHandlers(wsDepsRef = {
   sessions,
   history,
@@ -351,6 +355,8 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   onRouteNote: (message: string) => { routeNote = message },
   humanMail,
   conversations,
+  swarmConfig,
+  swarmJournal,
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
     updateSkillCommands(client, skills).catch((err: unknown) => {
       process.stderr.write(`discord channel: skill command registration failed: ${err instanceof Error ? err.message : String(err)}\n`)
@@ -622,6 +628,11 @@ const bufferInterval = setInterval(() => {
 // A name lease lasts as long as its holder stays connected (name-leases.ts)
 const leaseInterval = setInterval(() => sessions.refreshLeases(), 60_000)
 
+// Poll swarms-config.json every 5 s on mtime+size (§1, §10.5)
+const stopSwarmWatch = swarmConfig.startWatching(diff => {
+  applySwarmConfigReload(wsDepsRef, diff)
+}, 5_000)
+
 // ============================================================
 // Shutdown
 // ============================================================
@@ -634,6 +645,7 @@ async function shutdown(): Promise<void> {
   clearInterval(bufferInterval)
   clearInterval(agentChannelInterval)
   clearInterval(leaseInterval)
+  stopSwarmWatch()
   // Clear all typing intervals
   typingManager.stopAll()
   try {

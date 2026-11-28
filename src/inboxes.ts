@@ -13,6 +13,7 @@ export interface InboxEntry extends QueuedMessage {
   readonly id: string
   readonly key: string
   readonly state: WakeState
+  readonly swarm?: string
   readonly nativeId?: string
   readonly nudgeNumber?: number
   readonly lease?: { id: string; receipt: string; until: number }
@@ -302,6 +303,9 @@ export class Inboxes {
 
   target(alias: string): Target | undefined { return this.aliases.get(alias) }
   names(): string[] { return [...new Set([...this.aliases.keys(), ...this.legacyConversations.keys()])] }
+  hasName(name: string): boolean {
+    return this.aliases.has(name) || this.legacyConversations.has(name) || (this.byKey.get(name)?.size ?? 0) > 0
+  }
   conversation(name: string): string | undefined { return this.legacyConversations.get(name) }
   remember(name: string, conv: string): void {
     if (this.conversation(name) !== conv) this.append({ op: 'remember', name, conv })
@@ -341,14 +345,17 @@ export class Inboxes {
     this.append({ op: 'bind', target, ids })
   }
 
-  commit(messages: readonly { name: string; content: string; meta: ChannelMeta; target?: Target }[], publish?: PublishRecord): InboxEntry[] {
+  commit(messages: readonly { name: string; content: string; meta: ChannelMeta; target?: Target; swarm?: string }[], publish?: PublishRecord): InboxEntry[] {
     const counts = new Map<string, number>()
-    const entries = messages.map(({ name, content, meta, target }): InboxEntry => {
+    const entries = messages.map(({ name, content, meta, target, swarm }): InboxEntry => {
       const key = target ? identityKey(target) : this.key(name)
       const count = (counts.get(key) ?? this.byKey.get(key)?.size ?? 0) + 1
       if (count > INBOX_MAX) throw new Error('inbox_full')
       counts.set(key, count)
-      return { id: randomUUID(), key, content, meta, at: new Date().toISOString(), state: 'committed' }
+      return {
+        id: randomUUID(), key, content, meta, at: new Date().toISOString(), state: 'committed',
+        ...(swarm && swarm !== 'default' ? { swarm } : {}),
+      }
     })
     const publication = publish?.mirror
       ? { ...publish, mirror: { ...publish.mirror, entryIds: entries.map(entry => entry.id) } }
@@ -361,8 +368,8 @@ export class Inboxes {
     if (ids.length || sender) this.append({ op: 'mirror', ids, messageId, ...(sender && { sender }) })
   }
 
-  push(name: string, content: string, meta: ChannelMeta): number {
-    this.commit([{ name, content, meta }])
+  push(name: string, content: string, meta: ChannelMeta, swarm?: string): number {
+    this.commit([{ name, content, meta, ...(swarm && { swarm }) }])
     return this.count(name)
   }
 
@@ -371,10 +378,14 @@ export class Inboxes {
   get(id: string): InboxEntry | undefined { return this.entries.get(id) }
   wakePending(key: string): boolean { return this.list(key).some(holdsWake) }
 
-  legacy(name: string, conversationId?: string | null): InboxEntry[] {
+  legacy(name: string, conversationId?: string | null, swarm?: string): InboxEntry[] {
     if (this.target(name)) return []
-    return this.list(name).filter(({ meta }) => conversationId === undefined || meta.from_human !== 'true' || !meta.question_id ||
-      !meta.conversation_id || meta.conversation_id === conversationId)
+    return this.list(name).filter(entry => {
+      if (swarm !== undefined && (entry.swarm ?? 'default') !== swarm) return false
+      const { meta } = entry
+      return conversationId === undefined || meta.from_human !== 'true' || !meta.question_id ||
+        !meta.conversation_id || meta.conversation_id === conversationId
+    })
   }
 
   renameLegacy(oldName: string, name: string, conversationId: string | null): void {

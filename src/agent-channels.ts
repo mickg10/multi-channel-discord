@@ -11,6 +11,7 @@ export interface AgentChannelRegistration {
   name: string
   kind?: string
   host?: string
+  swarm?: string
 }
 
 export interface AgentChannelOps {
@@ -82,6 +83,7 @@ export class AgentChannels {
   }
 
   owner(id: string): string | undefined { return this.bindings.get(id) }
+  hasOwner(name: string): boolean { return this.channelFor(name) !== undefined }
 
   private channelFor(name: string): string | undefined {
     for (const [id, owner] of this.bindings) if (owner === name) return id
