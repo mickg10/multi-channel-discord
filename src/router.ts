@@ -10,14 +10,20 @@
 import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './access.js'
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
-import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, inboxError, deliver as deliverFn } from './ws.js'
+import { NameLeases } from './name-leases.js'
+import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, directChannelOwner, onlineBusAgent, inboxError, deliver as deliverFn, applySwarmConfigReload, knownSwarm, sendRulesForSwarm } from './ws.js'
+import { SwarmConfig } from './swarm-config.js'
+import { SwarmJournal } from './swarm-journal.js'
+import { SwarmChannels, type ChannelClientLike, type GuildLike } from './swarm-channels.js'
+import { identityKey } from './inboxes.js'
 import { Activity, Conversations, CostClasses, HumanMail, Unread, WakeBudget } from './wake.js'
+import { AgentChannels } from './agent-channels.js'
 import type { WsData, WsLike } from './ws.js'
 import { PidManager } from './pid.js'
 import { registerSlashCommands, handleSlashCommand, handleAutocomplete, updateSkillCommands, isSkillCommand } from './slash-commands.js'
 import type { SlashCommandDeps, SkillEntry } from './slash-commands.js'
 import type { ChannelMeta } from './types.js'
-import { ActivityType, ChannelType, type Message, type Guild } from 'discord.js'
+import { ActivityType, type Message, type Guild } from 'discord.js'
 import { Subscriptions } from './subscriptions.js'
 import { Inboxes, NodeRegistry, Claims } from './nodes.js'
 import { McpRegistry, Grants, McpAudit, PendingMcpCalls } from './mcp.js'
@@ -90,7 +96,7 @@ process.on('uncaughtException', (err: unknown) => {
 // Session management
 // ============================================================
 
-const sessions = new SessionManager()
+const sessions = new SessionManager(NameLeases.inStateDir(STATE_DIR))
 const history = new ProjectHistory()
 const startedAt = Date.now()
 
@@ -159,6 +165,8 @@ for (const pair of (process.env.DISCORD_CHANNEL_OWNERS ?? '').split(',')) {
   if (id && owner) channelOwners.set(id, owner)
 }
 
+const agentChannels = BUS_CHANNEL ? new AgentChannels(STATE_DIR, Date.now(), channelOwners) : undefined
+
 // Remote MCP over the bus: git-declared registry (MCP_REGISTRY or state dir), runtime in state dir.
 // A missing registry file = feature present but empty (mcp_list returns []); a malformed file
 // fails startup closed — a broken declaration must not silently widen admission.
@@ -196,64 +204,42 @@ async function busGuild(): Promise<Guild> {
   return ch.guild
 }
 
-// Guild channels come from discord.js's gateway-maintained cache (Guilds intent keeps it current
-// on create/update/delete). Hitting REST on every channel op exhausted Discord's per-route
-// rate limit (10/window) once several agents used channels, so tool calls queued and timed out.
-let lastChannelFetch = 0
-type ChanInfo = { id: string; name: string; type: ChannelType; topic: string | null }
-async function guildChannels(guild: Guild, forceRefresh = false): Promise<ChanInfo[]> {
-  const fresh = guild.channels.cache.size === 0 || (forceRefresh && Date.now() - lastChannelFetch > 30_000)
-  if (fresh) { lastChannelFetch = Date.now(); await guild.channels.fetch() }
-  return [...guild.channels.cache.values()].map(c => ({
-    id: c.id, name: c.name, type: c.type, topic: 'topic' in c ? (c as { topic: string | null }).topic : null,
-  }))
-}
-
-const channelOps: ChannelOps = {
-  async resolve(ref: string) {
-    const guild = await busGuild()
-    const want = ref.replace(/^<#(\d+)>$/, '$1').replace(/^#/, '').trim()
-    const match = (all: ChanInfo[]) =>
-      all.find(c => c.type === ChannelType.GuildText && (c.id === want || c.name === want.toLowerCase()))
-    // Cache miss (e.g. a channel created seconds ago): one rate-limited refresh at most.
-    const hit = match(await guildChannels(guild)) ?? match(await guildChannels(guild, true))
-    return hit ? { id: hit.id, name: hit.name } : null
-  },
-  async list() {
-    const guild = await busGuild()
-    return (await guildChannels(guild))
-      .filter(c => c.type === ChannelType.GuildText)
-      .map(c => ({ id: c.id, name: c.name, topic: c.topic }))
-  },
-  async create(name: string, topic?: string) {
-    const guild = await busGuild()
-    const bus = await client.channels.fetch(BUS_CHANNEL!)
-    const parent = bus && 'parentId' in bus ? bus.parentId ?? undefined : undefined
-    const ch = await guild.channels.create({
-      name: name.replace(/^#/, ''),
-      type: ChannelType.GuildText,
-      ...(topic && { topic }),
-      ...(parent && { parent }),
-      reason: 'agent-bus channel_create',
-    })
-    return { id: ch.id, name: ch.name }
-  },
-  async archive(id: string, topic: string) {
-    const guild = await busGuild()
-    const catInfo = (await guildChannels(guild)).find(c => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === 'archive')
-    const cat = catInfo ?? await guild.channels.create({ name: 'archive', type: ChannelType.GuildCategory, reason: 'agent-bus channel_archive' })
-    const ch = guild.channels.cache.get(id) ?? await guild.channels.fetch(id)
-    if (ch && ch.type === ChannelType.GuildText) {
-      await ch.edit({ parent: cat!.id, topic: topic.slice(0, 1000), reason: 'agent-bus channel_archive' })
-    }
-  },
-}
-
 let wsDepsRef: Parameters<typeof createWsHandlers>[0]
 let routeError: string | undefined
 let routeNote: string | undefined
 const humanMail = new HumanMail()
 const conversations = new Conversations()
+const swarmConfig = SwarmConfig.inStateDir(STATE_DIR)
+const swarmJournal = SwarmJournal.inStateDir(STATE_DIR)
+
+const swarmChannels = new SwarmChannels({
+  config: swarmConfig,
+  client: client as unknown as ChannelClientLike,
+  busChannelId: BUS_CHANNEL,
+  humanChannelId: HUMAN_CHANNEL,
+  subs: BUS_CHANNEL ? subs : undefined,
+  channelOwners,
+  agentChannels,
+  knownSwarm: name => knownSwarm(wsDepsRef, name),
+  nativeAlias: identity => {
+    for (const name of inboxes.names()) {
+      const target = inboxes.target(name)
+      if (target && identityKey(target) === identity) return name
+    }
+    return undefined
+  },
+  onSwarmReady: (swarm) => sendRulesForSwarm(wsDepsRef, swarm),
+})
+
+const getGuildLike = async () => (await busGuild()) as unknown as GuildLike
+const getStartupGuildLike = async (): Promise<GuildLike | null> => {
+  if (BUS_CHANNEL) return getGuildLike()
+  const first = client.guilds.cache.first()
+  return first ? (first as unknown as GuildLike) : null
+}
+const channelOps: ChannelOps = swarmChannels.createChannelOps(getGuildLike)
+const agentChannelOps = swarmChannels.createAgentChannelOps(getGuildLike)
+
 const wsHandlers = createWsHandlers(wsDepsRef = {
   sessions,
   history,
@@ -284,11 +270,17 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   budget: wakeBudget,
   dispatcher: process.env.DISCORD_DISPATCHER || undefined,
   channelOwners,
+  agentChannels,
   staggerMs: parseInt(process.env.DISCORD_ALL_STAGGER_MS ?? '0', 10),
   onRoutingError: (message: string) => { routeError = message },
   onRouteNote: (message: string) => { routeNote = message },
   humanMail,
   conversations,
+  swarmConfig,
+  swarmJournal,
+  swarmChannels,
+  swarmGeneralChannel: swarm => swarmChannels.generalChannelId(swarm),
+  onRegisterPruneSubs: (name, swarm) => { swarmChannels.pruneSessionSubscriptions(name, swarm) },
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
     updateSkillCommands(client, skills).catch((err: unknown) => {
       process.stderr.write(`discord channel: skill command registration failed: ${err instanceof Error ? err.message : String(err)}\n`)
@@ -355,6 +347,8 @@ const slashDeps: SlashCommandDeps = {
   sessions,
   history,
   startedAt,
+  channelSwarm: id => swarmChannels.channelSwarm(id),
+  isSwarmConfigured: () => swarmConfig.isConfigured(),
 }
 
 // ============================================================
@@ -385,15 +379,30 @@ async function handleBusInbound(msg: Message): Promise<void> {
   let channelName: string | undefined
   try { channelName = 'name' in msg.channel ? (msg.channel as { name: string }).name : undefined } catch {}
   const fullMeta: ChannelMeta = { ...meta, ...(channelName && { channel: channelName }) }
+  if (swarmConfig.isConfigured() && !swarmChannels.isInitialFetchDone() &&
+      msg.channelId !== BUS_CHANNEL && msg.channelId !== HUMAN_CHANNEL && !directChannelOwner(wsDepsRef, msg.channelId)) {
+    // Topic channel before initial fetch completes: reply swarm_not_ready instead of empty fan-out (m4).
+    await msg.reply('swarm_not_ready: channel layout is still initializing — please try again shortly.').catch(() => {})
+    return
+  }
   // A Discord reply to an agent's post goes to that agent only ("**[name → ...]**" prefix).
+  const chCls = swarmConfig.isConfigured() ? swarmChannels.classifyChannel(msg.channelId) : null
+  const chSwarm = chCls && chCls.kind === 'swarm' ? chCls.swarm : 'default'
   let delivered: string[] = []
   let boundMiss: string | undefined
-  if (msg.reference?.messageId) {
+  if (msg.reference?.messageId && !directChannelOwner(wsDepsRef, msg.channelId)) {
     try {
       const ref = await msg.channel.messages.fetch(msg.reference.messageId)
       const m = ref.author.id === client.user?.id ? ref.content.match(/^\*\*\[([^\]\s]+) →/) : null
       if (m) {
         const asker = m[1]
+        if (swarmConfig.isConfigured()) {
+          const askerSwarm = knownSwarm(wsDepsRef, asker) ?? 'default'
+          if (askerSwarm !== chSwarm && !swarmConfig.isCrossSwarm(asker)) {
+            await msg.reply(`not delivered to ${asker}: session is not in swarm ${chSwarm}.`).catch(() => {})
+            return
+          }
+        }
         const target = inboxes.approvalTarget(ref.id)
         const held = deliverFn(wsDepsRef, asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id, question_id: ref.id }, target)
         if (held) delivered = [asker]
@@ -409,10 +418,13 @@ async function handleBusInbound(msg: Message): Promise<void> {
   if (boundMiss) {
     routeNote = `not delivered to ${boundMiss}: that session is offline and has no conversation id. Reply again when they are back, or name a live session with @name.`
   } else if (delivered.length === 0) {
-    const bound = msg.reference?.messageId ? { ...fullMeta, unbound_reply: msg.reference.messageId } : fullMeta
-    const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
+    const bound = msg.reference?.messageId
+      ? { ...fullMeta, unbound_reply: msg.reference.messageId, in_reply_to: msg.reference.messageId }
+      : fullMeta
+    const core = swarmChannels.isSwarmCoreChannel(msg.channelId)
+    const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL || core?.role === 'general' || core?.role === 'human'
     try {
-      delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : channelSubscribers(wsDepsRef, msg.channelId), wsDepsRef)
+      delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : channelSubscribers(wsDepsRef, msg.channelId), wsDepsRef, chSwarm)
     } catch (err) {
       await msg.reply(inboxError(err)).catch(() => {})
       return
@@ -429,7 +441,13 @@ async function handleBusInbound(msg: Message): Promise<void> {
 }
 
 async function handleInbound(msg: Message): Promise<void> {
-  if (BUS_CHANNEL && (msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL || subs.channels().has(msg.channelId))) return handleBusInbound(msg)
+  const route = await swarmChannels.classifyInbound(
+    msg.channelId,
+    id => Boolean(BUS_CHANNEL && (id === BUS_CHANNEL || id === HUMAN_CHANNEL || directChannelOwner(wsDepsRef, id) || subs.channels().has(id))),
+    msg.channel.isDMBased(),
+  )
+  if (route === 'bus') return handleBusInbound(msg)
+  if (route === 'drop') return
   process.stderr.write(`discord: inbound from ${msg.author.username}: "${msg.content.slice(0, 50)}" action=`)
   const result = await gate(msg)
   process.stderr.write(`${result.action}\n`)
@@ -518,13 +536,23 @@ client.on('interactionCreate', interaction => {
     )
     return
   }
-  // Handle permission button clicks
+  // Handle permission button clicks (when swarm config is active, honoured only for users in allowFrom, §10.5, m2)
   if (interaction.isButton()) {
     const customId = interaction.customId
     if (customId.startsWith('perm_yes_') || customId.startsWith('perm_no_')) {
+      const configured = swarmConfig.isConfigured()
+      let allowFrom: readonly string[] | undefined
+      if (configured) {
+        allowFrom = loadAccess().allowFrom
+        if (!allowFrom.includes(interaction.user.id)) {
+          interaction.reply({ content: 'Not authorised to respond to permission requests.', ephemeral: true })
+            .catch((e: unknown) => process.stderr.write(`discord: permission button deny reply failed: ${e instanceof Error ? e.message : String(e)}\n`))
+          return
+        }
+      }
+      const allowed = handlePermissionButton(customId, interaction.user.id, allowFrom)
+      if (!allowed) return
       const isAllow = customId.startsWith('perm_yes_')
-      const requestId = customId.replace(/^perm_(yes|no)_/, '')
-      handlePermissionButton(customId)
       interaction.update({
         content: interaction.message.content + `\n\n> **${isAllow ? 'Allowed' : 'Denied'}**`,
         components: [],
@@ -533,11 +561,18 @@ client.on('interactionCreate', interaction => {
   }
 })
 
+client.on('channelUpdate', () => {
+  if (swarmConfig.isConfigured() && swarmChannels.isInitialFetchDone()) {
+    swarmChannels.sweep()
+  }
+})
+
 client.once('clientReady', c => {
   process.stderr.write(`discord channel: gateway connected as ${c.user.tag}\n`)
   registerSlashCommands(c).catch((e: unknown) =>
     process.stderr.write(`discord: registerSlashCommands failed: ${e instanceof Error ? e.message : String(e)}\n`),
   )
+  void swarmChannels.startClientReady(getStartupGuildLike)
   updatePresence()
 })
 
@@ -545,9 +580,28 @@ client.once('clientReady', c => {
 setInterval(() => checkApprovals(client), 5000).unref()
 
 // Periodic buffer persistence
+const agentChannelInterval = setInterval(() => {
+  if (client.isReady()) void agentChannels?.maintain(agentChannelOps, name => onlineBusAgent(wsDepsRef, name))
+    .catch(() => process.stderr.write('agent channels: maintenance failed\n'))
+}, 5_000)
+agentChannelInterval.unref()
+
 const bufferInterval = setInterval(() => {
   sessions.saveBuffers().catch(() => {})
 }, 30_000)
+
+// A name lease lasts as long as its holder stays connected (name-leases.ts)
+const leaseInterval = setInterval(() => sessions.refreshLeases(), 60_000)
+
+// Poll swarms-config.json every 5 s on mtime+size (§1, §10.4, §10.5)
+const stopSwarmWatch = swarmConfig.startWatching(diff => {
+  applySwarmConfigReload(wsDepsRef, diff)
+  if (BUS_CHANNEL && client.isReady()) {
+    void swarmChannels.onConfigReload(getGuildLike, diff).catch((e: unknown) => {
+      process.stderr.write(`discord: swarm channel reload failed: ${e instanceof Error ? e.message : String(e)}\n`)
+    })
+  }
+}, 5_000)
 
 // ============================================================
 // Shutdown
@@ -559,6 +613,10 @@ async function shutdown(): Promise<void> {
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
   clearInterval(bufferInterval)
+  clearInterval(agentChannelInterval)
+  clearInterval(leaseInterval)
+  stopSwarmWatch()
+  swarmChannels.stop()
   // Clear all typing intervals
   typingManager.stopAll()
   try {

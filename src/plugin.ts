@@ -306,7 +306,13 @@ export async function startPlugin(): Promise<void> {
   delete process.env.DISCORD_SESSION_NAME
   delete process.env.DISCORD_INSTANCE_ID
   const explicitAlias = new BusAlias(getStateDir(), instanceId)
-  const sessionName = explicitAlias.name || configuredName || generatedName(alias ?? namingCtx.dirName)
+  // A `-N` name the router handed out because this instance's own name was taken. It is
+  // asked for again as it is, so the instance keeps it across restarts. It is kept apart
+  // from the explicit alias (bus_rename, a /name), which always wins over it.
+  const assignedAlias = new BusAlias(getStateDir(), instanceId, 'assigned-aliases')
+  // What this instance calls itself when nothing is saved, read live: a /name can change it.
+  const sessionBase = (): string => configuredName || generatedName(claudeAlias() ?? namingCtx.dirName)
+  const sessionName = explicitAlias.name || assignedAlias.name || sessionBase()
 
   // Inbox: every inbound message is also queued here so clients without channel push
   // (Codex, agy) can read them with the check_inbox tool.
@@ -391,6 +397,10 @@ export async function startPlugin(): Promise<void> {
 
   let currentWs: WebSocket | null = null
   let currentName = sessionName
+  function forget(store: BusAlias): void {
+    if (!store.name) return
+    try { store.clear() } catch { process.stderr.write('discord plugin: could not forget a saved bus name\n') }
+  }
   let renamePending = false
   let registrationError: string | undefined
   let reconnectAttempt = 0
@@ -446,18 +456,21 @@ export async function startPlugin(): Promise<void> {
     // secret needs no agent restart.
     reloadClientEnv()
     explicitAlias.restore()
+    // A name the router assigned is asked for as it is and not taken over: the router holds
+    // it for this instance, and taking it over would be a claim on somebody else's name.
+    const assigned = !explicitAlias.name && !!assignedAlias.name
     // Don't auto-spawn the router — it's a Discord bot that must be started manually.
     // The plugin just connects to it.
     try {
       const conversationId = process.env.DISCORD_CONVERSATION_ID || claude?.sessionId
       const { ws, registeredName, canReclaim } = await connectToRouter({
         wsPort,
-        name: explicitAlias.name ?? currentName,
+        name: explicitAlias.name ?? assignedAlias.name ?? currentName,
         projectPath: cwd,
         instanceId,
         host: hostLabel,
         agent,
-        ...((retired || explicitAlias.name) ? { takeover: false, reclaimOnly: retired } : configuredName && { takeover: true }),
+        ...((retired || explicitAlias.name) ? { takeover: false, reclaimOnly: retired } : assigned ? { takeover: false } : configuredName && { takeover: true }),
         onRenamed: name => { currentName = name },
         onMessage,
         pendingRequests,
@@ -481,6 +494,19 @@ export async function startPlugin(): Promise<void> {
       }
       if (explicitAlias.name && explicitAlias.name !== registeredName) {
         try { explicitAlias.save(registeredName) } catch { process.stderr.write('discord plugin: could not save the registered bus alias\n') }
+      }
+      if (explicitAlias.name) {
+        // the explicit alias always wins: there is no assigned name left to remember
+        forget(assignedAlias)
+      } else if (registeredName !== sessionBase()) {
+        // the router gave another name, a `-N` one because this instance's own was taken:
+        // ask for that again next time, so it is this instance's from then on
+        if (assignedAlias.name !== registeredName) {
+          try { assignedAlias.save(registeredName) } catch { process.stderr.write('discord plugin: could not save the name the router assigned\n') }
+        }
+      } else {
+        // registered under the name this instance asks for by itself
+        forget(assignedAlias)
       }
       reconnectAttempt = 0
       process.stderr.write(`discord plugin: connected as "${registeredName}"\n`)
@@ -830,6 +856,7 @@ export async function startPlugin(): Promise<void> {
           try {
             const name = await sendToolRequest({ type: 'rename', name: args.name })
             if (aliasTimer) { clearInterval(aliasTimer); aliasTimer = null }
+            forget(assignedAlias)   // an explicit name replaces whatever the router had assigned
             try { explicitAlias.save(name) } catch {
               throw new Error(`Renamed to "${name}", but could not save it for a restart`)
             }
