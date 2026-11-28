@@ -66,53 +66,81 @@ export class NodeRegistry {
   nodeConnected(node: string): boolean { return this.nodes.has(node) }
 }
 
-export interface Claim { readonly task: string; readonly owner: string; readonly since: string; readonly note?: string }
+export interface Claim {
+  readonly task: string
+  readonly owner: string
+  readonly since: string
+  readonly note?: string
+  readonly swarm?: string
+}
 
-/** Atomic first-come task claims, so agents racing for the same request don't duplicate work. */
+/** Atomic first-come task claims, partitioned by `(swarm, task)` so swarms are isolated (§4). */
 export class Claims {
   private readonly map = new Map<string, Claim>()
   constructor(private readonly file?: string, private readonly ttlMs = 12 * 3600_000) {
     if (!file) return
-    try { for (const c of JSON.parse(readFileSync(file, 'utf8')) as Claim[]) this.map.set(c.task, c) } catch {}
+    try {
+      for (const c of JSON.parse(readFileSync(file, 'utf8')) as Claim[]) {
+        this.map.set(Claims.compositeKey(c.task, c.swarm), c)
+      }
+    } catch {}
   }
   static inStateDir(dir: string): Claims { return new Claims(join(dir, 'claims.json')) }
   static key(task: string): string { return task.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 200) }
+  private static compositeKey(task: string, swarm = 'default'): string {
+    const k = Claims.key(task)
+    return swarm === 'default' ? k : `${swarm}\0${k}`
+  }
   private expire(): void {
     const now = Date.now()
     for (const [k, c] of this.map) if (now - Date.parse(c.since) > this.ttlMs) this.map.delete(k)
   }
-  /** Claim `task` for `owner`. Returns the winning claim (yours if you got it or already had it). */
-  claim(task: string, owner: string, note?: string): { won: boolean; claim: Claim } {
+  /** Claim `task` for `owner` within `swarm`. Returns the winning claim (yours if you got it or already had it). */
+  claim(task: string, owner: string, note?: string, swarm = 'default'): { won: boolean; claim: Claim } {
     this.expire()
     const k = Claims.key(task)
-    const cur = this.map.get(k)
+    const ck = Claims.compositeKey(task, swarm)
+    const cur = this.map.get(ck)
     if (cur && cur.owner !== owner) return { won: false, claim: cur }
-    const c: Claim = cur ?? { task: k, owner, since: new Date().toISOString(), ...(note && { note }) }
-    this.map.set(k, c); this.save()
+    const c: Claim = cur ?? {
+      task: k, owner, since: new Date().toISOString(),
+      ...(note && { note }),
+      ...(swarm !== 'default' && { swarm }),
+    }
+    this.map.set(ck, c); this.save()
     return { won: true, claim: c }
   }
-  /** Release (owner only), or hand over to `to`. */
-  release(task: string, owner: string, to?: string): { ok: boolean; claim?: Claim } {
-    const k = Claims.key(task)
-    const cur = this.map.get(k)
+  /** Release (owner only), or hand over to `to`, within `swarm`. */
+  release(task: string, owner: string, to?: string, swarm = 'default'): { ok: boolean; claim?: Claim } {
+    const ck = Claims.compositeKey(task, swarm)
+    const cur = this.map.get(ck)
     if (!cur) return { ok: true }
     if (cur.owner !== owner) return { ok: false, claim: cur }
-    if (to) this.map.set(k, { ...cur, owner: to, since: new Date().toISOString() })
-    else this.map.delete(k)
+    if (to) this.map.set(ck, { ...cur, owner: to, since: new Date().toISOString() })
+    else this.map.delete(ck)
     this.save()
-    return { ok: true, claim: this.map.get(k) }
+    return { ok: true, claim: this.map.get(ck) }
   }
-  list(): Claim[] { this.expire(); return [...this.map.values()] }
-  hasOwner(owner: string): boolean {
+  list(swarm?: string): Claim[] {
     this.expire()
-    for (const c of this.map.values()) if (c.owner === owner) return true
+    const all = [...this.map.values()]
+    return swarm === undefined ? all : all.filter(c => (c.swarm ?? 'default') === swarm)
+  }
+  hasOwner(owner: string, swarm?: string): boolean {
+    this.expire()
+    for (const c of this.map.values()) {
+      if (c.owner === owner && (swarm === undefined || (c.swarm ?? 'default') === swarm)) return true
+    }
     return false
   }
-  dropByOwner(owner: string): number {
+  dropByOwner(owner: string, swarm?: string): number {
     this.expire()
     let dropped = 0
     for (const [k, c] of this.map) {
-      if (c.owner === owner) { this.map.delete(k); dropped++ }
+      if (c.owner === owner && (swarm === undefined || (c.swarm ?? 'default') === swarm)) {
+        this.map.delete(k)
+        dropped++
+      }
     }
     if (dropped > 0) this.save()
     return dropped
