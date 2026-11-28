@@ -311,6 +311,9 @@ function toBunWsLike(ws: BunServerWebSocket): WsLike {
   }
 }
 
+const keepaliveTimer = setInterval(() => wsHandlers.sweep(), 5000)
+keepaliveTimer.unref()
+
 const wsServer = Bun.serve<WsData>({
   port: WS_PORT,
   hostname: WS_HOST,
@@ -324,6 +327,8 @@ const wsServer = Bun.serve<WsData>({
     return undefined as unknown as Response
   },
   websocket: {
+    sendPings: true,
+    idleTimeout: 75,
     // Inline attachments (base64) can be several MB.
     maxPayloadLength: 64 * 1024 * 1024,
     open(ws) {
@@ -558,6 +563,7 @@ async function shutdown(): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
+  clearInterval(keepaliveTimer)
   clearInterval(bufferInterval)
   // Clear all typing intervals
   typingManager.stopAll()

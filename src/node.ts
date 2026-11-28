@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { clientKeepalive } from './keepalive.js'
 /**
  * agent-bus node — runs a machine's agents headless and wakes them when bus messages arrive.
  *
@@ -344,6 +345,7 @@ async function main(): Promise<void> {
     if (!url) { log(`no DISCORD_ROUTER_URL in ${ENV_FILE}; retrying in 30s`); setTimeout(connect, 30_000); return }
     ws = new WebSocket(url)
     ws.onopen = () => {
+      clientKeepalive(ws!)
       attempt = 0
       ws!.send(JSON.stringify({ type: 'registerNode', node, secret: env.DISCORD_ROUTER_SECRET,
         ...(env.DISCORD_NODE_SECRET && { nodeSecret: env.DISCORD_NODE_SECRET }),

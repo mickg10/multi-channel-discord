@@ -1,3 +1,4 @@
+import { clientKeepalive } from './keepalive.js'
 /**
  * MCP plugin — runs inside each Claude Code instance.
  * Connects to the router via WebSocket, exposes reply/react/edit/download/fetch tools to Claude.
@@ -143,6 +144,7 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
 
     let registered = false
     ws.onopen = () => {
+      clientKeepalive(ws)
       // process.ppid IS the Claude Code process (confirmed via process tree).
       // Multiple MCP spawns from the same Claude Code share this PID.
       // Claude Code spawns several MCP instances per session (same ppid) and they must merge.

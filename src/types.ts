@@ -221,6 +221,7 @@ export interface WsNodeMcpResult {
 }
 
 export type PluginToRouterMessage =
+  | { type: 'ping' | 'pong' }
   | WsMcpOp
   | WsNodeMcpResult
   | WsClaimOp
@@ -300,6 +301,7 @@ export interface WsReplaced {
 }
 
 export type RouterToPluginMessage =
+  | { type: 'ping' | 'pong' }
   | WsReplaced
   | WsMessage
   | WsRegistered
