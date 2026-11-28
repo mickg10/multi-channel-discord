@@ -20,3 +20,11 @@ test('retired tools fail before sending; repeated refusal keeps timestamp and lo
   state.retire('claude@mac:x')
   expect(logs).toHaveLength(2)
 })
+
+
+test('superseded conversation does not invite reclaim', () => {
+  const state = new BusOwnership(() => {})
+  state.retire('codex@mac:old', new Date('2026-11-28T00:00:00Z'), false)
+  expect(state.error()).toBe('a newer conversation superseded bus name codex@mac:old at 2026-11-28T00:00:00.000Z; this thread is offline')
+  expect(state.error()).not.toContain('reclaim')
+})

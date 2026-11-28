@@ -475,7 +475,7 @@ export async function startPlugin(): Promise<void> {
         onPermissionVerdict,
         onReplaced: (n: string, reclaim: boolean) => {
           reclaimAllowed = reclaim
-          ownership.retire(n)
+          ownership.retire(n, new Date(), reclaim)
           for (const pending of pendingRequests.values()) {
             clearTimeout(pending.timer)
             pending.reject(new Error(ownership.error()!))
