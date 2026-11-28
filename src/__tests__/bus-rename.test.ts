@@ -184,8 +184,13 @@ globalThis.setTimeout = (cb, ms, ...args) => schedule(cb, ms === 60000 ? 100 : m
     }))
     await waitFor(async () => {
       const status = await abandoned.callTool({ name: 'bus_sessions', arguments: {} })
-      return status.isError === true && JSON.stringify(status.content).includes('superseded')
+      return status.isError === true && JSON.stringify(status.content).includes('is held by another instance since')
     })
+    for (const name of ['check_inbox', 'bus_post', 'channel_list', 'reply']) {
+      const denied = await abandoned.callTool({ name, arguments: {} })
+      expect(denied.isError).toBe(true)
+      expect(JSON.stringify(denied.content)).toContain('reconnect this MCP (/mcp) to reclaim')
+    }
     handlers.close(successor.ws)
     const count = registrations.length
     await new Promise(resolve => setTimeout(resolve, 250))

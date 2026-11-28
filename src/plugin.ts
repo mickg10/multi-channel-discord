@@ -1,4 +1,5 @@
 import { clientKeepalive } from './keepalive.js'
+import { BusOwnership } from './bus-ownership.js'
 /**
  * MCP plugin — runs inside each Claude Code instance.
  * Connects to the router via WebSocket, exposes reply/react/edit/download/fetch tools to Claude.
@@ -181,6 +182,7 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
           else pending.reject(new Error(msg.data))
         }
       } else if (msg.type === 'takeover_refused') {
+        onReplaced?.(msg.name, true)
         clearTimeout(timeout)
         ws.close()
         reject(new Error('takeover_refused'))
@@ -192,7 +194,8 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
           reject(new Error('name_occupied'))
         }
       } else if (msg.type === 'error') {
-        process.stderr.write(`discord plugin: router error: ${msg.message}\n`)
+        if (msg.message === 'takeover_refused') onReplaced?.(name, true)
+        else process.stderr.write(`discord plugin: router error: ${msg.message}\n`)
         if (!registered && (msg.message.startsWith('register rejected') || msg.message === 'takeover_refused' || msg.message === 'name_occupied')) {
           clearTimeout(timeout)
           ws.close()
@@ -402,6 +405,7 @@ export async function startPlugin(): Promise<void> {
   let reconnectAttempt = 0
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined
   let shuttingDown = false
+  const ownership = new BusOwnership()
   let retired = false
   let routerSupportsReclaim = false
   let reclaimAllowed = true
@@ -433,6 +437,7 @@ export async function startPlugin(): Promise<void> {
   /** Send a WS message and await a tool result response. */
   function sendToolRequest(msg: Record<string, unknown>): Promise<string> {
     return new Promise((resolve, reject) => {
+      ownership.assertAvailable()
       if (!currentWs || currentWs.readyState !== WebSocket.OPEN) {
         reject(new Error('Not connected to router'))
         return
@@ -470,7 +475,12 @@ export async function startPlugin(): Promise<void> {
         onPermissionVerdict,
         onReplaced: (n: string, reclaim: boolean) => {
           reclaimAllowed = reclaim
-          process.stderr.write(`discord plugin: name "${n}" taken over${reclaim ? '; waiting for it to become free' : '; conversation superseded'}\n`)
+          ownership.retire(n)
+          for (const pending of pendingRequests.values()) {
+            clearTimeout(pending.timer)
+            pending.reject(new Error(ownership.error()!))
+          }
+          pendingRequests.clear()
           retired = true
           ackWake()
           try { currentWs?.close() } catch {}
@@ -481,6 +491,8 @@ export async function startPlugin(): Promise<void> {
       routerSupportsReclaim = canReclaim
       currentName = registeredName
       retired = false
+      ownership.clear()
+      registrationError = undefined
       reclaimAllowed = true
       if (explicitAlias.name && configuredName && explicitAlias.name !== configuredName) {
         process.stderr.write(`discord plugin: using saved bus alias "${registeredName}" (overrides DISCORD_SESSION_NAME)\n`)
@@ -513,7 +525,7 @@ export async function startPlugin(): Promise<void> {
       }
     } catch (err: unknown) {
       if (err instanceof Error && err.message === 'takeover_refused') {
-        if (!retired) process.stderr.write('discord plugin: takeover refused; retrying reclaim-only after 60 seconds\n')
+        ownership.retire(currentName)
         retired = true
         routerSupportsReclaim = true
         if (!shuttingDown) scheduleReconnect()
@@ -557,6 +569,7 @@ export async function startPlugin(): Promise<void> {
   }
 
   function sendWs(msg: string): void {
+    ownership.assertAvailable()
     if (currentWs && currentWs.readyState === WebSocket.OPEN) {
       currentWs.send(msg)
     }
@@ -805,13 +818,8 @@ export async function startPlugin(): Promise<void> {
     if (registrationError) {
       return { content: [{ type: 'text', text: registrationError }], isError: true }
     }
-    if (retired) {
-      return { content: [{ type: 'text', text: !reclaimAllowed
-        ? `A newer conversation superseded the bus name "${currentName}".`
-        : routerSupportsReclaim
-        ? `Waiting to reclaim the bus name "${currentName}". Discord tools are unavailable until the active holder disconnects.`
-        : `A newer session took over the bus name "${currentName}". This router does not support automatic reclaim.` }], isError: true }
-    }
+    const ownershipError = ownership.error()
+    if (ownershipError) return { content: [{ type: 'text', text: ownershipError }], isError: true }
     try {
       switch (req.params.name) {
         case 'reply': {
