@@ -324,6 +324,7 @@ export interface WsLike {
 }
 
 export interface WsHandlers {
+  pong(ws: WsLike): void
   sweep(now?: number): void
   open(ws: WsLike): void
   message(ws: WsLike, msg: string | Buffer): void
@@ -350,6 +351,11 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
   const clock = deps.now ?? Date.now
   const connections = new Map<WsData, { ws: WsLike; seen: number; ping: number; app: boolean }>()
   return {
+    pong(ws: WsLike): void {
+      ws.data.lastPongAt = clock()
+      const connection = connections.get(ws.data)
+      if (connection) connection.seen = clock()
+    },
     sweep(now = clock()): void {
       for (const [data, c] of connections) {
         if (c.app && now - c.seen > SILENCE_MS) {
@@ -877,11 +883,6 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         ? parsed.agent.toLowerCase() : undefined
       const conversationId = typeof parsed.conversationId === 'string' ? parsed.conversationId : ''
       const incumbent = deps.sessions.registeredIdentity(normalized)
-      if (incumbent && incumbent.instanceId !== parsed.instanceId &&
-          deps.sessions.answeredRecently(normalized, Date.now(), SILENCE_MS)) {
-        ws.send(JSON.stringify({ type: 'takeover_refused', name: normalized, reason: 'holder_live' }))
-        return
-      }
       if (incumbent && parsed.reclaimOnly === true) { sendError(ws, 'name_occupied'); return }
       const takeover = parsed.takeover === true || (parsed.takeover === undefined && parsed.mode === 'pull')
       if (incumbent && takeover) {
@@ -890,6 +891,13 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         // Older clients can prove continuity by the instance already in the slot.
         if (!valid && !(sameInstance && parsed.agent === undefined)) {
           sendError(ws, 'takeover_refused')
+          return
+        }
+        if (!sameInstance && deps.sessions.answeredRecently(normalized, (deps.now ?? Date.now)(), SILENCE_MS)) {
+          process.stderr.write(JSON.stringify({ event: 'takeover_refused', reason: 'holder_live', name: normalized,
+            instanceId: parsed.instanceId ?? null, host: host ?? null, agent: agent ?? null,
+            remoteAddress: (ws.data as WsData & { remoteAddress?: string }).remoteAddress ?? null }) + '\n')
+          ws.send(JSON.stringify({ type: 'takeover_refused', name: normalized, reason: 'holder_live' }))
           return
         }
         const sameConversation = !!conversationId && conversationId === incumbent.conversationId

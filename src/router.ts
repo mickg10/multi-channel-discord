@@ -337,6 +337,9 @@ const wsServer = Bun.serve<WsData>({
     message(ws, msg) {
       wsHandlers.message(toBunWsLike(ws), msg as string | Buffer)
     },
+    pong(ws) {
+      wsHandlers.pong(toBunWsLike(ws))
+    },
     close(ws) {
       wsHandlers.close(toBunWsLike(ws))
     },

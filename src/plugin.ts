@@ -513,8 +513,10 @@ export async function startPlugin(): Promise<void> {
       }
     } catch (err: unknown) {
       if (err instanceof Error && err.message === 'takeover_refused') {
-        registrationError = 'The router refused to take over the pinned bus alias. Check DISCORD_AGENT and DISCORD_SESSION_NAME.'
-        process.stderr.write(`discord plugin: ${registrationError}\n`)
+        if (!retired) process.stderr.write('discord plugin: takeover refused; retrying reclaim-only after 60 seconds\n')
+        retired = true
+        routerSupportsReclaim = true
+        if (!shuttingDown) scheduleReconnect()
         return
       }
       if (err instanceof Error && err.message === 'register rejected: invalid_bus_alias') {
