@@ -19,7 +19,10 @@ import type { WsMcpOp, PluginToRouterMessage, WsRegistered, WsRenamed, WsError, 
 import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
-import { isBusAlias } from './bus-alias.js'
+import type { AgentChannelRegistration, AgentChannels } from './agent-channels.js'
+import { BUS_ALIAS_MAX, isBusAlias } from './bus-alias.js'
+import { DEFAULT_SWARM, type SwarmConfig, type SwarmConfigDiff } from './swarm-config.js'
+import { holderKey, type SwarmJournal } from './swarm-journal.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
@@ -63,6 +66,8 @@ export interface WsData {
   gateway?: { user: string; agents: Map<string, Target> }
   /** Register-time instance id of the client connection (grant binding). */
   instanceId?: string
+  /** Raw swarm string sent on register (kept for config-reload re-normalisation, §2). */
+  requestedSwarm?: string
 }
 
 export interface WsDeps {
@@ -86,6 +91,7 @@ export interface WsDeps {
   /** Channel subscriptions (agent bus beyond the default channel). */
   readonly subs?: Subscriptions
   readonly channelOps?: ChannelOps
+  readonly agentChannels?: AgentChannels
   /** Durable per-agent inboxes and node-owned (headless) agents. */
   readonly inboxes?: Inboxes
   readonly nodes?: NodeRegistry
@@ -126,6 +132,12 @@ export interface WsDeps {
   readonly humanMail?: HumanMail
   /** conversationId from register. Survives disconnect so a held approval keeps its owner. */
   readonly conversations?: Conversations
+  /** Multi-swarm configuration (`swarms-config.json`). Absent/unconfigured = everything is default. */
+  readonly swarmConfig?: SwarmConfig
+  /** Name -> swarm journal (`agent-swarms.json`). */
+  readonly swarmJournal?: SwarmJournal
+  /** Resolve a swarm's `#general` channel id (for returning undelivered mail on move). */
+  readonly swarmGeneralChannel?: (swarm: string) => string | undefined
 }
 
 /** A file sent inline by a client (the router is remote: it must never open client-named paths). */
@@ -169,12 +181,129 @@ function liveSession(deps: Readonly<WsDeps>, name: string): boolean {
   return deps.sessions.getSessions().some(session => session.name === name)
 }
 
+export function directChannelOwner(deps: Readonly<WsDeps>, channelId: string): string | undefined {
+  const owner = deps.agentChannels?.owner(channelId)
+  return owner ? deps.channelOwners?.get(channelId) ?? owner : undefined
+}
+
+export function onlineBusAgent(deps: Readonly<WsDeps>, name: string): boolean {
+  const target = deps.inboxes?.target(name)
+  return target && deps.inboxes ? !!nativeConnection(deps.inboxes, target) : liveSession(deps, name) || !!deps.nodes?.get(name)
+}
+
+export function rewriteGeneratedSwarmName(
+  baseName: string,
+  swarm: string,
+): { ok: true; name: string } | { ok: false; error: 'name too long' } {
+  if (swarm === DEFAULT_SWARM) return { ok: true, name: baseName }
+  const at = baseName.indexOf('@')
+  const colon = baseName.indexOf(':', at === -1 ? 0 : at)
+  const rewritten = colon === -1
+    ? `${swarm}/${baseName}`
+    : `${baseName.slice(0, colon + 1)}${swarm}/${baseName.slice(colon + 1)}`
+  if (rewritten.length > BUS_ALIAS_MAX) return { ok: false, error: 'name too long' }
+  return { ok: true, name: rewritten }
+}
+
+export function knownOffline(deps: Readonly<WsDeps>, name: string): boolean {
+  return Boolean(
+    deps.nodes?.get(name) ||
+    deps.inboxes?.hasName(name) ||
+    deps.subs?.hasAny(name) ||
+    deps.agentChannels?.hasOwner(name) ||
+    deps.claims?.hasOwner(name),
+  )
+}
+
+export function knownSwarm(deps: Readonly<WsDeps>, name: string): string | undefined {
+  const live = deps.sessions.getSwarm(name)
+  if (live !== undefined) return live
+  const journaled = deps.swarmJournal?.get(name)?.swarm
+  if (journaled !== undefined) return journaled
+  return knownOffline(deps, name) ? DEFAULT_SWARM : undefined
+}
+
+function isSwarmCollision(deps: Readonly<WsDeps>, candidate: string, targetSwarm: string, holder: string | undefined): boolean {
+  const ks = knownSwarm(deps, candidate)
+  if (ks === undefined || ks === targetSwarm) return false
+  const entry = deps.swarmJournal?.get(candidate)
+  if (holder && entry?.holder && entry.holder === holder) return false
+  return true
+}
+
+function cleanupJournalEntry(deps: Readonly<WsDeps>, name: string): void {
+  if (!deps.swarmJournal) return
+  // Use the same predicate as knownOffline so a remembered conversation or other offline state
+  // never loses its journal entry and falls back to 'default' on reconnect (B1).
+  if (liveSession(deps, name) || knownOffline(deps, name)) return
+  deps.swarmJournal.delete(name)
+}
+
+/** Entry ids currently being reposted to an old swarm's #general after a swarm move (excluded from new-swarm delivery). */
+const flushingMovedInboxIds = new Set<string>()
+
+function performSwarmMove(deps: Readonly<WsDeps>, name: string, oldSwarm: string, newSwarm: string): void {
+  deps.subs?.clear(name)
+  deps.claims?.dropByOwner(name)
+  const entries = deps.inboxes?.legacy(name) ?? []
+  if (entries.length === 0) return
+  const oldGeneral = oldSwarm === DEFAULT_SWARM ? deps.busChannelId : deps.swarmGeneralChannel?.(oldSwarm)
+  // If old general cannot be resolved, leave rows unacked rather than dropping them silently (M2).
+  if (!oldGeneral) return
+  for (const entry of entries) {
+    flushingMovedInboxIds.add(entry.id)
+    const from = entry.meta.from ?? entry.meta.user ?? 'unknown'
+    const body = `**[router → undelivered]** (${name} moved ${oldSwarm} → ${newSwarm}; originally from ${from}):\n${entry.content}`
+    void sendToDiscord(deps.client, oldGeneral, body).then(ok => {
+      if (ok) deps.inboxes?.accept([entry.id])
+    }).finally(() => {
+      flushingMovedInboxIds.delete(entry.id)
+    })
+  }
+}
+
+/** Close live sessions whose swarm changed or whose alias left candidates/crossSwarm on config reload (§10.5). */
+export function applySwarmConfigReload(deps: Readonly<WsDeps>, diff: SwarmConfigDiff): string[] {
+  const cfg = deps.swarmConfig
+  if (!cfg) return []
+  const closed: string[] = []
+  for (const slot of deps.sessions.getAllSlotInfos()) {
+    const leftPrivileged = diff.leftCandidates.has(slot.name) || diff.leftCrossSwarm.has(slot.name)
+    const norm = cfg.normalizeSwarm(slot.requestedSwarm)
+    const swarmChanged = !norm.ok || norm.swarm !== slot.swarm
+    const candSwarm = cfg.candidateSwarm(slot.name)
+    const invalidProtected =
+      (cfg.isCrossSwarm(slot.name) && slot.swarm !== DEFAULT_SWARM) ||
+      (candSwarm !== undefined && candSwarm !== slot.swarm)
+    if (!leftPrivileged && !swarmChanged && !invalidProtected) continue
+    deps.sessions.closeSessionSockets(slot.name)
+    pullSessions.delete(slot.name)
+    offlineDirectChannel(deps, slot.name)
+    cleanupJournalEntry(deps, slot.name)
+    closed.push(slot.name)
+  }
+  if (closed.length > 0) deps.onSessionChange?.()
+  return closed
+}
+
+function observeDirectChannel(deps: Readonly<WsDeps>, info: AgentChannelRegistration, collision = false): void {
+  const { name } = info
+  if (!deps.agentChannels || collision || !isBusAlias(name) ||
+      !aliasAllowedOnHost(name, qualifiedAliasHost(name)) || protectedDirectChannelAlias(deps, name)) return
+  deps.agentChannels.register(info)
+}
+
+function offlineDirectChannel(deps: Readonly<WsDeps>, name: string): void {
+  if (!onlineBusAgent(deps, name)) deps.agentChannels?.disconnect(name)
+}
+
 function admission(deps: Readonly<WsDeps>, name: string, meta: ChannelMeta): ChannelMeta | undefined {
   const target = deps.inboxes?.target(name)
   const live = liveSession(deps, name)
   const node = deps.nodes?.get(name)
   const conv = target?.conv ?? deps.conversations?.get(name) ?? (!live ? deps.inboxes?.conversation(name) : undefined)
-  if (!target && !live && !node && !conv) return undefined
+  const direct = meta.chat_id && directChannelOwner(deps, meta.chat_id) === name
+  if (!target && !live && !node && !conv && !direct) return undefined
   if (meta.conversation_id && target && meta.conversation_id !== target.conv) return undefined
   return conv && (target || (meta.from_human === 'true' && meta.question_id)) ? { ...meta, conversation_id: conv } : meta
 }
@@ -372,17 +501,20 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
       if (ws.data.gateway && ws.data.nodeName && deps.inboxes) {
         const hosts = gateways.get(deps.inboxes)
         if (hosts?.get(ws.data.nodeName)?.data === ws.data) hosts.delete(ws.data.nodeName)
+        const aliases = [...ws.data.gateway.agents.keys()]
         ws.data.gateway = undefined
         ws.data.nodeName = undefined
         ws.data.authed = false
+        for (const alias of aliases) offlineDirectChannel(deps, alias)
         return
       }
       if (ws.data.nodeName && ws.data.sendCallback) {
+        const names = deps.nodes?.list().filter(agent => agent.node === ws.data.nodeName).map(agent => agent.name) ?? []
         deps.nodes?.unregister(ws.data.nodeName, ws.data.sendCallback)
+        for (const name of names) offlineDirectChannel(deps, name)
         deps.onSessionChange?.()
         return
       }
-      if (ws.data.sessionName) pullSessions.delete(ws.data.sessionName)
       // Clean up any pending permission requests associated with this WS
       for (const [reqId, reqWs] of permissionSessions) {
         if (reqWs === ws) {
@@ -393,20 +525,35 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
       }
 
       if (ws.data.sessionName) {
-        const isPrimary = ws.data.sendCallback
-          ? deps.sessions.isPrimarySender(ws.data.sessionName, ws.data.sendCallback)
-          : true
-
-        if (ws.data.sendCallback) {
-          deps.sessions.cleanupSender(ws.data.sendCallback)
-        }
-
-        // Only deregister the session if this WS is the primary sender.
-        // Duplicate connections (extraSends) just remove their callback.
-        if (isPrimary) {
-          try {
-            deps.sessions.deregisterSession(ws.data.sessionName)
-          } catch {}
+        const closingName = ws.data.sessionName
+        if (!deps.swarmConfig?.isConfigured()) {
+          // Exact pre-multi-swarm disconnect semantics when no config is present (M1).
+          pullSessions.delete(closingName)
+          const isPrimary = ws.data.sendCallback
+            ? deps.sessions.isPrimarySender(closingName, ws.data.sendCallback)
+            : true
+          if (ws.data.sendCallback) deps.sessions.cleanupSender(ws.data.sendCallback, ws)
+          if (isPrimary) {
+            try { deps.sessions.deregisterSession(closingName) } catch {}
+          }
+          offlineDirectChannel(deps, closingName)
+          cleanupJournalEntry(deps, closingName)
+        } else {
+          let deregistered = false
+          if (ws.data.sendCallback) {
+            deregistered = deps.sessions.removeSocket(closingName, ws.data.sendCallback, ws)
+            deps.sessions.cleanupSender(ws.data.sendCallback, ws)
+          } else {
+            try {
+              deps.sessions.deregisterSession(closingName)
+              deregistered = true
+            } catch {}
+          }
+          if (deregistered) {
+            pullSessions.delete(closingName)
+            offlineDirectChannel(deps, closingName)
+            cleanupJournalEntry(deps, closingName)
+          }
         }
         ws.data.sessionName = null
         ws.data.sendCallback = null
@@ -440,15 +587,29 @@ function takeoverKindMatches(name: string, agent: string, incumbent?: string): b
   return kindAndProfile === agent || kindAndProfile.startsWith(agent + '-')
 }
 
-function protectedRenameAlias(deps: Readonly<WsDeps>, name: string): boolean {
+function matchesProtectedNames(names: readonly string[], name: string): boolean {
   const lower = name.toLowerCase()
-  const names = [
-    ...(deps.admins ?? []), ...(deps.channelOwners?.values() ?? []), ...(deps.subs?.channelOwnerAliases() ?? []),
-  ]
   return names.some(alias => {
     const protectedName = alias.toLowerCase()
     return lower === protectedName || (lower.startsWith(protectedName) && /^(?:-\d+)+$/.test(lower.slice(protectedName.length)))
   })
+}
+
+function protectedRenameAlias(deps: Readonly<WsDeps>, name: string): boolean {
+  const names = [
+    ...(deps.admins ?? []), ...(deps.channelOwners?.values() ?? []), ...(deps.subs?.channelOwnerAliases() ?? []),
+    ...(deps.swarmConfig?.allProtectedAliases() ?? []),
+  ]
+  return matchesProtectedNames(names, name)
+}
+
+/** Excludes admins, channel owners, and master candidates — NOT crossSwarm sessions (§10.5). */
+function protectedDirectChannelAlias(deps: Readonly<WsDeps>, name: string): boolean {
+  const names = [
+    ...(deps.admins ?? []), ...(deps.channelOwners?.values() ?? []), ...(deps.subs?.channelOwnerAliases() ?? []),
+    ...(deps.swarmConfig?.allCandidateAliases() ?? []),
+  ]
+  return matchesProtectedNames(names, name)
 }
 
 function gatewayAliasAllowed(deps: Readonly<WsDeps>, alias: string, host: string): boolean {
@@ -523,6 +684,13 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
       reply(false, 'alias_already_registered')
       return
     }
+    const existingSwarm = knownSwarm(deps, frame.alias)
+    const candSwarm = deps.swarmConfig?.candidateSwarm(frame.alias)
+    if ((existingSwarm !== undefined && existingSwarm !== DEFAULT_SWARM) ||
+        (candSwarm !== undefined && candSwarm !== DEFAULT_SWARM)) {
+      reply(false, 'cross_swarm')
+      return
+    }
     const target: Target = { host, user: gateway.user, kind: frame.kind, conv: frame.conv, alias: frame.alias }
     const alreadyRegistered = [...gateway.agents.values()].some(agent => identityKey(agent) === identityKey(target))
     const inheritSubscriptions = inboxes.canInheritLegacy(target)
@@ -530,6 +698,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     if (inheritSubscriptions) deps.subs?.migrateToNative(target.alias, identityKey(target))
     gateway.agents.set(frame.alias, target)
     deps.conversations?.set(frame.alias, frame.conv)
+    deps.swarmJournal?.set(frame.alias, DEFAULT_SWARM)
     if (liveSession(deps, frame.alias)) {
       deps.sessions.notifySession(frame.alias, JSON.stringify({ type: 'replaced', name: frame.alias }))
       deps.sessions.deregisterSession(frame.alias)
@@ -537,6 +706,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     }
     ws.send(JSON.stringify({ type: 'agentRegistered', as: frame.alias, target }))
     reply(true, JSON.stringify({ as: frame.alias, target }))
+    observeDirectChannel(deps, { name: target.alias, kind: target.kind, host: target.host, swarm: DEFAULT_SWARM })
     if (alreadyRegistered) return
     for (const entry of inboxes.list(identityKey(target))) {
       if (entry.state === 'uncertain') wakeNative(deps, target, entry, true)
@@ -551,6 +721,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     if (target?.host !== host || target.user !== gateway.user) { reply(false, 'invalid_as'); return }
     inboxes.release(frame.alias)
     gateway.agents.delete(frame.alias)
+    offlineDirectChannel(deps, frame.alias)
     deps.conversations?.set(frame.alias, '')
     ws.send(JSON.stringify({ type: 'agentReleased', alias: frame.alias }))
     reply(true, '{}')
@@ -673,6 +844,18 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
           process.stderr.write(`discord channel: node "${parsed.node}" registered WITHOUT a node secret (set one; DISCORD_REQUIRE_NODE_SECRET=1 will reject this)\n`)
         }
       }
+      for (const a of parsed.agents) {
+        if (!a || typeof a.name !== 'string') {
+          sendError(ws, 'register rejected: invalid_agent_registration')
+          return
+        }
+        const ks = knownSwarm(deps, a.name)
+        const candSwarm = deps.swarmConfig?.candidateSwarm(a.name)
+        if ((ks !== undefined && ks !== DEFAULT_SWARM) || (candSwarm !== undefined && candSwarm !== DEFAULT_SWARM)) {
+          sendError(ws, `register rejected: cross_swarm (${a.name})`)
+          return
+        }
+      }
       ws.data.authed = true
       ws.data.nodeName = parsed.node
       const send = (m: string) => ws.send(m)
@@ -680,6 +863,8 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       deps.nodes.register(parsed.node, send, parsed.agents)
       ws.send(JSON.stringify({ type: 'nodeRegistered', node: parsed.node, agents: parsed.agents.map(a => a.name) }))
       for (const a of parsed.agents) {
+        deps.swarmJournal?.set(a.name, DEFAULT_SWARM)
+        observeDirectChannel(deps, { name: a.name, kind: a.kind, host: parsed.node, swarm: DEFAULT_SWARM })
         sendRulesOnce(deps, a.name)
         // Wake agents that have mail waiting from while the node was away.
         const n = deps.inboxes?.count(a.name) ?? 0
@@ -815,7 +1000,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         sendToolResult(ws, parsed.requestId, true, JSON.stringify([...live, ...native, ...asleep]))
       }
       break
-    case 'register':
+    case 'register': {
       if (!hasString(parsed, 'name') || !hasString(parsed, 'projectPath')) {
         sendError(ws, 'register requires name and projectPath')
         return
@@ -824,31 +1009,94 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         sendError(ws, 'register rejected: bad or missing router secret')
         return
       }
-      const normalized = parsed.name.trim()
+      const rawSwarm = typeof parsed.swarm === 'string' ? parsed.swarm : undefined
+      const normSwarm = deps.swarmConfig ? deps.swarmConfig.normalizeSwarm(rawSwarm) : { ok: true as const, swarm: DEFAULT_SWARM }
+      if (!normSwarm.ok) {
+        sendError(ws, 'register rejected: unknown_swarm')
+        return
+      }
+      const swarm = normSwarm.swarm
+      const rawNormalized = parsed.name.trim()
+      let normalized = rawNormalized
+      if (parsed.generated === true && swarm !== DEFAULT_SWARM) {
+        const rewritten = rewriteGeneratedSwarmName(rawNormalized, swarm)
+        if (!rewritten.ok) {
+          sendError(ws, `register rejected: ${rewritten.error}`)
+          return
+        }
+        normalized = rewritten.name
+      }
       const host = ws.data.legacyHost ?? parsed.host ?? qualifiedAliasHost(normalized)
       if ((parsed.host !== undefined && (typeof parsed.host !== 'string' || !/^[a-z0-9][a-z0-9.-]*$/i.test(parsed.host) || parsed.host !== host)) ||
           !isBusAlias(normalized) || !aliasAllowedOnHost(normalized, host)) {
         sendError(ws, 'register rejected: invalid_bus_alias')
         return
       }
-      if (deps.inboxes?.target(normalized)) {
+      if (parsed.role === 'master' && parsed.mode === 'pull') {
+        sendError(ws, 'register rejected: pull_mode_master')
+        return
+      }
+      if (deps.swarmConfig?.isCrossSwarm(normalized) && swarm !== DEFAULT_SWARM) {
+        sendError(ws, 'register rejected: protected_alias')
+        return
+      }
+      const candSwarm = deps.swarmConfig?.candidateSwarm(normalized)
+      if (candSwarm !== undefined && candSwarm !== swarm) {
+        sendError(ws, 'register rejected: protected_alias')
+        return
+      }
+      if (swarm === DEFAULT_SWARM && deps.inboxes?.target(normalized)) {
         ws.send(JSON.stringify({ type: 'replaced', name: normalized }))
         return
       }
       const agent = typeof parsed.agent === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(parsed.agent)
         ? parsed.agent.toLowerCase() : undefined
       const conversationId = typeof parsed.conversationId === 'string' ? parsed.conversationId : ''
-      const incumbent = deps.sessions.registeredIdentity(normalized)
+      const existingByInstance = parsed.instanceId ? deps.sessions.findByInstance(parsed.instanceId, host) : undefined
+      const sameInstanceSwarmMove = !!existingByInstance && existingByInstance.swarm !== swarm
+      const rawIncumbent = deps.sessions.registeredIdentity(normalized)
+      const incumbent = sameInstanceSwarmMove && existingByInstance.name === normalized ? undefined : rawIncumbent
       if (incumbent && parsed.reclaimOnly === true) { sendError(ws, 'name_occupied'); return }
-      const takeover = parsed.takeover === true || (parsed.takeover === undefined && parsed.mode === 'pull')
+      const rawTakeover = parsed.takeover === true || (parsed.takeover === undefined && parsed.mode === 'pull')
+      // A cross-swarm takeover (including implicit pull-mode takeover) is a plain registration and gets -N (§2).
+      const takeover = incumbent && incumbent.swarm !== swarm ? false : rawTakeover
       if (incumbent && takeover) {
-        const sameInstance = incumbent.instanceId === parsed.instanceId
+        const sameInstance = incumbent.instanceId === parsed.instanceId && incumbent.host === host
         const valid = !!agent && takeoverKindMatches(normalized, agent, incumbent.agent)
         // Older clients can prove continuity by the instance already in the slot.
         if (!valid && !(sameInstance && parsed.agent === undefined)) {
           sendError(ws, 'takeover_refused')
           return
         }
+      }
+      const holder = holderKey(host, parsed.instanceId)
+      const reserved = (candidate: string) =>
+        !!deps.inboxes?.target(candidate) || isSwarmCollision(deps, candidate, swarm, holder)
+      const exact = takeover || parsed.reclaimOnly === true
+      const willMerge = !!existingByInstance && existingByInstance.swarm === swarm && existingByInstance.name === normalized
+      // Protected aliases carry rights only in exact form; reject if register would assign -N (§10.5).
+      if (!willMerge && deps.swarmConfig?.isExactProtectedAlias(normalized)) {
+        const ignoreLive = sameInstanceSwarmMove ? existingByInstance.name : (incumbent && takeover ? normalized : undefined)
+        const collides = reserved(normalized) ||
+          (!exact && deps.sessions.wouldCollide(normalized, reserved, parsed.instanceId, host, ignoreLive))
+        if (collides) {
+          sendError(ws, 'register rejected: protected_alias')
+          return
+        }
+      }
+
+      let siblingSockets: WsLike[] = []
+      if (sameInstanceSwarmMove) {
+        siblingSockets = deps.sessions.detachSockets(existingByInstance.name, ws)
+        pullSessions.delete(existingByInstance.name)
+        if (existingByInstance.name !== normalized) {
+          performSwarmMove(deps, existingByInstance.name, existingByInstance.swarm, swarm)
+          offlineDirectChannel(deps, existingByInstance.name)
+          cleanupJournalEntry(deps, existingByInstance.name)
+        }
+      }
+      if (incumbent && takeover) {
+        const sameInstance = incumbent.instanceId === parsed.instanceId && incumbent.host === host
         const sameConversation = !!conversationId && conversationId === incumbent.conversationId
         const differentConversation = !!conversationId && !!incumbent.conversationId && !sameConversation
         const kind = agent ?? incumbent.agent ?? normalized.toLowerCase().split('@', 1)[0]!
@@ -859,10 +1107,32 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         }))
         deps.sessions.deregisterSession(normalized)
       }
+
       ws.data.authed = true
       ws.data.legacyHost = host
-      handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, { agent, conversationId })
+      ws.data.requestedSwarm = rawSwarm
+      // A takeover, or a reclaim of a name this client was moved off, asks for that exact
+      // name: another instance's lease does not hold it. Any other registration is steered
+      // by leases (see name-leases.ts).
+      const prevJournalSwarm = (sameInstanceSwarmMove && existingByInstance.name === normalized)
+        ? existingByInstance.swarm
+        : deps.swarmJournal?.get(normalized)?.swarm
+      const prevJournalHolder = deps.swarmJournal?.get(normalized)?.holder
+      const movingSameName = !!prevJournalSwarm && prevJournalSwarm !== swarm &&
+        (sameInstanceSwarmMove || (!!holder && prevJournalHolder === holder))
+
+      handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, {
+        agent, conversationId, host, swarm, requestedSwarm: rawSwarm, ws,
+      }, exact, reserved, parsed.role, movingSameName ? prevJournalSwarm : undefined)
+
+      if (siblingSockets.length > 0) {
+        const movedMsg = JSON.stringify({ type: 'swarm_changed', swarm })
+        for (const sibling of siblingSockets) {
+          try { sibling.send(movedMsg) } catch {}
+        }
+      }
       if (ws.data.sessionName) {
+        observeDirectChannel(deps, { name: ws.data.sessionName, kind: agent ?? (host ? normalized.split('@')[0] : undefined), host, swarm }, ws.data.sessionName !== normalized)
         deps.conversations?.set(ws.data.sessionName, conversationId)
         if (conversationId) deps.inboxes?.remember(ws.data.sessionName, conversationId)
         const cid = deps.conversations ? (deps.conversations.get(ws.data.sessionName) ?? null) : undefined
@@ -870,12 +1140,18 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         else {
           pullSessions.delete(ws.data.sessionName)
           // Messages queued while this agent was offline. Approvals for another conversation stay queued.
-          for (const entry of deps.inboxes?.legacy(ws.data.sessionName, cid) ?? []) pushLegacy(deps, ws.data.sessionName, entry)
+          // Skip legacy push during a swarm move (rows are being reposted to old general or left unacked).
+          if (!movingSameName) {
+            for (const entry of deps.inboxes?.legacy(ws.data.sessionName, cid) ?? []) {
+              if (!flushingMovedInboxIds.has(entry.id)) pushLegacy(deps, ws.data.sessionName, entry)
+            }
+          }
         }
         sendRulesOnce(deps, ws.data.sessionName)
         deps.costs?.set(ws.data.sessionName, (parsed as { costClass?: unknown }).costClass)
       }
       break
+    }
     case 'deregister':
       handleDeregister(ws, deps)
       break
@@ -904,7 +1180,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         handleBusPost(ws, parsed.text, undefined, deps, files, requestId ? { requestId } : undefined, sender)
         break
       }
-      void handleReply(ws, parsed.text, parsed.replyTo, files, deps, parsed.chatId, requestId)
+      void handleReply(ws, parsed.text, parsed.replyTo, files, deps, parsed.chatId, requestId, sender)
       break
     }
     case 'react':
@@ -912,35 +1188,43 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         sendError(ws, 'react requires chatId, messageId, and emoji')
         return
       }
-      handleReact(parsed.chatId, parsed.messageId, parsed.emoji, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, undefined, sender)) handleReact(parsed.chatId, parsed.messageId, parsed.emoji, deps)
       break
     case 'editMessage':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'chatId') || !hasString(parsed, 'messageId') || !hasString(parsed, 'text')) {
         sendError(ws, 'editMessage requires requestId, chatId, messageId, and text')
         return
       }
-      handleEditMessage(ws, parsed.requestId, parsed.chatId, parsed.messageId, parsed.text, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, parsed.requestId, sender)) {
+        handleEditMessage(ws, parsed.requestId, parsed.chatId, parsed.messageId, parsed.text, deps)
+      }
       break
     case 'downloadAttachment':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'chatId') || !hasString(parsed, 'messageId')) {
         sendError(ws, 'downloadAttachment requires requestId, chatId, and messageId')
         return
       }
-      handleDownloadAttachment(ws, parsed.requestId, parsed.chatId, parsed.messageId, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, parsed.requestId, sender)) {
+        handleDownloadAttachment(ws, parsed.requestId, parsed.chatId, parsed.messageId, deps)
+      }
       break
     case 'fetchMessages':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'channel')) {
         sendError(ws, 'fetchMessages requires requestId and channel')
         return
       }
-      handleFetchMessages(ws, parsed.requestId, parsed.channel, parsed.limit, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.channel, parsed.requestId, sender)) {
+        handleFetchMessages(ws, parsed.requestId, parsed.channel, parsed.limit, deps)
+      }
       break
     case 'askUser':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'chatId') || !hasString(parsed, 'question')) {
         sendError(ws, 'askUser requires requestId, chatId, and question')
         return
       }
-      handleAskUser(ws, parsed.requestId, parsed.chatId, parsed.question, parsed.options ?? [], deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, parsed.requestId, sender)) {
+        handleAskUser(ws, parsed.requestId, parsed.chatId, parsed.question, parsed.options ?? [], deps)
+      }
       break
     case 'permissionRequest':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'toolName') || !hasString(parsed, 'description') || !hasString(parsed, 'inputPreview')) {
@@ -961,7 +1245,18 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
   }
 }
 
-function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>, identity: { agent?: string; conversationId?: string }): void {
+function handleRegister(
+  ws: WsLike,
+  name: string,
+  projectPath: string,
+  instanceId: string | undefined,
+  deps: Readonly<WsDeps>,
+  identity: { agent?: string; conversationId?: string; host?: string; swarm: string; requestedSwarm?: string; ws: WsLike },
+  exact = false,
+  reserved?: (name: string) => boolean,
+  role?: string,
+  movedFromSwarm?: string,
+): void {
   const sendCb = (msg: string) => ws.send(msg)
   ws.data.instanceId = instanceId
   const actualName = deps.sessions.registerSession(
@@ -969,25 +1264,44 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     name,
     projectPath,
     instanceId,
-    name => !!deps.inboxes?.target(name),
+    reserved ?? (n => !!deps.inboxes?.target(n)),
     identity,
+    exact,
   )
   ws.data.sessionName = actualName
-  deps.subs?.reclaim(actualName, instanceId)
+  if (movedFromSwarm && actualName === name) {
+    performSwarmMove(deps, actualName, movedFromSwarm, identity.swarm)
+  }
+  deps.swarmJournal?.set(actualName, identity.swarm, holderKey(identity.host, instanceId))
+  deps.subs?.reclaim(actualName, instanceId, identity.host)
   ws.data.sendCallback = sendCb
   deps.history.record(actualName, projectPath)
 
-  const response: WsRegistered = { type: 'registered', name: actualName, reclaimOnly: true }
+  const warning = role === 'master' && !deps.swarmConfig?.isCandidate(actualName, identity.swarm)
+    ? 'not_master_candidate' : undefined
+  const response: WsRegistered = {
+    type: 'registered',
+    name: actualName,
+    reclaimOnly: true,
+    swarm: identity.swarm,
+    defaultSessions: deps.swarmConfig?.getDefaultSessions() ?? ['agents'],
+    ...(warning && { warning }),
+  }
   ws.send(JSON.stringify(response))
   deps.onSessionChange?.()
 }
 
 function handleDeregister(ws: WsLike, deps: Readonly<WsDeps>): void {
   if (ws.data.sessionName) {
+    const name = ws.data.sessionName
     try {
-      deps.sessions.deregisterSession(ws.data.sessionName)
+      deps.sessions.deregisterSession(name)
     } catch {}
+    pullSessions.delete(name)
+    offlineDirectChannel(deps, name)
+    cleanupJournalEntry(deps, name)
     ws.data.sessionName = null
+    ws.data.sendCallback = null
     deps.onSessionChange?.()
   }
 }
@@ -998,20 +1312,38 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>, reque
     sendOperationError(ws, requestId, 'Cannot rename: not registered')
     return
   }
+  const swarm = deps.sessions.getSwarm(oldName) ?? DEFAULT_SWARM
+  const holder = holderKey(ws.data.legacyHost, ws.data.instanceId)
   const conv = deps.conversations?.get(oldName) ?? null
-  const actualName = deps.sessions.renameSession(oldName, newName, name => !!deps.inboxes?.target(name) || protectedRenameAlias(deps, name),
-    name => deps.inboxes?.renameLegacy(oldName, name, conv))
+  const actualName = deps.sessions.renameSession(
+    oldName,
+    newName,
+    candidate => !!deps.inboxes?.target(candidate) || protectedRenameAlias(deps, candidate) || isSwarmCollision(deps, candidate, swarm, holder),
+    candidate => {
+      const prevEntry = deps.swarmJournal?.get(candidate)
+      if (prevEntry && prevEntry.swarm !== swarm && holder && prevEntry.holder === holder) {
+        performSwarmMove(deps, candidate, prevEntry.swarm, swarm)
+      }
+      deps.inboxes?.renameLegacy(oldName, candidate, conv)
+    },
+  )
   deps.subs?.rename(oldName, actualName)
+  deps.agentChannels?.rename(oldName, actualName, Date.now(), actualName === newName)
   if (pullSessions.delete(oldName)) pullSessions.add(actualName)
   if (conv) deps.conversations?.set(actualName, conv)
+  deps.swarmJournal?.set(actualName, swarm, holder)
+  if (actualName !== oldName) cleanupJournalEntry(deps, oldName)
   ws.data.sessionName = actualName
-  if (actualName !== oldName) ws.data.renamed = true
+  if (actualName !== oldName) {
+    ws.data.renamed = true
+    observeDirectChannel(deps, { name: actualName, kind: deps.sessions.registeredIdentity(actualName)?.agent ?? (oldName.includes('@') ? oldName.split('@')[0] : undefined), host: ws.data.legacyHost, swarm }, actualName !== newName)
+  }
 
   const response: WsRenamed = { type: 'renamed', oldName, newName: actualName, ...(requestId && { requestId }) }
   ws.send(JSON.stringify(response))
 }
 
-async function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: DiscordFile[], deps: Readonly<WsDeps>, explicitChatId?: string, requestId?: string): Promise<void> {
+async function handleReply(ws: WsLike, text: string, replyTo: string | undefined, files: DiscordFile[], deps: Readonly<WsDeps>, explicitChatId?: string, requestId?: string, sender?: Target): Promise<void> {
   const sessionName = ws.data.sessionName
   if (!sessionName) {
     sendOperationError(ws, requestId, 'Cannot reply: not registered')
@@ -1023,7 +1355,10 @@ async function handleReply(ws: WsLike, text: string, replyTo: string | undefined
     return
   }
 
-  const activeChat = chatId === deps.chatId()
+  const restriction = agentPostError(deps, chatId, sessionName)
+  if (restriction) { sendOperationError(ws, requestId, restriction); return }
+  if (!canAccessDirectChannel(ws, deps, chatId, requestId, sender)) return
+  const activeChat = !directChannelOwner(deps, chatId) && chatId === deps.chatId()
   const sends: Promise<boolean>[] = []
   if (activeChat && deps.sessions.getActive() !== sessionName) {
     const count = deps.sessions.bufferReply(sessionName, text)
@@ -1416,6 +1751,28 @@ const busPostTimes = new Map<string, number[]>()
 /** Tests share one process. Production never calls this. */
 export function resetBusRateLimit(): void { busPostTimes.clear() }
 const HUMAN_TARGETS = new Set(['human', 'admin', 'user', 'me'])
+const HUMAN_CHANNEL_POST_ERROR = 'Only posts to=human can use #human-questions. Use the topic channel or #general.'
+
+function agentPostError(deps: Readonly<WsDeps>, channel: string, from: string, to?: string): string | undefined {
+  const recipient = to?.toLowerCase()
+  if (channel === deps.humanChannelId && recipient !== 'human') return HUMAN_CHANNEL_POST_ERROR
+  const owner = directChannelOwner(deps, channel)
+  if (owner && (owner !== from || (recipient && !HUMAN_TARGETS.has(recipient)))) {
+    return 'This direct channel is reserved for its owner and the human. Use the topic channel or #general.'
+  }
+  return undefined
+}
+
+function canAccessDirectChannel(ws: WsLike, deps: Readonly<WsDeps>, channel: string, requestId?: string, sender?: Target): boolean {
+  const owner = directChannelOwner(deps, channel)
+  if (!owner) return true
+  const current = sender
+    ? deps.inboxes && nativeConnection(deps.inboxes, sender)
+    : ws.data.sendCallback && deps.sessions.ownsSender(owner, ws.data.sendCallback)
+  if (current && owner === ws.data.sessionName) return true
+  sendOperationError(ws, requestId, 'This direct channel is reserved for its owner and the human. Use the topic channel or #general.')
+  return false
+}
 
 /**
  * Post `[from → to] text` to the bus channel (so humans see the conversation).
@@ -1435,6 +1792,8 @@ export function handleBusPost(ws: WsLike, text: string, to: string | undefined, 
 }
 
 export function channelSubscribers(deps: Readonly<WsDeps>, channelId: string): string[] {
+  const direct = directChannelOwner(deps, channelId)
+  if (direct) return [direct]
   const subs = deps.subs
   if (!subs) return []
   const inboxes = deps.inboxes
@@ -1537,6 +1896,9 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
     } catch { /* A caller can retry with the same publish id. */ }
   }
   if (to !== undefined && typeof to !== 'string') { reply(false, 'invalid_target'); return }
+  const restriction = agentPostError(deps, channelId, from, to)
+  if (restriction) { reply(false, restriction); return }
+  if (!canAccessDirectChannel(ws, deps, channelId, requestId, sender)) return
   const now = Date.now()
   const id = publish?.publish_id === undefined ? `pub_${now}_${randomUUID()}` : publish.publish_id
   if (typeof id !== 'string' || !id || id.length > 256) { reply(false, 'invalid_publish_id'); return }
@@ -1549,6 +1911,8 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
       reply(false, 'publish_payload_mismatch')
       return
     }
+    const retryRestriction = agentPostError(deps, retry.mirror.where, retry.mirror.from, retry.mirror.label)
+    if (retryRestriction) { reply(false, retryRestriction); return }
     const copyOnly = retry.mirror.copyOnly
     const attemptKey = JSON.stringify([key, copyOnly ? 'uncommitted' : retry.at])
     void tryPublishMirror(deps, retry.mirror, text, files, attemptKey).then(({ messageId, copyId }) => {
@@ -1586,7 +1950,8 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   if (routed.passive) deps.unread?.bump(heard)
   deps.activity?.markPost(from)
 
-  const humanChannel = toLabel === 'human' && deps.humanChannelId !== channelId ? deps.humanChannelId : undefined
+  const humanChannel = toLabel === 'human' && deps.humanChannelId !== channelId &&
+    !directChannelOwner(deps, channelId) ? deps.humanChannelId : undefined
   const redirect = humanChannel && (!channelName || channelId === deps.busChannelId)
   const source = channelName ? `#${channelName}` : '#general'
   const where = redirect ? humanChannel : channelId
@@ -1768,6 +2133,10 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
     else sessions.routeToSession(n, t, m)
   }
   const pool = audienceNames ? names.filter(n => audienceNames.includes(n)) : names
+  const direct = deps && meta.chat_id ? directChannelOwner(deps, meta.chat_id) : undefined
+  if (direct && deps) {
+    return deliver(deps, direct, content, { ...meta, to: direct, routed: 'direct-channel' }) ? [direct] : []
+  }
   deps?.humanMail?.remember(content, meta)
   const replyMeta: ChannelMeta = meta.unbound_reply
     ? { in_reply_to: meta.unbound_reply, question_id: meta.question_id ?? meta.unbound_reply }
@@ -1840,7 +2209,8 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
         id: c.id, name: c.name, topic: c.topic ?? undefined,
         default: c.id === deps.busChannelId,
         human: c.id === deps.humanChannelId,
-        subscribed: c.id === deps.busChannelId || c.id === deps.humanChannelId || subs.has(me, c.id, identity),
+        subscribed: c.id === deps.busChannelId || c.id === deps.humanChannelId ||
+          (directChannelOwner(deps, c.id) ? directChannelOwner(deps, c.id) === me : subs.has(me, c.id, identity)),
         subscribers: c.id === deps.busChannelId || c.id === deps.humanChannelId ? ['(everyone)'] : channelSubscribers(deps, c.id),
       }))
       sendToolResult(ws, msg.requestId, true, JSON.stringify(out))
@@ -1850,12 +2220,20 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       if (!msg.name) { sendToolResult(ws, msg.requestId, false, 'channel_create requires name'); return }
       const existing = await ops.resolve(msg.name)
       const ch = existing ?? await ops.create(msg.name, msg.topic)
+      if (directChannelOwner(deps, ch.id)) {
+        sendToolResult(ws, msg.requestId, false, 'direct_channel_managed')
+        return
+      }
       subs.add(me, ch.id, identity)
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, created: !existing, subscribed: true }))
       return
     }
     const ch = msg.channel ? await ops.resolve(msg.channel) : null
     if (!ch) { sendToolResult(ws, msg.requestId, false, `Unknown channel "${msg.channel ?? ''}" (use channel_list)`); return }
+    if (directChannelOwner(deps, ch.id)) {
+      sendToolResult(ws, msg.requestId, false, 'direct_channel_managed')
+      return
+    }
     if (ch.id === deps.busChannelId) {
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, note: 'default bus channel: every session always receives it' }))
       return

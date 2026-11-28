@@ -39,6 +39,12 @@ export interface WsRegister {
   readonly costClass?: 'cheap' | 'standard' | 'premium'
   /** Stable id of this conversation. A reused display name with a different id does not inherit held approvals. */
   readonly conversationId?: string
+  /** Raw swarm name reported by the client (session_group, session_name, or SWARM_ID). Normalised by the router. */
+  readonly swarm?: string
+  /** True when `name` is the generated base form `<agent>@<host>:<dir>`, to be rewritten for non-default swarms. */
+  readonly generated?: boolean
+  /** Optional role declaration ('master' for master candidates). */
+  readonly role?: string
 }
 
 /** Plugin → Router: rename this session */
@@ -259,6 +265,9 @@ export interface WsRegistered {
   readonly type: 'registered'
   readonly name: string
   readonly reclaimOnly?: true
+  readonly swarm?: string
+  readonly defaultSessions?: readonly string[]
+  readonly warning?: string
 }
 
 /** Router → Plugin: confirms rename */
@@ -299,8 +308,15 @@ export interface WsReplaced {
   readonly reclaim?: false
 }
 
+/** Router → plugin: another sibling connection moved this instance to a new swarm; re-register without closing. */
+export interface WsSwarmChanged {
+  readonly type: 'swarm_changed'
+  readonly swarm: string
+}
+
 export type RouterToPluginMessage =
   | WsReplaced
+  | WsSwarmChanged
   | WsMessage
   | WsRegistered
   | WsRenamed
@@ -319,6 +335,7 @@ export interface SessionEntry {
   readonly projectPath: string
   readonly connectedAt: number
   readonly messageCount: number
+  readonly swarm?: string
 }
 
 /** A buffered message waiting to be flushed */
