@@ -72,3 +72,27 @@ test('plugin exits on stdin EOF rather than retaining its name as an orphan', as
     rmSync(dir, { recursive: true, force: true })
   }
 }, 6000)
+
+
+test('regular transport pongs protect a legacy holder after 70 seconds without application frames', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'legacy-pongs-'))
+  try {
+    let now = 100_000, pings = 0
+    const sessions = new SessionManager()
+    const h = createWsHandlers({ now: () => now, sessions, history: new ProjectHistory(dir), client: {} as any,
+      chatId: () => null, chunkLimit: 2000, chunkMode: 'length', replyToMode: 'first' })
+    const old: WsLike = { data: { sessionName: null, sendCallback: null }, send: () => {},
+      ping: () => { pings++; h.pong(old) } }
+    h.open(old)
+    h.message(old, JSON.stringify({ type: 'register', name: 'claude@mac:legacy', instanceId: 'old', agent: 'claude', projectPath: '/tmp' }))
+    now += 30_000; h.sweep()
+    now += 30_000; h.sweep()
+    now += 10_000
+    const frames: any[] = []
+    const child: WsLike = { data: { sessionName: null, sendCallback: null }, send: s => frames.push(JSON.parse(s)) }
+    h.message(child, JSON.stringify({ type: 'register', name: 'claude@mac:legacy', instanceId: 'child', agent: 'claude', projectPath: '/tmp', takeover: true }))
+    expect(pings).toBe(2)
+    expect(frames.at(-1)).toMatchObject({ type: 'takeover_refused', reason: 'holder_live' })
+    expect(sessions.registeredIdentity('claude@mac:legacy')?.instanceId).toBe('old')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})

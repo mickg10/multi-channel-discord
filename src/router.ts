@@ -301,6 +301,7 @@ interface BunServerWebSocket {
   data: WsData
   send(msg: string | ArrayBufferLike | Uint8Array): number
   close(): void
+  ping(): void
 }
 
 function toBunWsLike(ws: BunServerWebSocket): WsLike {
@@ -308,6 +309,7 @@ function toBunWsLike(ws: BunServerWebSocket): WsLike {
     data: ws.data,
     send(msg: string) { if (ws.send(msg) === 0) throw new Error('WebSocket send failed') },
     close() { ws.close() },
+    ping() { ws.ping() },
   }
 }
 
