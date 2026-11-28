@@ -96,3 +96,32 @@ test('regular transport pongs protect a legacy holder after 70 seconds without a
     expect(sessions.registeredIdentity('claude@mac:legacy')?.instanceId).toBe('old')
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+
+for (const appHeartbeats of [true, false]) {
+  test(`${appHeartbeats ? 'app' : 'legacy'} holder answering only transport pongs uses the correct liveness clock`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'heartbeat-silence-'))
+    try {
+      let now = 100_000, closed = false
+      const sessions = new SessionManager()
+      const h = createWsHandlers({ now: () => now, sessions, history: new ProjectHistory(dir), client: {} as any,
+        chatId: () => null, chunkLimit: 2000, chunkMode: 'length', replyToMode: 'first' })
+      const old: WsLike = { data: { sessionName: null, sendCallback: null }, send: () => {},
+        ping: () => h.pong(old), close: () => { closed = true } }
+      h.open(old)
+      h.message(old, JSON.stringify({ type: 'register', name: 'claude@mac:heartbeat', instanceId: 'old', agent: 'claude', projectPath: '/tmp' }))
+      if (appHeartbeats) h.message(old, JSON.stringify({ type: 'pong' }))
+      now += 30_000; h.sweep()
+      now += 30_000; h.sweep()
+      now += 15_001; h.pong(old)
+      // Check ownership before sweep removes the expired session.
+      expect(sessions.answeredRecently('claude@mac:heartbeat', now, SILENCE_MS)).toBe(!appHeartbeats)
+      h.sweep()
+      expect(closed).toBe(appHeartbeats)
+      expect(!!sessions.registeredIdentity('claude@mac:heartbeat')).toBe(!appHeartbeats)
+      const frames: any[] = []
+      const child: WsLike = { data: { sessionName: null, sendCallback: null }, send: s => frames.push(JSON.parse(s)) }
+      h.message(child, JSON.stringify({ type: 'register', name: 'claude@mac:heartbeat', instanceId: 'child', agent: 'claude', projectPath: '/tmp', takeover: true }))
+      expect(frames.at(-1).type).toBe(appHeartbeats ? 'registered' : 'takeover_refused')
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+}

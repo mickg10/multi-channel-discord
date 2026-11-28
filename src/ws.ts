@@ -57,6 +57,8 @@ import { join, basename } from 'node:path'
 export interface WsData {
   closeHandled?: boolean
   lastPongAt?: number
+  /** Application activity after the client opts into app heartbeats. */
+  appSeenAt?: number
   closeReason?: string
   remoteAddress?: string
   sessionName: string | null
@@ -368,16 +370,14 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
     return target ? [[name, identityKey(target)]] : []
   }))
   const clock = deps.now ?? Date.now
-  const connections = new Map<WsData, { ws: WsLike; seen: number; ping: number; app: boolean }>()
+  const connections = new Map<WsData, { ws: WsLike; ping: number; app: boolean }>()
   return {
     pong(ws: WsLike): void {
       ws.data.lastPongAt = clock()
-      const connection = connections.get(ws.data)
-      if (connection) connection.seen = clock()
     },
     sweep(now = clock()): void {
       for (const [data, c] of connections) {
-        if (c.app && now - c.seen > SILENCE_MS) {
+        if (c.app && now - (data.appSeenAt ?? 0) > SILENCE_MS) {
           data.closeReason = 'keepalive_timeout'
           this.close(c.ws)
           c.ws.close?.()
@@ -396,7 +396,8 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
     },
     open(ws: WsLike): void {
       ws.data.closeHandled = false
-      connections.set(ws.data, { ws, seen: clock(), ping: clock(), app: false })
+      ws.data.appSeenAt = undefined
+      connections.set(ws.data, { ws, ping: clock(), app: false })
       ws.send(JSON.stringify({ type: 'ping' }))
     },
 
@@ -414,8 +415,8 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
       if (!parsed || typeof parsed !== 'object') { sendError(ws, 'Invalid frame'); return }
       const connection = connections.get(ws.data)
       if (connection) {
-        connection.seen = clock()
         if (parsed.type === 'ping' || parsed.type === 'pong') connection.app = true
+        if (connection.app) ws.data.appSeenAt = clock()
       }
       if (parsed.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); return }
       if (parsed.type === 'pong') { ws.data.lastPongAt = clock(); return }
@@ -1052,7 +1053,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     projectPath,
     instanceId,
     name => !!deps.inboxes?.target(name),
-    { ...identity, lastPongAt: () => ws.data.lastPongAt },
+    { ...identity, lastPongAt: () => ws.data.appSeenAt ?? ws.data.lastPongAt },
   )
   ws.data.sessionName = actualName
   deps.subs?.reclaim(actualName, instanceId)
