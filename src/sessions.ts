@@ -10,11 +10,15 @@ import { SessionNotFoundError } from './errors.js'
 import { getStateDir } from './access.js'
 import { BUS_ALIAS_MAX } from './bus-alias.js'
 import type { NameLeases } from './name-leases.js'
+import type { WsLike } from './ws.js'
 
 interface SessionSlot {
   readonly name: string
   readonly projectPath: string
   readonly instanceId: string
+  readonly host?: string
+  readonly swarm: string
+  readonly requestedSwarm?: string
   /** The client presented `instanceId` itself. One was made up otherwise, and such a
    *  client takes no part in name leases: it is named exactly as before. */
   readonly identified: boolean
@@ -22,8 +26,27 @@ interface SessionSlot {
   readonly conversationId?: string
   readonly connectedAt: number
   messageCount: number
-  readonly send: (msg: string) => void
+  send: (msg: string) => void
   readonly extraSends: Array<(msg: string) => void>
+  readonly sockets: Set<WsLike>
+}
+
+export interface SessionIdentity {
+  readonly agent?: string
+  readonly conversationId?: string
+  readonly host?: string
+  readonly swarm?: string
+  readonly requestedSwarm?: string
+  readonly ws?: WsLike
+}
+
+export interface SessionSlotInfo {
+  readonly name: string
+  readonly swarm: string
+  readonly requestedSwarm?: string
+  readonly host?: string
+  readonly instanceId: string
+  readonly identified: boolean
 }
 
 /** Manages the routing table, active session, message buffers, and unrouted inbox. */
@@ -44,24 +67,33 @@ export class SessionManager {
    *  A plain registration is kept off names leased to other instances. An `exact` one
    *  (a takeover, or reclaiming a name the client was moved off) asks for that name and
    *  is held by nothing but a live session. */
-  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string }, exact = false): string {
-    // Deduplicate: if same instanceId is already registered, add send callback to existing.
+  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: SessionIdentity, exact = false): string {
+    const swarm = identity?.swarm ?? 'default'
+    const host = identity?.host
+    // Deduplicate: if same (host, instanceId, swarm) is already registered, add send callback to existing.
     // This handles Claude Code spawning multiple MCP plugin processes for one session.
+    // Different hosts never share an instance (§2).
     if (instanceId) {
       for (const [existingName, slot] of this.sessions) {
-        if (slot.instanceId === instanceId) {
+        if (slot.identified && slot.instanceId === instanceId && slot.host === host && slot.swarm === swarm) {
           slot.extraSends.push(send)
-          this.leases?.touch(existingName, instanceId)
+          if (identity?.ws) slot.sockets.add(identity.ws)
+          this.leases?.touch(existingName, instanceId, host)
           return existingName
         }
       }
     }
 
-    const actualName = this.resolveCollision(name, reserved, undefined, exact ? undefined : instanceId)
+    const actualName = this.resolveCollision(name, reserved, undefined, exact ? undefined : instanceId, host)
+    const sockets = new Set<WsLike>()
+    if (identity?.ws) sockets.add(identity.ws)
     this.sessions.set(actualName, {
       name: actualName,
       projectPath,
       instanceId: instanceId ?? `anon-${Date.now()}`,
+      host,
+      swarm,
+      requestedSwarm: identity?.requestedSwarm,
       identified: !!instanceId,
       agent: identity?.agent,
       conversationId: identity?.conversationId,
@@ -69,9 +101,41 @@ export class SessionManager {
       messageCount: 0,
       send,
       extraSends: [],
+      sockets,
     })
-    if (instanceId) this.leases?.touch(actualName, instanceId)
+    if (instanceId) this.leases?.touch(actualName, instanceId, host)
     return actualName
+  }
+
+  /** Find a live slot by `(host, instanceId)` regardless of swarm. */
+  findByInstance(instanceId: string, host?: string): SessionSlotInfo | undefined {
+    for (const slot of this.sessions.values()) {
+      if (slot.identified && slot.instanceId === instanceId && slot.host === host) {
+        return {
+          name: slot.name, swarm: slot.swarm, requestedSwarm: slot.requestedSwarm,
+          host: slot.host, instanceId: slot.instanceId, identified: slot.identified,
+        }
+      }
+    }
+    return undefined
+  }
+
+  getSwarm(name: string): string | undefined {
+    return this.sessions.get(name)?.swarm
+  }
+
+  getAllSlotInfos(): SessionSlotInfo[] {
+    return Array.from(this.sessions.values()).map(slot => ({
+      name: slot.name, swarm: slot.swarm, requestedSwarm: slot.requestedSwarm,
+      host: slot.host, instanceId: slot.instanceId, identified: slot.identified,
+    }))
+  }
+
+  /** Check whether registering `name` (without takeover) would collide and receive `-N`. */
+  wouldCollide(name: string, reserved?: (name: string) => boolean, claimant?: string, host?: string, ignoreLiveName?: string): boolean {
+    return (name !== ignoreLiveName && this.sessions.has(name)) ||
+      reserved?.(name) === true ||
+      this.leases?.heldByAnother(name, claimant, host) === true
   }
 
   /** Remove a session from the routing table. Also cleans up any extraSends references to this session's send callback. */
@@ -85,7 +149,7 @@ export class SessionManager {
     this.buffers.delete(name)
     // The lease outlives the connection: a client that is coming back (or a router that is
     // restarting) finds its name held, until the lease expires.
-    if (slot.identified) this.leases?.touch(name, slot.instanceId)
+    if (slot.identified) this.leases?.touch(name, slot.instanceId, slot.host)
     if (this.active === name) {
       this.active = null
     }
@@ -96,27 +160,83 @@ export class SessionManager {
     }
   }
 
+  /** Detach a slot for a same-instance swarm move (§10.3): nulls ws.data on every socket
+   *  without closing them, removes the slot, and returns the sibling sockets (excluding `except`). */
+  detachSockets(name: string, except?: WsLike): WsLike[] {
+    const slot = this.sessions.get(name)
+    if (!slot) return []
+    const others: WsLike[] = []
+    for (const sock of slot.sockets) {
+      sock.data.sessionName = null
+      sock.data.sendCallback = null
+      if (sock !== except) others.push(sock)
+    }
+    slot.sockets.clear()
+    this.sessions.delete(name)
+    this.buffers.delete(name)
+    if (this.active === name) this.active = null
+    return others
+  }
+
+  /** Close every socket belonging to `name`, nulling `sessionName` and `sendCallback` first (§10.2),
+   *  and deregister the slot. */
+  closeSessionSockets(name: string): boolean {
+    const slot = this.sessions.get(name)
+    if (!slot) return false
+    const sockets = [...slot.sockets]
+    slot.sockets.clear()
+    for (const sock of sockets) {
+      sock.data.sessionName = null
+      sock.data.sendCallback = null
+      try { sock.close?.() } catch {}
+    }
+    try { this.deregisterSession(name) } catch {}
+    return true
+  }
+
   /** Check if a send callback is the primary sender for a session (not an extraSend). */
   isPrimarySender(sessionName: string, send: (msg: string) => void): boolean {
     const slot = this.sessions.get(sessionName)
     return slot?.send === send
   }
 
+  /** Remove a specific send callback (and its socket) from a session. Promotes an extraSend if
+   *  the primary disconnected while sibling sockets remain; deregisters only when no sender remains.
+   *  Returns true if the session was deregistered. */
+  removeSocket(sessionName: string, send: (msg: string) => void, ws?: WsLike): boolean {
+    const slot = this.sessions.get(sessionName)
+    if (!slot) return false
+    if (ws) slot.sockets.delete(ws)
+    if (slot.send === send) {
+      if (slot.extraSends.length > 0) {
+        slot.send = slot.extraSends.shift()!
+        return false
+      }
+      this.deregisterSession(sessionName)
+      return true
+    }
+    const idx = slot.extraSends.indexOf(send)
+    if (idx !== -1) slot.extraSends.splice(idx, 1)
+    return false
+  }
+
   /** Remove a specific send callback from all sessions' extraSends lists without deregistering the session. */
-  cleanupSender(send: (msg: string) => void): void {
+  cleanupSender(send: (msg: string) => void, ws?: WsLike): void {
     for (const [, slot] of this.sessions) {
       const idx = slot.extraSends.indexOf(send)
       if (idx !== -1) slot.extraSends.splice(idx, 1)
+      if (ws) slot.sockets.delete(ws)
     }
   }
 
-  registeredIdentity(name: string): Pick<SessionSlot, 'instanceId' | 'agent' | 'conversationId'> | undefined {
+  registeredIdentity(name: string): Pick<SessionSlot, 'instanceId' | 'agent' | 'conversationId' | 'host' | 'swarm'> | undefined {
     const slot = this.sessions.get(name)
-    return slot && { instanceId: slot.instanceId, agent: slot.agent, conversationId: slot.conversationId }
+    return slot && { instanceId: slot.instanceId, agent: slot.agent, conversationId: slot.conversationId, host: slot.host, swarm: slot.swarm }
   }
 
-  isSameInstance(name: string, instanceId?: string): boolean {
-    return !!instanceId && this.sessions.get(name)?.instanceId === instanceId
+  isSameInstance(name: string, instanceId?: string, host?: string): boolean {
+    const slot = this.sessions.get(name)
+    return !!instanceId && !!slot && slot.identified && slot.instanceId === instanceId && (host === undefined || slot.host === host)
   }
 
   ownsSender(name: string, send: (msg: string) => void): boolean {
@@ -129,13 +249,14 @@ export class SessionManager {
     const slot = this.sessions.get(oldName)
     if (!slot) throw new SessionNotFoundError(oldName)
 
-    const actualName = this.resolveCollision(newName, reserved, oldName)
+    const actualName = this.resolveCollision(newName, reserved, oldName, undefined, slot.host)
     beforeRename?.(actualName)
     this.sessions.delete(oldName)
-    const moved = { ...slot, name: actualName }
+    const moved: SessionSlot = { ...slot, name: actualName }
     this.sessions.set(actualName, moved)
+    for (const sock of moved.sockets) sock.data.sessionName = actualName
     // the lease follows the session, and leaves the old name with it
-    if (moved.identified) this.leases?.touch(actualName, moved.instanceId)
+    if (moved.identified) this.leases?.touch(actualName, moved.instanceId, moved.host)
 
     const buf = this.buffers.get(oldName)
     if (buf) {
@@ -207,6 +328,7 @@ export class SessionManager {
       projectPath: slot.projectPath,
       connectedAt: slot.connectedAt,
       messageCount: slot.messageCount,
+      swarm: slot.swarm,
     }))
   }
 
@@ -270,14 +392,14 @@ export class SessionManager {
   /** Mark every connected instance as seen, so that its lease lasts as long as it stays connected. */
   refreshLeases(): void {
     this.leases?.touchAll(
-      [...this.sessions].flatMap(([name, slot]) => slot.identified ? [[name, slot.instanceId] as const] : []),
+      [...this.sessions].flatMap(([name, slot]) => slot.identified ? [[name, slot.instanceId, slot.host] as const] : []),
     )
   }
 
-  private resolveCollision(name: string, reserved?: (name: string) => boolean, previous?: string, claimant?: string): string {
+  private resolveCollision(name: string, reserved?: (name: string) => boolean, previous?: string, claimant?: string, host?: string): string {
     const inUse = (candidate: string) =>
       (candidate !== previous && this.sessions.has(candidate)) || reserved?.(candidate) ||
-      this.leases?.heldByAnother(candidate, claimant) === true
+      this.leases?.heldByAnother(candidate, claimant, host) === true
     if (!inUse(name)) return name
     let suffix = 2
     let candidate: string
