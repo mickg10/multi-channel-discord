@@ -16,6 +16,7 @@ interface SessionSlot {
   readonly instanceId: string
   readonly agent?: string
   readonly conversationId?: string
+  readonly lastPongAt?: () => number | undefined
   readonly connectedAt: number
   messageCount: number
   readonly send: (msg: string) => void
@@ -33,7 +34,7 @@ export class SessionManager {
    *  If a session with the same instanceId already exists, adds this send callback
    *  to extraSends (dedup for multiple MCP spawns from the same Claude Code process).
    *  Different Claude Code instances on the same project get separate sessions with collision suffixes. */
-  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string }): string {
+  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string; lastPongAt?: () => number | undefined }): string {
     // Deduplicate: if same instanceId is already registered, add send callback to existing.
     // This handles Claude Code spawning multiple MCP plugin processes for one session.
     if (instanceId) {
@@ -52,6 +53,7 @@ export class SessionManager {
       instanceId: instanceId ?? `anon-${Date.now()}`,
       agent: identity?.agent,
       conversationId: identity?.conversationId,
+      lastPongAt: identity?.lastPongAt,
       connectedAt: Date.now(),
       messageCount: 0,
       send,
@@ -96,6 +98,12 @@ export class SessionManager {
   registeredIdentity(name: string): Pick<SessionSlot, 'instanceId' | 'agent' | 'conversationId'> | undefined {
     const slot = this.sessions.get(name)
     return slot && { instanceId: slot.instanceId, agent: slot.agent, conversationId: slot.conversationId }
+  }
+
+  answeredRecently(name: string, now: number, windowMs: number): boolean {
+    const slot = this.sessions.get(name)
+    const last = slot?.lastPongAt?.()
+    return last !== undefined && now - last <= windowMs
   }
 
   isSameInstance(name: string, instanceId?: string): boolean {

@@ -328,15 +328,22 @@ interface BunServerWebSocket {
   data: WsData
   send(msg: string | ArrayBufferLike | Uint8Array): number
   close(): void
+  remoteAddress?: string
+  ping(): void
 }
 
 function toBunWsLike(ws: BunServerWebSocket): WsLike {
+  ws.data.remoteAddress = ws.remoteAddress
   return {
     data: ws.data,
     send(msg: string) { if (ws.send(msg) === 0) throw new Error('WebSocket send failed') },
     close() { ws.close() },
+    ping() { ws.ping() },
   }
 }
+
+const keepaliveTimer = setInterval(() => wsHandlers.sweep(), 5000)
+keepaliveTimer.unref()
 
 const wsServer = Bun.serve<WsData>({
   port: WS_PORT,
@@ -351,6 +358,8 @@ const wsServer = Bun.serve<WsData>({
     return undefined as unknown as Response
   },
   websocket: {
+    sendPings: true,
+    idleTimeout: 75,
     // Inline attachments (base64) can be several MB.
     maxPayloadLength: 64 * 1024 * 1024,
     open(ws) {
@@ -358,6 +367,9 @@ const wsServer = Bun.serve<WsData>({
     },
     message(ws, msg) {
       wsHandlers.message(toBunWsLike(ws), msg as string | Buffer)
+    },
+    pong(ws) {
+      wsHandlers.pong(toBunWsLike(ws))
     },
     close(ws) {
       wsHandlers.close(toBunWsLike(ws))
@@ -585,6 +597,7 @@ async function shutdown(): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
+  clearInterval(keepaliveTimer)
   clearInterval(bufferInterval)
   // Clear all typing intervals
   typingManager.stopAll()
