@@ -55,6 +55,22 @@ function gatewayAliasHostsProvider(): Readonly<Record<string, string>> {
   } catch { /* Bare gateway aliases fail closed without a configured owner. */ }
   return {}
 }
+function readJsonConfig(value?: string): unknown {
+  try { return value ? JSON.parse(value) : undefined }
+  catch { return undefined }
+}
+
+const configuredTopicAdmins = readJsonConfig(process.env.DISCORD_TOPIC_ADMIN_IDENTITIES)
+const topicAdmins = new Set<string>(Array.isArray(configuredTopicAdmins) ? configuredTopicAdmins.filter((key): key is string => typeof key === 'string' && key.startsWith('native:')) : [])
+if (Array.isArray(configuredTopicAdmins) && configuredTopicAdmins.some(key => typeof key === 'string' && key.startsWith('legacy:'))) {
+  process.stderr.write('discord: ignoring legacy identities in DISCORD_TOPIC_ADMIN_IDENTITIES; topic admins require a native identity\n')
+}
+const configuredTopicOwners = readJsonConfig(process.env.DISCORD_TOPIC_CHANNEL_OWNERS)
+const topicChannelOwners = new Map<string, string>(
+  configuredTopicOwners && typeof configuredTopicOwners === 'object' && !Array.isArray(configuredTopicOwners)
+    ? Object.entries(configuredTopicOwners).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+    : [],
+)
 const ADMINS = new Set((process.env.DISCORD_ADMIN_SESSIONS ?? '').split(',').map(s => s.trim()).filter(Boolean))
 if (WS_HOST !== '127.0.0.1' && WS_HOST !== 'localhost' && !ROUTER_SECRET) {
   process.stderr.write('discord channel: refusing to bind non-localhost without DISCORD_ROUTER_SECRET\n')
@@ -238,6 +254,15 @@ const channelOps: ChannelOps = {
     })
     return { id: ch.id, name: ch.name }
   },
+  async setTopic(id, topic, reason) {
+    const guild = await busGuild()
+    const ch = guild.channels.cache.get(id) ?? await guild.channels.fetch(id)
+    if (!ch || ch.type !== ChannelType.GuildText) throw new Error('channel not found or not a guild text channel')
+    const previousTopic = ch.topic
+    const updated = await ch.setTopic(topic || null, reason)
+    guild.channels.cache.set(id, updated)
+    return { id: updated.id, name: updated.name, topic: updated.topic, previousTopic }
+  },
   async archive(id: string, topic: string) {
     const guild = await busGuild()
     const catInfo = (await guildChannels(guild)).find(c => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === 'archive')
@@ -274,6 +299,8 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   claims,
   mcp: mcp ?? undefined,
   admins: ADMINS,
+  topicAdmins,
+  topicChannelOwners,
   nodeSecrets: nodeSecretsProvider,
   gatewayAliasHosts: gatewayAliasHostsProvider,
   humanChannelId: HUMAN_CHANNEL,

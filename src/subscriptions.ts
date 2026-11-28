@@ -7,7 +7,7 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
-export type ChannelOwner = { name: string; instanceId?: string } | { identity: string }
+export type ChannelOwner = { name: string; instanceId?: string; host?: string } | { identity: string }
 
 interface SubscriptionState {
   version: 1
@@ -83,6 +83,32 @@ export class Subscriptions {
     return [...this.native].filter(([, channels]) => channels.has(channelId)).map(([key]) => key)
   }
 
+  recordChannelOwner(channel: string, owner: ChannelOwner): void {
+    if (this.channelOwners.has(channel)) return
+    this.channelOwners.set(channel, owner)
+    this.save()
+  }
+
+  isChannelOwner(channel: string, caller: ChannelOwner): boolean {
+    const owner = this.channelOwners.get(channel)
+    if (!owner) return false
+    if ('identity' in owner) return 'identity' in caller && owner.identity === caller.identity
+    return 'name' in caller && !!owner.host && !!owner.instanceId &&
+      owner.host === caller.host && owner.instanceId === caller.instanceId
+  }
+
+  private moveChannelOwnership(name: string, destination: ChannelOwner): boolean {
+    let changed = false
+    const instanceId = this.owners.get(name)
+    for (const [channel, owner] of this.channelOwners) {
+      if (!('name' in owner) || owner.name !== name ||
+          (owner.instanceId !== undefined && owner.instanceId !== instanceId)) continue
+      this.channelOwners.set(channel, 'name' in destination ? { ...owner, name: destination.name } : destination)
+      changed = true
+    }
+    return changed
+  }
+
   channelOwnerAliases(): string[] {
     return [...this.channelOwners.values()].flatMap(owner => owner && 'name' in owner ? [owner.name] : [])
   }
@@ -90,7 +116,11 @@ export class Subscriptions {
   reclaim(name: string, instanceId?: string): void {
     if (this.owners.get(name) === instanceId) return
     const old = instanceId && [...this.owners].find(([, owner]) => owner === instanceId)?.[0]
-    if (old) { this.move(this.map, old, name); this.owners.delete(old) }
+    if (old) {
+      this.move(this.map, old, name)
+      this.moveChannelOwnership(old, { name, instanceId })
+      this.owners.delete(old)
+    }
     if (instanceId) this.owners.set(name, instanceId)
     else this.owners.delete(name)
     this.save()
@@ -100,6 +130,7 @@ export class Subscriptions {
     if (oldName === name) return
     this.move(this.map, oldName, name)
     const owner = this.owners.get(oldName)
+    this.moveChannelOwnership(oldName, { name, instanceId: owner })
     this.owners.delete(oldName)
     if (owner) this.owners.set(name, owner)
     else this.owners.delete(name)
@@ -107,7 +138,8 @@ export class Subscriptions {
   }
 
   migrateToNative(name: string, identity: string): void {
-    if (!this.map.has(name)) return
+    const movedOwner = this.moveChannelOwnership(name, { identity })
+    if (!this.map.has(name) && !movedOwner) return
     this.move(this.native, name, identity)
     this.owners.delete(name)
     this.save()
