@@ -158,9 +158,11 @@ export interface WsChannelPost {
   readonly to?: string
 }
 
+export const CHANNEL_TOPIC_MAX = 1024
+
 /** Channel management, answered with a toolResult. */
 export interface WsChannelOp {
-  readonly type: 'channelList' | 'channelCreate' | 'channelSubscribe' | 'channelUnsubscribe' | 'channelArchive'
+  readonly type: 'channelList' | 'channelCreate' | 'channelSubscribe' | 'channelUnsubscribe' | 'channelArchive' | 'channelSetTopic'
   readonly requestId: string
   readonly channel?: string
   readonly name?: string
@@ -406,6 +408,7 @@ type ForwardedGatewayCall =
   | (Omit<WsClaimOp, 'type'> & { op: WsClaimOp['type'] })
   | (Omit<WsMcpOp, 'type'> & { op: WsMcpOp['type'] })
   | { op: 'channelList' | 'channelSubscribe'; channel?: string; session?: string }
+  | { op: 'channelSetTopic'; channel: string; topic: string }
 
 export type GatewayToolCall = ForwardedGatewayCall & {
   type: 'gatewayOp'

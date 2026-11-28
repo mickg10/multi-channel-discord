@@ -17,10 +17,11 @@
 
 import type { WsMcpOp, PluginToRouterMessage, WsRegistered, WsRenamed, WsError, WsToolResult, WsPermissionVerdict, WsAskUser, WsRegisterSkills, ChannelMeta } from './types.js'
 import type { SessionManager, ProjectHistory } from './sessions.js'
-import type { Subscriptions } from './subscriptions.js'
+import type { ChannelOwner, Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
 import { isBusAlias } from './bus-alias.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
+import { CHANNEL_TOPIC_MAX } from './types.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
 import { newCallId } from './mcp.js'
@@ -34,6 +35,7 @@ export interface ChannelOps {
   create(name: string, topic?: string): Promise<{ id: string; name: string }>
   /** Move to the "archive" category and set its topic (optional: not all routers support it). */
   archive?(id: string, topic: string): Promise<void>
+  setTopic?(id: string, topic: string, reason: string): Promise<{ id: string; name: string; topic: string | null; previousTopic: string | null }>
 }
 import { chunk } from './discord.js'
 import { noteSent, getStateDir } from './access.js'
@@ -101,6 +103,9 @@ export interface WsDeps {
   readonly gatewayAliasHosts?: () => Readonly<Record<string, string>>
   /** Sessions allowed to manage other sessions' subscriptions (DISCORD_ADMIN_SESSIONS). */
   readonly admins?: ReadonlySet<string>
+  /** Topic permissions are keyed by registered identity, never by display alias. */
+  readonly topicAdmins?: ReadonlySet<string>
+  readonly topicChannelOwners?: ReadonlyMap<string, string>
   /** Channel where every to="human" post lands; everyone receives the human's posts there. */
   readonly humanChannelId?: string
   /** Bus rules sent once to every session on (first) register. */
@@ -470,6 +475,7 @@ const GATEWAY_TOOL_HANDLERS = {
   mcpDescribe: 'mcpDescribe',
   mcpCall: 'mcpCall',
   channelList: 'channelList',
+  channelSetTopic: 'channelSetTopic',
   channelSubscribe: 'channelSubscribe',
 } as const satisfies Record<GatewayToolCall['op'], PluginToRouterMessage['type']>
 
@@ -768,6 +774,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       break
     }
     case 'channelList':
+    case 'channelSetTopic':
     case 'channelCreate':
     case 'channelSubscribe':
     case 'channelUnsubscribe':
@@ -1070,7 +1077,7 @@ async function sendToDiscordAwait(client: Client, chatId: string, text: string, 
   }
 }
 
-async function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly DiscordFile[]): Promise<boolean> {
+async function sendToDiscord(client: Client, chatId: string, text: string, replyTo?: string, files?: readonly DiscordFile[], suppressMentions = false): Promise<boolean> {
   try {
     const ch = await fetchTextChannelOrNull(client, chatId)
     if (!ch || !('send' in ch)) return false
@@ -1078,6 +1085,7 @@ async function sendToDiscord(client: Client, chatId: string, text: string, reply
       content: text,
       ...(files?.length && { files: [...files] }),
       ...(replyTo && { reply: { messageReference: replyTo, failIfNotExists: false } }),
+      ...(suppressMentions && { allowedMentions: { parse: [] } }),
     })
     noteSent(sent.id)
     return true
@@ -1818,6 +1826,17 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
   return []
 }
 
+function channelActor(ws: WsLike, sender?: Target): ChannelOwner | undefined {
+  if (sender) return { identity: identityKey(sender) }
+  const { sessionName, instanceId, legacyHost } = ws.data
+  if (!sessionName || !instanceId || !legacyHost) return undefined
+  return { name: sessionName, instanceId, host: legacyHost }
+}
+
+function channelActorKey(actor: ChannelOwner): string {
+  return 'identity' in actor ? 'native:' + actor.identity : 'legacy:' + JSON.stringify([actor.host, actor.instanceId])
+}
+
 async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>, sender?: Target): Promise<void> {
   // A legacy alias change cannot confer or carry administrative privileges.
   const caller = ws.data.sessionName
@@ -1847,11 +1866,51 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       return
     }
     if (msg.type === 'channelCreate') {
+      const creator = channelActor(ws, sender)
       if (!msg.name) { sendToolResult(ws, msg.requestId, false, 'channel_create requires name'); return }
       const existing = await ops.resolve(msg.name)
       const ch = existing ?? await ops.create(msg.name, msg.topic)
+      if (!existing && creator) subs.recordChannelOwner(ch.id, creator)
       subs.add(me, ch.id, identity)
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, created: !existing, subscribed: true }))
+      return
+    }
+    if (msg.type === 'channelSetTopic') {
+      if (typeof msg.channel !== 'string' || !msg.channel.trim()) {
+        sendToolResult(ws, msg.requestId, false, 'channel_set_topic requires channel')
+        return
+      }
+      if (typeof msg.topic !== 'string' || msg.topic.length > CHANNEL_TOPIC_MAX) {
+        sendToolResult(ws, msg.requestId, false, 'invalid_channel_topic')
+        return
+      }
+      const channel = await ops.resolve(msg.channel)
+      if (!channel) { sendToolResult(ws, msg.requestId, false, 'unknown_channel'); return }
+      const caller = ws.data.sessionName
+      const current = caller && (sender
+        ? deps.inboxes && nativeConnection(deps.inboxes, sender) && deps.inboxes.key(caller) === identityKey(sender)
+        : ws.data.sendCallback && deps.sessions.ownsSender(caller, ws.data.sendCallback))
+      if (!caller || !current) {
+        sendToolResult(ws, msg.requestId, false, 'not_channel_owner')
+        return
+      }
+      const actor = channelActor(ws, sender)
+      const key = actor && channelActorKey(actor)
+      const topicAdmin = sender && key && deps.topicAdmins?.has(key)
+      const protectedChannel = channel.id === deps.busChannelId || channel.id === deps.humanChannelId
+      const owner = !!actor && !!key && (deps.topicChannelOwners?.get(channel.id) === key || subs.isChannelOwner(channel.id, actor))
+      if (!topicAdmin && (protectedChannel || !owner)) {
+        sendToolResult(ws, msg.requestId, false, 'not_channel_owner')
+        return
+      }
+      if (!ops.setTopic) { sendToolResult(ws, msg.requestId, false, 'channel_topic_edit_unavailable'); return }
+      const { previousTopic, ...updated } = await ops.setTopic(channel.id, msg.topic, `agent-bus channel_set_topic requested by ${caller}`)
+      const audit = `**Topic changed by ${caller}**\n${previousTopic || '(empty)'} → ${updated.topic || '(empty)'}`
+      let logged = true
+      for (const content of chunk(audit, deps.chunkLimit, deps.chunkMode)) {
+        if (!await sendToDiscord(deps.client, channel.id, content, undefined, undefined, true)) logged = false
+      }
+      sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...updated, ...(!logged && { audit: 'failed' }) }))
       return
     }
     const ch = msg.channel ? await ops.resolve(msg.channel) : null
