@@ -27,6 +27,8 @@ export interface WsRegister {
   /** Parent PID of the Claude Code process. Used to dedup multiple MCP spawns
    *  from the same instance while keeping separate instances as separate sessions. */
   readonly instanceId?: string
+  /** Parent pid. A live holder may be replaced by the same instance or the same parent. */
+  readonly parent?: string
   /** Shared secret; required when the router sets DISCORD_ROUTER_SECRET. */
   readonly secret?: string
   /** 'pull' = cannot receive pushes; messages are queued for check_inbox. Default 'push'. */
@@ -39,6 +41,11 @@ export interface WsRegister {
   readonly costClass?: 'cheap' | 'standard' | 'premium'
   /** Stable id of this conversation. A reused display name with a different id does not inherit held approvals. */
   readonly conversationId?: string
+}
+
+/** Plugin → Router: keepalive. A fresh ping marks the holder live. */
+export interface WsPing {
+  readonly type: 'ping'
 }
 
 /** Plugin → Router: rename this session */
@@ -232,6 +239,7 @@ export type PluginToRouterMessage =
   | WsDispatch
   | WsListSessions
   | WsRegister
+  | WsPing
   | WsRename
   | WsReply
   | WsReact

@@ -149,6 +149,7 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       // Codex hosts many threads' MCP servers in one app-server daemon (also same ppid), so
       // non-Claude agents use their own pid to avoid being merged into another thread's session.
       const instanceId = opts.instanceId ?? clientInstanceId()
+      const parent = process.env.DISCORD_PARENT_PID || String(process.ppid)
       const secret = process.env.DISCORD_ROUTER_SECRET || undefined
       const mode = process.env.DISCORD_MODE === 'pull' ? 'pull' : 'push'
       // An explicitly configured name belongs to the newest client that claims it (a resumed
@@ -157,7 +158,7 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       const agent = opts.agent ?? (process.env.DISCORD_AGENT || 'claude')
       const costClass = process.env.DISCORD_COST_CLASS
       const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
-      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, agent, mode, ...(opts.host && { host: opts.host }), ...(takeover !== undefined && { takeover }), ...(opts.reclaimOnly && { reclaimOnly: true }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
+      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, parent, agent, mode, ...(opts.host && { host: opts.host }), ...(takeover !== undefined && { takeover }), ...(opts.reclaimOnly && { reclaimOnly: true }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
     }
 
     ws.onmessage = (event) => {

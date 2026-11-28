@@ -63,6 +63,8 @@ export interface WsData {
   gateway?: { user: string; agents: Map<string, Target> }
   /** Register-time instance id of the client connection (grant binding). */
   instanceId?: string
+  /** Last keepalive ping. Unset until the client opts in by pinging. */
+  lastPing?: number
 }
 
 export interface WsDeps {
@@ -838,14 +840,24 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       const agent = typeof parsed.agent === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(parsed.agent)
         ? parsed.agent.toLowerCase() : undefined
       const conversationId = typeof parsed.conversationId === 'string' ? parsed.conversationId : ''
+      const parent = typeof parsed.parent === 'string' && parsed.parent ? parsed.parent : undefined
       const incumbent = deps.sessions.registeredIdentity(normalized)
       if (incumbent && parsed.reclaimOnly === true) { sendError(ws, 'name_occupied'); return }
       const takeover = parsed.takeover === true || (parsed.takeover === undefined && parsed.mode === 'pull')
       if (incumbent && takeover) {
         const sameInstance = incumbent.instanceId === parsed.instanceId
+        const sameParent = !!parent && parent === incumbent.parent
         const valid = !!agent && takeoverKindMatches(normalized, agent, incumbent.agent)
         // Older clients can prove continuity by the instance already in the slot.
         if (!valid && !(sameInstance && parsed.agent === undefined)) {
+          sendError(ws, 'takeover_refused')
+          return
+        }
+        // A holder that has pinged recently is live. Only the same instance or parent may take it.
+        // A client that never pings stays replaceable, so a resumed thread can still retire a stale socket.
+        const seen = incumbent.lastPing
+        const live = seen !== undefined && Date.now() - seen <= 45_000
+        if (live && !sameInstance && !sameParent) {
           sendError(ws, 'takeover_refused')
           return
         }
@@ -861,7 +873,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       }
       ws.data.authed = true
       ws.data.legacyHost = host
-      handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, { agent, conversationId })
+      handleRegister(ws, normalized, parsed.projectPath, parsed.instanceId, deps, { agent, conversationId, parent })
       if (ws.data.sessionName) {
         deps.conversations?.set(ws.data.sessionName, conversationId)
         if (conversationId) deps.inboxes?.remember(ws.data.sessionName, conversationId)
@@ -876,6 +888,13 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         deps.costs?.set(ws.data.sessionName, (parsed as { costClass?: unknown }).costClass)
       }
       break
+    case 'ping': {
+      const now = Date.now()
+      ws.data.lastPing = now
+      if (ws.data.sessionName) deps.sessions.notePing(ws.data.sessionName, now)
+      ws.send(JSON.stringify({ type: 'pong' }))
+      break
+    }
     case 'deregister':
       handleDeregister(ws, deps)
       break
@@ -961,7 +980,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
   }
 }
 
-function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>, identity: { agent?: string; conversationId?: string }): void {
+function handleRegister(ws: WsLike, name: string, projectPath: string, instanceId: string | undefined, deps: Readonly<WsDeps>, identity: { agent?: string; conversationId?: string; parent?: string }): void {
   const sendCb = (msg: string) => ws.send(msg)
   ws.data.instanceId = instanceId
   const actualName = deps.sessions.registerSession(

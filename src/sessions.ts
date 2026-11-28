@@ -16,7 +16,11 @@ interface SessionSlot {
   readonly instanceId: string
   readonly agent?: string
   readonly conversationId?: string
+  /** Parent pid of the agent that spawned this client. */
+  readonly parent?: string
   readonly connectedAt: number
+  /** Last protocol ping from the connection that owns this name. */
+  lastPing?: number
   messageCount: number
   readonly send: (msg: string) => void
   readonly extraSends: Array<(msg: string) => void>
@@ -33,7 +37,7 @@ export class SessionManager {
    *  If a session with the same instanceId already exists, adds this send callback
    *  to extraSends (dedup for multiple MCP spawns from the same Claude Code process).
    *  Different Claude Code instances on the same project get separate sessions with collision suffixes. */
-  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string }): string {
+  registerSession(send: (msg: string) => void, name: string, projectPath: string, instanceId?: string, reserved?: (name: string) => boolean, identity?: { agent?: string; conversationId?: string; parent?: string }): string {
     // Deduplicate: if same instanceId is already registered, add send callback to existing.
     // This handles Claude Code spawning multiple MCP plugin processes for one session.
     if (instanceId) {
@@ -52,6 +56,7 @@ export class SessionManager {
       instanceId: instanceId ?? `anon-${Date.now()}`,
       agent: identity?.agent,
       conversationId: identity?.conversationId,
+      parent: identity?.parent,
       connectedAt: Date.now(),
       messageCount: 0,
       send,
@@ -93,9 +98,14 @@ export class SessionManager {
     }
   }
 
-  registeredIdentity(name: string): Pick<SessionSlot, 'instanceId' | 'agent' | 'conversationId'> | undefined {
+  registeredIdentity(name: string): Pick<SessionSlot, 'instanceId' | 'agent' | 'conversationId' | 'parent' | 'lastPing'> | undefined {
     const slot = this.sessions.get(name)
-    return slot && { instanceId: slot.instanceId, agent: slot.agent, conversationId: slot.conversationId }
+    return slot && { instanceId: slot.instanceId, agent: slot.agent, conversationId: slot.conversationId, parent: slot.parent, lastPing: slot.lastPing }
+  }
+
+  notePing(name: string, at: number): void {
+    const slot = this.sessions.get(name)
+    if (slot) slot.lastPing = at
   }
 
   isSameInstance(name: string, instanceId?: string): boolean {
