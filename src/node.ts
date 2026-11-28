@@ -372,7 +372,10 @@ async function main(): Promise<void> {
       } else if (m.type === 'toolResult') { pending.get(m.requestId)?.(m.data); pending.delete(m.requestId) }
       else if (m.type === 'error') log(`router error: ${m.message}`)
     }
+    let reconnectScheduled = false
     ws.onclose = () => {
+      if (reconnectScheduled) return
+      reconnectScheduled = true
       const delay = Math.min(30_000, 1000 * 2 ** attempt++)
       log(`router connection closed; reconnecting in ${delay}ms`)
       setTimeout(connect, delay)
