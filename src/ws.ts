@@ -31,12 +31,12 @@ import { orderByCost, resolveExact, type Activity, type Conversations, type Cost
 
 /** Guild channel operations the router provides (mockable in tests). */
 export interface ChannelOps {
-  /** Resolve a channel id, "name" or "#name" to a text channel in the bus guild. */
-  resolve(ref: string): Promise<{ id: string; name: string } | null>
-  list(): Promise<Array<{ id: string; name: string; topic?: string | null }>>
-  create(name: string, topic?: string): Promise<{ id: string; name: string }>
-  /** Move to the "archive" category and set its topic (optional: not all routers support it). */
-  archive?(id: string, topic: string): Promise<void>
+  /** Resolve a channel id, "name" or "#name" to a text channel in the bus guild (scoped to `swarm` for name matches). */
+  resolve(ref: string, swarm?: string): Promise<{ id: string; name: string } | null>
+  list(swarm?: string): Promise<Array<{ id: string; name: string; topic?: string | null }>>
+  create(name: string, topic?: string, swarm?: string): Promise<{ id: string; name: string }>
+  /** Move to the archive category (for `swarm`) and set its topic (optional: not all routers support it). */
+  archive?(id: string, topic: string, swarm?: string): Promise<void>
 }
 import { chunk } from './discord.js'
 import { noteSent, getStateDir } from './access.js'
@@ -136,8 +136,10 @@ export interface WsDeps {
   readonly swarmConfig?: SwarmConfig
   /** Name -> swarm journal (`agent-swarms.json`). */
   readonly swarmJournal?: SwarmJournal
-  /** Resolve a swarm's `#general` channel id (for returning undelivered mail on move). */
+  /** Resolve a swarm's `#general` channel id (for returning undelivered mail on move & deferred rules). */
   readonly swarmGeneralChannel?: (swarm: string) => string | undefined
+  /** Register-time subscription prune callback (wired to SwarmChannels.pruneSessionSubscriptions; §10.4). */
+  readonly onRegisterPruneSubs?: (name: string, swarm: string) => void
 }
 
 /** A file sent inline by a client (the router is remote: it must never open client-named paths). */
@@ -446,8 +448,19 @@ function logCommit(deps: Readonly<WsDeps>, name: string, entry: InboxEntry): voi
 function sendRulesOnce(deps: Readonly<WsDeps>, name: string): void {
   const r = deps.rules?.()
   if (!r || r.seen(name)) return
-  if (deliver(deps, name, r.text, { source: 'agent-bus', from: 'router', user: 'router', to: name, channel: 'rules', chat_id: deps.busChannelId })) {
+  const swarm = deps.sessions.getSwarm(name) ?? DEFAULT_SWARM
+  const generalId = swarm === DEFAULT_SWARM ? deps.busChannelId : deps.swarmGeneralChannel?.(swarm)
+  // Defer until <swarm>:general exists (§10.4).
+  if (swarm !== DEFAULT_SWARM && !generalId) return
+  if (deliver(deps, name, r.text, { source: 'agent-bus', from: 'router', user: 'router', to: name, channel: 'rules', chat_id: generalId })) {
     r.markSeen(name)
+  }
+}
+
+/** Deliver deferred bus rules to all live sessions in `swarm` once `<swarm>:general` exists (§10.4). */
+export function sendRulesForSwarm(deps: Readonly<WsDeps>, swarm: string): void {
+  for (const s of deps.sessions.getSessions()) {
+    if ((s.swarm ?? DEFAULT_SWARM) === swarm) sendRulesOnce(deps, s.name)
   }
 }
 
@@ -1341,6 +1354,7 @@ function handleRegister(
   }
   deps.swarmJournal?.set(actualName, identity.swarm, holderKey(identity.host, instanceId))
   deps.subs?.reclaim(actualName, instanceId, identity.host)
+  deps.onRegisterPruneSubs?.(actualName, identity.swarm)
   ws.data.sendCallback = sendCb
   deps.history.record(actualName, projectPath)
 
