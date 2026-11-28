@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, mock } from 'bun:test'
-import { createWsHandlers, deliver, resetBusRateLimit } from '../ws.js'
+import { acceptHumanReply, createWsHandlers, deliver, NO_TOPIC_WARNING, resetBusRateLimit } from '../ws.js'
 import type { WsData, WsDeps } from '../ws.js'
 import { SessionManager, ProjectHistory } from '../sessions.js'
 import { Inboxes, NodeRegistry } from '../nodes.js'
@@ -191,7 +191,7 @@ describe('human channel + rules + archive', () => {
     h.message(a as any, JSON.stringify({ type: 'busPost', text: 'may I reboot?', to: 'human' }))
     await tick()
     expect(posted[0][0]).toBe('hq1')
-    expect(posted[0][1]).toContain('[claude@mac:src → human]** (from #general) may I reboot?')
+    expect(posted[0][1]).toContain('[claude@mac:src → human]** (from claude@mac:src, no topic) may I reboot?')
     expect(msgs(b).some(m => m.type === 'message')).toBe(false)
   })
 
@@ -215,9 +215,65 @@ describe('human channel + rules + archive', () => {
       ['bbq-topic', '**[claude@mac:bbq → human]** answer'],
       ['hq1', '**[claude@mac:bbq → human]** (from #bbq) answer'],
       ['hq1', '**[claude@mac:bbq → human]** (from #general) new question'],
-      ['hq1', '**[claude@mac:bbq → human]** (from #general) channel-free question'],
+      ['hq1', '**[claude@mac:bbq → human]** (from claude@mac:bbq, no topic) channel-free question'],
       ['hq1', '**[claude@mac:bbq → human]** already in human questions'],
     ])
+  })
+
+  test('a topic mirror starts with a jump link and a reply to the copy returns to that topic', async () => {
+    let n = 0
+    const sent: Array<{ channel: string; id: string; content: string; reply?: string }> = []
+    const client = {
+      channels: { fetch: async (id: string) => ({ isTextBased: () => true, send: async (p: { content: string; reply?: { messageReference: string } }) => {
+        const idSent = `m${++n}`
+        posted.push([id, p.content])
+        sent.push({ channel: id, id: idSent, content: p.content, reply: p.reply?.messageReference })
+        return { id: idSent }
+      } }) },
+    }
+    const channels = [{ id: 'bbq-topic', name: 'bbq' }, { id: 'hq1', name: 'human-questions' }]
+    const d = deps({
+      guildId: 'guild1',
+      client: client as any,
+      channelOps: {
+        resolve: async name => channels.find(channel => channel.name === name) ?? null,
+        list: async () => channels,
+        create: async name => ({ id: name, name }),
+      },
+    })
+    const h = createWsHandlers(d)
+    const a = reg(h, 'claude@mac:bbq')
+    h.message(a, JSON.stringify({ type: 'channelPost', channel: 'bbq', text: 'answer', to: 'human', requestId: 'p' }))
+    await tick()
+    expect(sent[0]).toMatchObject({ channel: 'bbq-topic', id: 'm1', content: '**[claude@mac:bbq → human]** answer' })
+    expect(sent[1]!.content).toBe('https://discord.com/channels/guild1/bbq-topic/m1\n**[claude@mac:bbq → human]** (from #bbq) answer')
+    expect(inboxes.copyLink('m2')).toEqual({ channelId: 'bbq-topic', originId: 'm1', agent: 'claude@mac:bbq' })
+    expect(JSON.parse(msgs(a).find(m => m.requestId === 'p').data).warning).toBeUndefined()
+
+    const ok = acceptHumanReply(d, inboxes.copyLink('m2')!, 'yes, ship it', {
+      from_human: 'true', chat_id: 'hq1', message_id: 'mick-1', user: 'mick', source: 'agent-bus', from: 'mick',
+    }, 'mick')
+    expect(ok).toBe(true)
+    await tick()
+    const reply = msgs(a).find(m => m.type === 'message' && m.content === 'yes, ship it')
+    expect(reply.meta).toMatchObject({ question_id: 'm1', chat_id: 'bbq-topic', to: 'claude@mac:bbq', in_reply_to: 'mick-1' })
+    expect(sent.at(-1)).toMatchObject({
+      channel: 'bbq-topic',
+      content: '**[mick → claude@mac:bbq]** yes, ship it',
+      reply: 'm1',
+    })
+  })
+
+  test('bus_post to=human warns the sender and does not invent a topic', async () => {
+    const h = createWsHandlers(deps())
+    const a = reg(h, 'claude@mac:bbq')
+    h.message(a, JSON.stringify({ type: 'busPost', text: 'where should this live?', to: 'human', requestId: 'q' }))
+    await tick()
+    expect(posted).toEqual([
+      ['hq1', '**[claude@mac:bbq → human]** (from claude@mac:bbq, no topic) where should this live?'],
+    ])
+    expect(JSON.parse(msgs(a).find(m => m.requestId === 'q').data).warning).toBe(NO_TOPIC_WARNING)
+    expect(inboxes.copyLink('mid')).toBeUndefined()
   })
 
   test('rules are delivered once per session name', () => {

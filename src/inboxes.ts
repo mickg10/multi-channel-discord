@@ -18,6 +18,13 @@ export interface InboxEntry extends QueuedMessage {
   readonly lease?: { id: string; receipt: string; until: number }
 }
 
+/** A #human-questions copy of a topic post. Mick's reply to copyId goes back to this channel. */
+export interface HumanCopyLink {
+  readonly channelId: string
+  readonly originId: string
+  readonly agent: string
+}
+
 export interface PublishMirror {
   readonly where: string
   readonly label: string
@@ -28,6 +35,10 @@ export interface PublishMirror {
   readonly fingerprint: string
   readonly sender?: Target
   readonly entryIds?: string[]
+  /** Guild used to build the jump link on the human-questions copy. */
+  readonly guildId?: string
+  /** Topic message id, so a retried copy can still link to it. */
+  readonly originId?: string
 }
 
 interface PublishRecord {
@@ -48,6 +59,7 @@ type Record =
   | { op: 'mark'; id: string; result: WakeResult; nudgeNumber?: number }
   | { op: 'bind'; target: Target; ids: string[] }
   | { op: 'mirror'; ids: string[]; messageId: string; sender?: Target }
+  | { op: 'copyLink'; copyId: string; channelId: string; originId: string; agent: string }
   | { op: 'remember'; name: string; conv: string }
   | { op: 'release'; alias: string }
   | { op: 'renameLegacy'; name: string; ids: string[]; conv?: string }
@@ -76,6 +88,7 @@ export class Inboxes {
   private readonly publishes = new Map<string, PublishRecord>()
   private readonly aliases = new Map<string, Target>()
   private readonly approvals = new Map<string, Target>()
+  private readonly copies = new Map<string, HumanCopyLink>()
   private readonly legacyConversations = new Map<string, string>()
   private readonly seenAliases = new Set<string>()
   private readonly counters = new Map<string, number>()
@@ -129,6 +142,7 @@ export class Inboxes {
       ...[...this.seenAliases].filter(alias => !this.aliases.has(alias)).map((alias): Record => ({ op: 'release', alias })),
       ...[...this.aliases.values()].map((target): Record => ({ op: 'bind', target, ids: [] })),
       ...[...this.approvals].map(([messageId, sender]): Record => ({ op: 'mirror', ids: [], messageId, sender })),
+      ...[...this.copies].map(([copyId, link]): Record => ({ op: 'copyLink', copyId, ...link })),
       ...[...this.legacyConversations].map(([name, conv]): Record => ({ op: 'remember', name, conv })),
       { op: 'commit', entries: [...this.entries.values()] },
       ...[...this.publishes.values()].map((publish): Record => ({ op: 'commit', entries: [], publish })),
@@ -287,6 +301,12 @@ export class Inboxes {
       case 'remember':
         this.legacyConversations.set(record.name, record.conv)
         break
+      case 'copyLink':
+        if ([record.copyId, record.channelId, record.originId, record.agent].some(part => typeof part !== 'string' || !part)) {
+          throw new Error('Invalid copy link record')
+        }
+        this.copies.set(record.copyId, { channelId: record.channelId, originId: record.originId, agent: record.agent })
+        break
       case 'mirror':
         if (!isIds(record.ids) || typeof record.messageId !== 'string') throw new Error('Invalid mirror record')
         if (record.sender) this.approvals.set(record.messageId, record.sender)
@@ -307,6 +327,12 @@ export class Inboxes {
     if (this.conversation(name) !== conv) this.append({ op: 'remember', name, conv })
   }
   approvalTarget(messageId: string): Target | undefined { return this.approvals.get(messageId) }
+  rememberCopy(copyId: string, link: HumanCopyLink): void {
+    const previous = this.copies.get(copyId)
+    if (previous && previous.channelId === link.channelId && previous.originId === link.originId && previous.agent === link.agent) return
+    this.append({ op: 'copyLink', copyId, ...link })
+  }
+  copyLink(copyId: string): HumanCopyLink | undefined { return this.copies.get(copyId) }
   key(alias: string): string { const target = this.target(alias); return target ? identityKey(target) : alias }
   publish(key: string, now = Date.now()): PublishRecord | undefined {
     const publish = this.publishes.get(key)

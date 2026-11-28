@@ -396,6 +396,8 @@ export interface PublishResult {
   readonly committed: readonly string[]
   readonly mirror?: 'failed'
   readonly copy?: 'failed'
+  /** Set when to=human had no topic channel. The post still lands in #human-questions. */
+  readonly warning?: string
 }
 
 type ForwardedGatewayCall =

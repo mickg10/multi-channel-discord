@@ -840,8 +840,10 @@ export async function startPlugin(): Promise<void> {
           if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
           const to = args.to as string | undefined
           const inline = inlineFiles(args.files)
-          sendWs(JSON.stringify({ type: 'busPost', text: args.text as string, ...(to && { to }), ...(inline.length && { files: inline }) }))
-          return { content: [{ type: 'text', text: `Posted to ${to ?? 'all agents'} as ${currentName}${inline.length ? ` with ${inline.length} file(s)` : ''}` }] }
+          const r = await sendToolRequest({ type: 'busPost', text: args.text as string, ...(to && { to }), ...(inline.length && { files: inline }) })
+          let warning = ''
+          try { const parsed = JSON.parse(r) as { warning?: unknown }; if (typeof parsed.warning === 'string') warning = `\n${parsed.warning}` } catch { /* older routers return no body */ }
+          return { content: [{ type: 'text', text: `Posted to ${to ?? 'all agents'} as ${currentName}${inline.length ? ` with ${inline.length} file(s)` : ''}${warning}` }] }
         }
         case 'channel_post': {
           if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
