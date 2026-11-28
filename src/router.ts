@@ -301,9 +301,11 @@ interface BunServerWebSocket {
   data: WsData
   send(msg: string | ArrayBufferLike | Uint8Array): number
   close(): void
+  remoteAddress?: string
 }
 
 function toBunWsLike(ws: BunServerWebSocket): WsLike {
+  ws.data.remoteAddress = ws.remoteAddress
   return {
     data: ws.data,
     send(msg: string) { if (ws.send(msg) === 0) throw new Error('WebSocket send failed') },

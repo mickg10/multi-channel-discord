@@ -1,4 +1,5 @@
 import { PING_MS, SILENCE_MS } from './keepalive.js'
+import { lifecycleLine, type LifecycleFields } from './lifecycle.js'
 /**
  * WebSocket message handlers for the router's plugin-facing WS server.
  *
@@ -55,6 +56,7 @@ export interface WsData {
   closeHandled?: boolean
   lastPongAt?: number
   closeReason?: string
+  remoteAddress?: string
   sessionName: string | null
   /** The send callback registered with SessionManager, kept for cleanup on close. */
   sendCallback: ((msg: string) => void) | null
@@ -71,6 +73,7 @@ export interface WsData {
 
 export interface WsDeps {
   readonly now?: () => number
+  readonly lifecycleLog?: (line: string) => void
   readonly sessions: SessionManager
   readonly history: ProjectHistory
   readonly client: Client
@@ -323,6 +326,16 @@ export interface WsLike {
   close?(): void
 }
 
+function logLifecycle(deps: Readonly<WsDeps>, ws: WsLike, event: string, reason: string, fields: Partial<LifecycleFields> = {}): void {
+  const name = fields.name ?? ws.data.sessionName
+  const identity = name ? deps.sessions.registeredIdentity(name) : undefined
+  const line = lifecycleLine(event, { name, instanceId: identity?.instanceId ?? ws.data.instanceId,
+    host: ws.data.legacyHost ?? ws.data.nodeName, agent: identity?.agent,
+    remoteAddress: ws.data.remoteAddress, reason, ...fields })
+  if (deps.lifecycleLog) deps.lifecycleLog(line)
+  else process.stderr.write(line)
+}
+
 export interface WsHandlers {
   pong(ws: WsLike): void
   sweep(now?: number): void
@@ -413,6 +426,7 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
       if (ws.data.closeHandled) return
       ws.data.closeHandled = true
       connections.delete(ws.data)
+      if (ws.data.sessionName || ws.data.nodeName) logLifecycle(deps, ws, 'deregister', ws.data.closeReason ?? 'socket_closed', { name: ws.data.sessionName ?? ws.data.nodeName })
       if (ws.data.gateway && ws.data.nodeName && deps.inboxes) {
         const hosts = gateways.get(deps.inboxes)
         if (hosts?.get(ws.data.nodeName)?.data === ws.data) hosts.delete(ws.data.nodeName)
@@ -545,8 +559,9 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     if (previous) {
       try { previous.send(JSON.stringify({ type: 'replaced', name: frame.host })) } catch {}
       try { previous.close?.() } catch {}
-      process.stderr.write(`Replaced gateway connection for ${frame.host}\n`)
+      logLifecycle(deps, ws, 'takeover', 'gateway_replaced', { name: frame.host, host: frame.host, agent: 'gateway' })
     }
+    logLifecycle(deps, ws, 'register', 'gateway_registered', { name: frame.host, host: frame.host, agent: 'gateway' })
     ws.send(JSON.stringify({ type: 'gatewayRegistered', host: frame.host, user: frame.user, proto: 1 }))
     reply(true, '{}')
     return
@@ -579,6 +594,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
       deps.sessions.deregisterSession(frame.alias)
       pullSessions.delete(frame.alias)
     }
+    logLifecycle(deps, ws, 'register', 'native_agent_registered', { name: frame.alias, host, agent: frame.kind })
     ws.send(JSON.stringify({ type: 'agentRegistered', as: frame.alias, target }))
     reply(true, JSON.stringify({ as: frame.alias, target }))
     if (alreadyRegistered) return
@@ -596,6 +612,7 @@ function handleGateway(ws: WsLike, frame: GatewayToRouterMessage, deps: Readonly
     inboxes.release(frame.alias)
     gateway.agents.delete(frame.alias)
     deps.conversations?.set(frame.alias, '')
+    logLifecycle(deps, ws, 'deregister', 'native_agent_released', { name: frame.alias, host, agent: target.kind })
     ws.send(JSON.stringify({ type: 'agentReleased', alias: frame.alias }))
     reply(true, '{}')
     deps.onSessionChange?.()
@@ -722,6 +739,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       const send = (m: string) => ws.send(m)
       ws.data.sendCallback = send
       deps.nodes.register(parsed.node, send, parsed.agents)
+      logLifecycle(deps, ws, 'register', 'node_registered', { name: parsed.node, host: parsed.node, agent: 'node' })
       ws.send(JSON.stringify({ type: 'nodeRegistered', node: parsed.node, agents: parsed.agents.map(a => a.name) }))
       for (const a of parsed.agents) {
         sendRulesOnce(deps, a.name)
@@ -883,13 +901,14 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         ? parsed.agent.toLowerCase() : undefined
       const conversationId = typeof parsed.conversationId === 'string' ? parsed.conversationId : ''
       const incumbent = deps.sessions.registeredIdentity(normalized)
-      if (incumbent && parsed.reclaimOnly === true) { sendError(ws, 'name_occupied'); return }
+      if (incumbent && parsed.reclaimOnly === true) { logLifecycle(deps, ws, 'takeover_refused', 'name_occupied', { name: normalized, instanceId: parsed.instanceId, host, agent }); sendError(ws, 'name_occupied'); return }
       const takeover = parsed.takeover === true || (parsed.takeover === undefined && parsed.mode === 'pull')
       if (incumbent && takeover) {
         const sameInstance = incumbent.instanceId === parsed.instanceId
         const valid = !!agent && takeoverKindMatches(normalized, agent, incumbent.agent)
         // Older clients can prove continuity by the instance already in the slot.
         if (!valid && !(sameInstance && parsed.agent === undefined)) {
+          logLifecycle(deps, ws, 'takeover_refused', 'agent_kind_mismatch', { name: normalized, instanceId: parsed.instanceId, host, agent })
           sendError(ws, 'takeover_refused')
           return
         }
@@ -905,6 +924,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         const kind = agent ?? incumbent.agent ?? normalized.toLowerCase().split('@', 1)[0]!
         const codex = kind === 'codex' || kind.startsWith('codex-') || kind === 'chatgpt-codex'
         const reclaimable = !differentConversation && (!codex || sameInstance || sameConversation)
+        logLifecycle(deps, ws, 'takeover', 'explicit_takeover', { name: normalized, instanceId: parsed.instanceId, host, agent })
         deps.sessions.notifySession(normalized, JSON.stringify({
           type: 'replaced', name: normalized, ...(!reclaimable && { reclaim: false }),
         }))
@@ -1027,6 +1047,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
   deps.subs?.reclaim(actualName, instanceId)
   ws.data.sendCallback = sendCb
   deps.history.record(actualName, projectPath)
+  logLifecycle(deps, ws, 'register', 'registered')
 
   const response: WsRegistered = { type: 'registered', name: actualName, reclaimOnly: true }
   ws.send(JSON.stringify(response))
@@ -1035,6 +1056,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
 
 function handleDeregister(ws: WsLike, deps: Readonly<WsDeps>): void {
   if (ws.data.sessionName) {
+    logLifecycle(deps, ws, 'deregister', 'client_requested')
     try {
       deps.sessions.deregisterSession(ws.data.sessionName)
     } catch {}
@@ -1056,6 +1078,7 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>, reque
   if (pullSessions.delete(oldName)) pullSessions.add(actualName)
   if (conv) deps.conversations?.set(actualName, conv)
   ws.data.sessionName = actualName
+  logLifecycle(deps, ws, 'rename', `renamed_from:${oldName}`)
   if (actualName !== oldName) ws.data.renamed = true
 
   const response: WsRenamed = { type: 'renamed', oldName, newName: actualName, ...(requestId && { requestId }) }
