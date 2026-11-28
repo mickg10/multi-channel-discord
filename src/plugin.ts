@@ -180,6 +180,10 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
           else if (msg.success) pending.resolve(msg.data)
           else pending.reject(new Error(msg.data))
         }
+      } else if (msg.type === 'takeover_refused') {
+        clearTimeout(timeout)
+        ws.close()
+        reject(new Error('takeover_refused'))
       } else if (msg.type === 'replaced') {
         onReplaced?.(msg.name, msg.reclaim !== false)
         if (!registered) {

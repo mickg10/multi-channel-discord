@@ -301,6 +301,7 @@ export interface WsReplaced {
 }
 
 export type RouterToPluginMessage =
+  | { type: 'takeover_refused'; name: string; reason: 'holder_live' }
   | { type: 'ping' | 'pong' }
   | WsReplaced
   | WsMessage

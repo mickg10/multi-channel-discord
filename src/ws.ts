@@ -868,6 +868,11 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         ? parsed.agent.toLowerCase() : undefined
       const conversationId = typeof parsed.conversationId === 'string' ? parsed.conversationId : ''
       const incumbent = deps.sessions.registeredIdentity(normalized)
+      if (incumbent && incumbent.instanceId !== parsed.instanceId &&
+          deps.sessions.answeredRecently(normalized, Date.now(), SILENCE_MS)) {
+        ws.send(JSON.stringify({ type: 'takeover_refused', name: normalized, reason: 'holder_live' }))
+        return
+      }
       if (incumbent && parsed.reclaimOnly === true) { sendError(ws, 'name_occupied'); return }
       const takeover = parsed.takeover === true || (parsed.takeover === undefined && parsed.mode === 'pull')
       if (incumbent && takeover) {
@@ -999,7 +1004,7 @@ function handleRegister(ws: WsLike, name: string, projectPath: string, instanceI
     projectPath,
     instanceId,
     name => !!deps.inboxes?.target(name),
-    identity,
+    { ...identity, lastPongAt: () => ws.data.lastPongAt },
   )
   ws.data.sessionName = actualName
   deps.subs?.reclaim(actualName, instanceId)
