@@ -17,7 +17,9 @@ import { computeBackoff } from './reconnect.js'
 import { discoverSkills } from './skills.js'
 import { getStateDir, loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
-import { existsSync, readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { spawn as spawnProc } from 'node:child_process'
 import type { RouterToPluginMessage, WsRegisterSkills, ChannelMeta } from './types.js'
 import { BUS_ALIAS_MAX, BusAlias, isBusAlias } from './bus-alias.js'
@@ -89,6 +91,11 @@ interface ConnectResult {
   readonly ws: WebSocket
   readonly registeredName: string
   readonly canReclaim: boolean
+  readonly swarm: string
+  readonly defaultSessions: readonly string[]
+  readonly routerSupportsSwarms: boolean
+  readonly swarmConfigured: boolean
+  readonly warning?: string
 }
 
 /** Pending request awaiting a WsToolResult response from the router. */
@@ -115,12 +122,30 @@ export interface ConnectToRouterOptions {
   readonly takeover?: boolean
   readonly reclaimOnly?: boolean
   readonly agent?: string
+  readonly swarm?: string
+  readonly generated?: boolean
+  readonly role?: string
   readonly onRenamed?: (name: string) => void
   readonly onMessage?: (content: string, meta: ChannelMeta) => void
   readonly pendingRequests?: Map<string, PendingRequest>
   readonly onPermissionVerdict?: (requestId: string, behavior: 'allow' | 'deny') => void
   /** The router gave our name to a newer connection. */
   readonly onReplaced?: (name: string, reclaim: boolean) => void
+  /** Operator killed this session via `/kill`; close WS, suppress reconnects, keep process alive (§10.2, impl-plan-v2 #32-3). */
+  readonly onKilled?: (reason?: string) => void
+  /** Another sibling connection moved this instance to a new swarm; re-register without closing (§10.3). */
+  readonly onSwarmChanged?: (swarm: string) => void
+  /** Confirmation of an in-place re-register on an already-open socket (after `swarm_changed`). */
+  readonly onReRegistered?: (info: {
+    readonly registeredName: string
+    readonly swarm: string
+    readonly defaultSessions: readonly string[]
+    readonly routerSupportsSwarms: boolean
+    readonly swarmConfigured: boolean
+    readonly warning?: string
+  }) => void
+  /** Error/rejection received for an in-place re-register on an already-open socket (M4). */
+  readonly onReRegisterError?: (message: string) => void
   /** Stable conversation id. A later session that reuses the display name does not inherit held approvals. */
   readonly conversationId?: string
 }
@@ -131,9 +156,44 @@ function clientInstanceId(agentKind = process.env.DISCORD_AGENT || 'claude'): st
   return process.env.DISCORD_INSTANCE_ID || (agentKind === 'claude' ? parent : `${parent}-${supervisor}`)
 }
 
+export function buildRegisterFrame(opts: {
+  name: string
+  projectPath: string
+  instanceId: string
+  agent: string
+  mode: 'push' | 'pull'
+  host?: string
+  takeover?: boolean
+  reclaimOnly?: boolean
+  secret?: string
+  costClass?: 'cheap' | 'standard' | 'premium'
+  conversationId?: string
+  swarm?: string
+  generated?: boolean
+  role?: string
+}): string {
+  return JSON.stringify({
+    type: 'register',
+    name: opts.name,
+    projectPath: opts.projectPath,
+    instanceId: opts.instanceId,
+    agent: opts.agent,
+    mode: opts.mode,
+    ...(opts.host && { host: opts.host }),
+    ...(opts.takeover !== undefined && { takeover: opts.takeover }),
+    ...(opts.reclaimOnly && { reclaimOnly: true }),
+    ...(opts.secret && { secret: opts.secret }),
+    ...(opts.costClass && { costClass: opts.costClass }),
+    ...(opts.conversationId && { conversationId: opts.conversationId }),
+    ...(opts.swarm && { swarm: opts.swarm }),
+    ...(opts.generated && { generated: true }),
+    ...(opts.role && { role: opts.role }),
+  })
+}
+
 /** Connect to the router via WebSocket and register. */
 export async function connectToRouter(opts: ConnectToRouterOptions): Promise<ConnectResult> {
-  const { wsPort, name, projectPath, onMessage, pendingRequests, onPermissionVerdict, conversationId, onReplaced } = opts
+  const { wsPort, name, projectPath, onMessage, pendingRequests, onPermissionVerdict, conversationId, onReplaced, onKilled, onSwarmChanged, onReRegistered, onReRegisterError } = opts
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(process.env.DISCORD_ROUTER_URL || `ws://localhost:${wsPort}`)
     const timeout = setTimeout(() => {
@@ -157,15 +217,58 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
       const agent = opts.agent ?? (process.env.DISCORD_AGENT || 'claude')
       const costClass = process.env.DISCORD_COST_CLASS
       const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
-      ws.send(JSON.stringify({ type: 'register', name, projectPath, instanceId, agent, mode, ...(opts.host && { host: opts.host }), ...(takeover !== undefined && { takeover }), ...(opts.reclaimOnly && { reclaimOnly: true }), ...(secret && { secret }), ...(cost && { costClass: cost }), ...(conversationId && { conversationId }) }))
+      ws.send(buildRegisterFrame({
+        name,
+        projectPath,
+        instanceId,
+        agent,
+        mode,
+        host: opts.host,
+        takeover,
+        reclaimOnly: opts.reclaimOnly,
+        secret,
+        costClass: cost,
+        conversationId,
+        swarm: opts.swarm,
+        generated: opts.generated,
+        role: opts.role,
+      }))
     }
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(String(event.data)) as RouterToPluginMessage
       if (msg.type === 'registered') {
-        registered = true
-        clearTimeout(timeout)
-        resolve({ ws, registeredName: msg.name, canReclaim: msg.reclaimOnly === true })
+        const routerSupportsSwarms = typeof msg.swarm === 'string'
+        const swarm = msg.swarm ?? 'default'
+        const defaultSessions = Array.isArray(msg.defaultSessions) && msg.defaultSessions.length > 0
+          ? msg.defaultSessions
+          : ['agents']
+        const swarmConfigured = msg.swarmConfigured === true
+        if (!registered) {
+          registered = true
+          clearTimeout(timeout)
+          resolve({
+            ws,
+            registeredName: msg.name,
+            canReclaim: msg.reclaimOnly === true,
+            swarm,
+            defaultSessions,
+            routerSupportsSwarms,
+            swarmConfigured,
+            warning: msg.warning,
+          })
+        } else {
+          onReRegistered?.({ registeredName: msg.name, swarm, defaultSessions, routerSupportsSwarms, swarmConfigured, warning: msg.warning })
+        }
+      } else if (msg.type === 'swarm_changed') {
+        onSwarmChanged?.(msg.swarm)
+      } else if (msg.type === 'killed') {
+        onKilled?.(msg.reason)
+        try { ws.close() } catch {}
+        if (!registered) {
+          clearTimeout(timeout)
+          reject(new Error('session killed by operator'))
+        }
       } else if (msg.type === 'message' && onMessage) {
         onMessage(msg.content, msg.meta)
       } else if (msg.type === 'toolResult' || msg.type === 'renamed') {
@@ -187,10 +290,13 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
         }
       } else if (msg.type === 'error') {
         process.stderr.write(`discord plugin: router error: ${msg.message}\n`)
-        if (!registered && (msg.message.startsWith('register rejected') || msg.message === 'takeover_refused' || msg.message === 'name_occupied')) {
+        const isRegError = msg.message.startsWith('register rejected') || msg.message === 'takeover_refused' || msg.message === 'name_occupied'
+        if (!registered && isRegError) {
           clearTimeout(timeout)
           ws.close()
           reject(new Error(msg.message))
+        } else if (registered && isRegError) {
+          onReRegisterError?.(msg.message)
         }
       } else if (msg.type === 'permissionVerdict' && onPermissionVerdict) {
         onPermissionVerdict(msg.requestId, msg.behavior)
@@ -220,23 +326,316 @@ async function getProjectDir(): Promise<string> {
   return process.env.OLDPWD ?? process.cwd()
 }
 
-/** Find the tmux pane hosting this process by matching ancestor PIDs to pane PIDs. */
-async function findTmuxPane(tmuxBin: string): Promise<string | undefined> {
-  try {
-    const { execFileSync } = await import('child_process')
-    const panes = new Map<string, string>()
-    for (const line of execFileSync(tmuxBin, ['list-panes', '-a', '-F', '#{pane_pid} #{pane_id}']).toString().split('\n')) {
-      const [pid, id] = line.trim().split(' ')
-      if (pid && id) panes.set(pid, id)
+export interface TmuxPaneInfo {
+  readonly paneId: string
+  readonly windowId: string
+}
+
+/** Parse `tmux list-panes -a -F '#{pane_pid} #{pane_id} #{window_id}'` output into a pid -> pane map. */
+export function parseTmuxPanes(output: string): Map<string, TmuxPaneInfo> {
+  const panes = new Map<string, TmuxPaneInfo>()
+  for (const line of output.split('\n')) {
+    const [pid, paneId, windowId] = line.trim().split(/\s+/)
+    if (pid && paneId && windowId) panes.set(pid, { paneId, windowId })
+  }
+  return panes
+}
+
+function parseSessionIdNum(sessionId: string): number {
+  const m = /^\$?(\d+)$/.exec(sessionId.trim())
+  return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER
+}
+
+/** Resolve raw swarm for `windowId` from `tmux list-windows -a -F '#{window_id}:#{session_id}:#{session_group}:#{session_name}'` (also accepts `\t`).
+ *  Uses `session_group` if set; for a window linked into several ungrouped sessions, picks the lowest `#{session_id}` (§5, §10.3). */
+export function resolveRawSwarmFromWindows(windowId: string, listWindowsOutput: string): string | undefined {
+  const matches: Array<{ sessionId: string; sessionGroup: string; sessionName: string }> = []
+  for (const line of listWindowsOutput.split('\n')) {
+    if (!line.trim()) continue
+    const sep = line.includes('\t') ? '\t' : ':'
+    const parts = line.split(sep)
+    if (parts.length < 4) continue
+    const wid = parts[0]
+    const sid = parts[1]
+    const group = parts[2]
+    const name = parts.slice(3).join(sep)
+    if (wid?.trim() === windowId && name?.trim()) {
+      matches.push({ sessionId: (sid ?? '').trim(), sessionGroup: (group ?? '').trim(), sessionName: name.trim() })
     }
-    let pid = String(process.pid)
-    for (let i = 0; i < 30 && pid && pid !== '0' && pid !== '1'; i++) {
-      const hit = panes.get(pid)
-      if (hit) return hit
-      pid = execFileSync('ps', ['-o', 'ppid=', '-p', pid]).toString().trim()
+  }
+  if (matches.length === 0) return undefined
+  matches.sort((a, b) => parseSessionIdNum(a.sessionId) - parseSessionIdNum(b.sessionId) || a.sessionId.localeCompare(b.sessionId))
+  const grouped = matches.find(m => m.sessionGroup.length > 0)
+  return grouped ? grouped.sessionGroup : matches[0]!.sessionName
+}
+
+/** Normalise a raw session name locally using the router's `defaultSessions` list + all-numeric rule (§10.1). */
+export function normalizeSwarmLocally(raw: string | undefined, defaultSessions: readonly string[]): string {
+  const trimmed = typeof raw === 'string' ? raw.trim() : ''
+  if (!trimmed || trimmed === 'default' || /^\d+$/.test(trimmed) || defaultSessions.includes(trimmed)) {
+    return 'default'
+  }
+  return trimmed
+}
+
+/** Key for `explicitAlias` and `assignedAlias`: bare `instanceId` in `default`, `${swarm}:${instanceId}` otherwise (§10.1). */
+export function aliasKeyForSwarm(swarm: string, instanceId: string): string {
+  return swarm === 'default' ? instanceId : `${swarm}:${instanceId}`
+}
+
+/** Expected generated name after router rewriting (`<agent>@<host>:<swarm>/<dir>` in non-default swarms). */
+export function expectedGeneratedName(baseName: string, swarm: string): string {
+  if (swarm === 'default') return baseName
+  const at = baseName.indexOf('@')
+  const colon = baseName.indexOf(':', at === -1 ? 0 : at)
+  const rewritten = colon === -1
+    ? `${swarm}/${baseName}`
+    : `${baseName.slice(0, colon + 1)}${swarm}/${baseName.slice(colon + 1)}`
+  return rewritten.length <= BUS_ALIAS_MAX ? rewritten : rewritten.slice(0, BUS_ALIAS_MAX)
+}
+
+/** Parse `ps -eo pid=,ppid=` output into a pid -> ppid map (m5 batching). */
+export function parsePsPpidTable(output: string): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const line of output.split('\n')) {
+    const parts = line.trim().split(/\s+/)
+    if (parts.length >= 2 && parts[0] && parts[1]) map.set(parts[0], parts[1])
+  }
+  return map
+}
+
+/** Walk up ancestor PIDs in memory against a parsed `ps` table + `tmux list-panes` map (m5 batching). */
+export function findAncestorTmuxPane(
+  startPid: string,
+  ppids: ReadonlyMap<string, string>,
+  panes: ReadonlyMap<string, TmuxPaneInfo>,
+  maxDepth = 30,
+): TmuxPaneInfo | undefined {
+  let pid: string | undefined = startPid
+  for (let i = 0; i < maxDepth && pid && pid !== '0' && pid !== '1'; i++) {
+    const hit = panes.get(pid)
+    if (hit) return hit
+    const next = ppids.get(pid)
+    if (!next || next === pid) break
+    pid = next
+  }
+  return undefined
+}
+
+export interface PersistedSwarmState {
+  readonly raw?: string
+  readonly swarm: string
+  readonly defaultSessions: readonly string[]
+  readonly configured?: boolean
+  /** Last router-approved generated name for `(raw, instanceId)` (rollback hint, impl-plan-v2 #32-2). */
+  readonly lastApprovedGeneratedName?: string
+}
+
+export const SWARM_STATE_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+function swarmStateDir(stateDir: string): string {
+  return join(stateDir, 'swarm-state')
+}
+
+function swarmStatePath(stateDir: string, instanceId: string): string {
+  const hash = createHash('sha256').update(instanceId).digest('hex')
+  return join(swarmStateDir(stateDir), `${hash}.json`)
+}
+
+export function loadPersistedSwarmState(stateDir: string, instanceId: string): PersistedSwarmState | null {
+  try {
+    const raw = readFileSync(swarmStatePath(stateDir, instanceId), 'utf8')
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    // Ignore stale/unconfigured swarm-state so no-config sessions stay in default (N2).
+    if (parsed.configured !== true) return null
+    if (typeof parsed.swarm !== 'string' || !parsed.swarm) return null
+    const defaultSessions = Array.isArray(parsed.defaultSessions)
+      ? parsed.defaultSessions.filter((s): s is string => typeof s === 'string' && s.length > 0)
+      : ['agents']
+    return {
+      raw: typeof parsed.raw === 'string' ? parsed.raw : undefined,
+      swarm: parsed.swarm,
+      defaultSessions: defaultSessions.length > 0 ? defaultSessions : ['agents'],
+      configured: true,
+      ...(typeof parsed.lastApprovedGeneratedName === 'string' && parsed.lastApprovedGeneratedName.length > 0
+        ? { lastApprovedGeneratedName: parsed.lastApprovedGeneratedName }
+        : {}),
+    }
+  } catch {
+    return null
+  }
+}
+
+export function removePersistedSwarmState(stateDir: string, instanceId: string): void {
+  try { unlinkSync(swarmStatePath(stateDir, instanceId)) } catch {}
+}
+
+export function savePersistedSwarmState(stateDir: string, instanceId: string, state: PersistedSwarmState): void {
+  // Write swarm-state/ only when the router reports configured; delete stale state otherwise (N2, housekeeping).
+  if (state.configured !== true) {
+    removePersistedSwarmState(stateDir, instanceId)
+    return
+  }
+  try {
+    const dir = swarmStateDir(stateDir)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    try { chmodSync(dir, 0o700) } catch {}
+    const target = swarmStatePath(stateDir, instanceId)
+    const tmp = `${target}.${process.pid}.${Date.now()}.tmp`
+    writeFileSync(tmp, JSON.stringify(state) + '\n', { encoding: 'utf8', mode: 0o600 })
+    try { chmodSync(tmp, 0o600) } catch {}
+    renameSync(tmp, target)
+  } catch {}
+}
+
+/** Delete swarm-state entries older than 30 days on startup (housekeeping). */
+export function pruneOldSwarmStates(stateDir: string, now = Date.now()): number {
+  let removed = 0
+  const dir = swarmStateDir(stateDir)
+  try {
+    for (const entry of readdirSync(dir)) {
+      const full = join(dir, entry)
+      try {
+        const st = statSync(full)
+        if (st.isFile() && now - st.mtimeMs > SWARM_STATE_TTL_MS) {
+          unlinkSync(full)
+          removed++
+        }
+      } catch {}
     }
   } catch {}
-  return undefined
+  return removed
+}
+
+function isTmuxNoServerError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false
+  const e = err as { stderr?: Buffer | string; message?: string; code?: string }
+  if (e.code === 'ENOENT') return true
+  const text = `${typeof e.stderr === 'string' ? e.stderr : e.stderr?.toString('utf8') ?? ''} ${e.message ?? ''}`.toLowerCase()
+  return text.includes('no server running') || text.includes('no such file or directory') || text.includes("can't find")
+}
+
+export type ExecTextFn = (cmd: string, args: readonly string[]) => string
+
+export interface DetectSwarmResult {
+  readonly ok: boolean
+  readonly pane: TmuxPaneInfo | undefined
+  readonly rawSwarm: string | undefined
+}
+
+/** Pure/injectable swarm + pane detection used by startup, connect(), and the 10 s timer (M2, m5).
+ *  On transient tmux/ps lookup failures, returns `{ ok: false, pane: prevPane, rawSwarm: prevRawSwarm }`. */
+export function detectSwarmAndPaneSync(opts: {
+  readonly tmuxBin: string
+  readonly startPid: string
+  readonly prevPane: TmuxPaneInfo | undefined
+  readonly prevRawSwarm: string | undefined
+  readonly envSwarm: string | undefined
+  readonly exec: ExecTextFn
+}): DetectSwarmResult {
+  let panesOut: string
+  try {
+    panesOut = opts.exec(opts.tmuxBin, ['list-panes', '-a', '-F', '#{pane_pid} #{pane_id} #{window_id}'])
+  } catch (err: unknown) {
+    if (isTmuxNoServerError(err)) return { ok: true, pane: undefined, rawSwarm: opts.envSwarm }
+    if (opts.prevPane !== undefined) return { ok: false, pane: opts.prevPane, rawSwarm: opts.prevRawSwarm }
+    return { ok: false, pane: undefined, rawSwarm: opts.prevRawSwarm }
+  }
+  const panes = parseTmuxPanes(panesOut)
+  if (panes.size === 0) return { ok: true, pane: undefined, rawSwarm: opts.envSwarm }
+  let psOut: string
+  try {
+    psOut = opts.exec('ps', ['-eo', 'pid=,ppid='])
+  } catch {
+    return { ok: false, pane: opts.prevPane, rawSwarm: opts.prevRawSwarm }
+  }
+  const ppids = parsePsPpidTable(psOut)
+  const pane = findAncestorTmuxPane(opts.startPid, ppids, panes)
+  if (!pane) return { ok: true, pane: undefined, rawSwarm: opts.envSwarm }
+  try {
+    const winOut = opts.exec(opts.tmuxBin, ['list-windows', '-a', '-F', '#{window_id}:#{session_id}:#{session_group}:#{session_name}'])
+    const raw = resolveRawSwarmFromWindows(pane.windowId, winOut)
+    if (raw === undefined) return { ok: false, pane: opts.prevPane, rawSwarm: opts.prevRawSwarm }
+    return { ok: true, pane, rawSwarm: raw }
+  } catch {
+    return { ok: false, pane: opts.prevPane, rawSwarm: opts.prevRawSwarm }
+  }
+}
+
+async function lookupTargetPaneId(tmuxBin: string, target: string): Promise<string | undefined> {
+  try {
+    const { execFileSync } = await import('child_process')
+    const out = execFileSync(tmuxBin, ['display-message', '-p', '-t', target, '#{pane_id}'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString().trim()
+    return out || undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function lookupTargetRawSwarm(tmuxBin: string, target: string): Promise<string | undefined> {
+  try {
+    const { execFileSync } = await import('child_process')
+    const out = execFileSync(tmuxBin, ['display-message', '-p', '-t', target, '#{session_group}:#{session_name}'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).toString().replace(/\r?\n$/, '')
+    if (!out) return undefined
+    const sep = out.indexOf(':')
+    if (sep === -1) return out.trim() || undefined
+    const group = out.slice(0, sep).trim()
+    const name = out.slice(sep + 1).trim()
+    return group || name || undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Detect whether an ancestor process command line belongs to grok or opencode (§10.7). */
+export function detectForeignAgentFromCommands(commands: readonly string[]): 'grok' | 'opencode' | null {
+  for (const raw of commands) {
+    const cmd = raw.trim()
+    if (!cmd) continue
+    const tokens = cmd.split(/\s+/)
+    for (const tok of tokens.slice(0, 2)) {
+      const base = tok.split('/').pop()?.toLowerCase()
+      if (base === 'grok') return 'grok'
+      if (base === 'opencode') return 'opencode'
+    }
+  }
+  return null
+}
+
+/** True when grok/opencode auto-loaded ~/.claude/plugins with DISCORD_AGENT unset (§10.7). */
+export function isDuplicateClaudePluginUnderForeignAgent(
+  env: Readonly<Record<string, string | undefined>>,
+  ancestorCommands: readonly string[],
+): 'grok' | 'opencode' | null {
+  if (env.DISCORD_AGENT) return null
+  return detectForeignAgentFromCommands(ancestorCommands)
+}
+
+function readAncestorCommands(maxDepth = 12): string[] {
+  const out: string[] = []
+  try {
+    const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
+    let pid = String(process.ppid)
+    for (let i = 0; i < maxDepth && pid && pid !== '0' && pid !== '1'; i++) {
+      const line = execFileSync('ps', ['-o', 'ppid=,command=', '-p', pid], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+      if (!line) break
+      const m = /^(\d+)\s+([\s\S]+)$/.exec(line)
+      if (!m) break
+      out.push(m[2]!)
+      pid = m[1]!
+    }
+  } catch {}
+  return out
+}
+
+/** True if an ancestor process is the ChatGPT desktop app (its built-in Codex). */
+function underChatGPTApp(ancestorCommands?: readonly string[]): boolean {
+  const cmds = ancestorCommands ?? readAncestorCommands()
+  return cmds.some(line => line.includes('/Applications/ChatGPT.app/'))
 }
 
 /** Read local files for upload (the router is remote and never sees our filesystem). */
@@ -263,28 +662,23 @@ function reloadClientEnv(): void {
   } catch {}
 }
 
-/** True if an ancestor process is the ChatGPT desktop app (its built-in Codex). */
-function underChatGPTApp(): boolean {
-  try {
-    const { execFileSync } = require('node:child_process') as typeof import('node:child_process')
-    let pid = String(process.pid)
-    for (let i = 0; i < 12 && pid && pid !== '0' && pid !== '1'; i++) {
-      const line = execFileSync('ps', ['-o', 'ppid=,command=', '-p', pid]).toString().trim()
-      if (line.includes('/Applications/ChatGPT.app/')) return true
-      pid = line.split(/\s+/)[0]
-    }
-  } catch {}
-  return false
-}
-
 /** Start the MCP plugin. */
 export async function startPlugin(): Promise<void> {
   // Claude Code sets --cwd to the plugin cache dir, not the actual project.
   // Walk up the process tree to find Claude Code's cwd (the real project dir).
   // Client config (router URL, secret, agent label) lives in the same .env as the bot token.
   loadEnvFile()
-  const inChatGPT = underChatGPTApp()
+  const ancestorCmds = readAncestorCommands()
+  const inChatGPT = underChatGPTApp(ancestorCmds)
+  if (!inChatGPT) {
+    const foreign = isDuplicateClaudePluginUnderForeignAgent(process.env, ancestorCmds)
+    if (foreign) {
+      process.stderr.write(`discord plugin: detected ${foreign} ancestor with DISCORD_AGENT unset; disabling duplicate Claude plugin load\n`)
+      process.exit(0)
+    }
+  }
   const agent = inChatGPT ? 'chatgpt-codex' : (process.env.DISCORD_AGENT || 'claude')
+  const role = process.env.DISCORD_ROLE || undefined
   // Claude tells us its project directory and keeps a session file; guessing from the process
   // tree fails under the supervisor (the runner's cwd is the plugin cache).
   const claude = agent === 'claude' ? findClaudeSession(String(process.ppid)) : undefined
@@ -305,14 +699,23 @@ export async function startPlugin(): Promise<void> {
   const configuredName = !inChatGPT ? process.env.DISCORD_SESSION_NAME : undefined
   delete process.env.DISCORD_SESSION_NAME
   delete process.env.DISCORD_INSTANCE_ID
-  const explicitAlias = new BusAlias(getStateDir(), instanceId)
-  // A `-N` name the router handed out because this instance's own name was taken. It is
-  // asked for again as it is, so the instance keeps it across restarts. It is kept apart
-  // from the explicit alias (bus_rename, a /name), which always wins over it.
-  const assignedAlias = new BusAlias(getStateDir(), instanceId, 'assigned-aliases')
+  const stateDir = getStateDir()
+  const explicitCache = new Map<string, BusAlias>()
+  const assignedCache = new Map<string, BusAlias>()
+  const explicitAliasFor = (swarm: string): BusAlias => {
+    const key = aliasKeyForSwarm(swarm, instanceId)
+    let store = explicitCache.get(key)
+    if (!store) { store = new BusAlias(stateDir, key); explicitCache.set(key, store) }
+    return store
+  }
+  const assignedAliasFor = (swarm: string): BusAlias => {
+    const key = aliasKeyForSwarm(swarm, instanceId)
+    let store = assignedCache.get(key)
+    if (!store) { store = new BusAlias(stateDir, key, 'assigned-aliases'); assignedCache.set(key, store) }
+    return store
+  }
   // What this instance calls itself when nothing is saved, read live: a /name can change it.
   const sessionBase = (): string => configuredName || generatedName(claudeAlias() ?? namingCtx.dirName)
-  const sessionName = explicitAlias.name || assignedAlias.name || sessionBase()
 
   // Inbox: every inbound message is also queued here so clients without channel push
   // (Codex, agy) can read them with the check_inbox tool.
@@ -320,11 +723,93 @@ export async function startPlugin(): Promise<void> {
   const INBOX_MAX = 200
 
   // Optional wake-up for clients without push: type a nudge into the agent's tmux pane.
+  // Always discover own pane via ancestor walk (whatever DISCORD_WAKE is); with config, never read TMUX_PANE (§5).
   const wakeMode = inChatGPT ? undefined : process.env.DISCORD_WAKE // 'tmux' to enable
   const tmuxBin = ['/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux'].find(p => { try { return existsSync(p) } catch { return false } }) ?? 'tmux'
-  let wakePane = process.env.DISCORD_WAKE_PANE || process.env.TMUX_PANE
-  if (wakeMode === 'tmux' && !wakePane) wakePane = await findTmuxPane(tmuxBin)
+  const configuredWakePane = !inChatGPT ? process.env.DISCORD_WAKE_PANE : undefined
+  let ownPane: TmuxPaneInfo | undefined
+  let wakePane: string | undefined
+  pruneOldSwarmStates(stateDir)
+  const persistedSwarm = loadPersistedSwarmState(stateDir, instanceId)
+  let currentSwarm = 'default'
+  let currentDefaultSessions: readonly string[] = persistedSwarm?.defaultSessions ?? ['agents']
+  let routerSwarmConfigured = Boolean(persistedSwarm?.configured)
+  let lastRouterRaw: string | undefined = persistedSwarm?.raw
+  let lastRouterSwarm: string | undefined = persistedSwarm?.swarm
+  let lastApprovedGeneratedName: string | undefined = persistedSwarm?.lastApprovedGeneratedName
+  let lastRawSwarm: string | undefined
+  let routerSupportsSwarms = false
+
+  // Router owns swarm normalisation (B1 / §10.1 / N2): reuse persisted/router-returned swarm only when configured and raw is unchanged; else default.
+  function swarmGuessForRaw(raw: string | undefined): string {
+    if (routerSwarmConfigured && lastRouterSwarm !== undefined && lastRouterRaw === raw) return lastRouterSwarm
+    return 'default'
+  }
+
+  /** Return cached rollback hint when raw swarm is unchanged and no explicit/assigned/configured name applies (#32-2). */
+  function rollbackHintForRaw(raw: string | undefined): string | undefined {
+    if (lastApprovedGeneratedName && lastRouterRaw !== undefined && raw === lastRouterRaw) {
+      return lastApprovedGeneratedName
+    }
+    return undefined
+  }
+
+  async function detectSwarmAndPane(): Promise<DetectSwarmResult> {
+    if (inChatGPT) return { ok: true, pane: undefined, rawSwarm: 'default' }
+    const { execFileSync } = await import('child_process')
+    return detectSwarmAndPaneSync({
+      tmuxBin,
+      startPid: String(process.pid),
+      prevPane: ownPane,
+      prevRawSwarm: lastRawSwarm,
+      envSwarm: process.env.SWARM_ID?.trim() || undefined,
+      exec: (cmd, args) => execFileSync(cmd, [...args], { stdio: ['ignore', 'pipe', 'pipe'] }).toString(),
+    })
+  }
+
+  async function refreshWakePane(): Promise<void> {
+    if (wakeMode !== 'tmux') { wakePane = undefined; return }
+    if (!routerSwarmConfigured) {
+      // With no swarms-config.json (or old router), keep today's DISCORD_WAKE_PANE / own-pane / TMUX_PANE fallback (B3, N5).
+      wakePane = configuredWakePane || ownPane?.paneId || process.env.TMUX_PANE
+      return
+    }
+    // With swarms-config.json: own pane wins; warn if DISCORD_WAKE_PANE resolves to a different pane (§5, B3).
+    if (ownPane) {
+      if (configuredWakePane) {
+        const targetPaneId = await lookupTargetPaneId(tmuxBin, configuredWakePane)
+        if (!targetPaneId || targetPaneId !== ownPane.paneId) {
+          process.stderr.write(
+            `discord plugin: DISCORD_WAKE_PANE="${configuredWakePane}"${targetPaneId ? ` (${targetPaneId})` : ''} differs from own pane ${ownPane.paneId}; waking own pane\n`,
+          )
+        }
+      }
+      wakePane = ownPane.paneId
+      return
+    }
+    if (!configuredWakePane) {
+      wakePane = undefined
+      return
+    }
+    // Without an own pane, use DISCORD_WAKE_PANE only if its session normalises to currentSwarm (§5, B3).
+    const targetRaw = await lookupTargetRawSwarm(tmuxBin, configuredWakePane)
+    const targetNorm = normalizeSwarmLocally(targetRaw, currentDefaultSessions)
+    if (!targetRaw || targetNorm !== currentSwarm) {
+      process.stderr.write(`discord plugin: ignoring DISCORD_WAKE_PANE="${configuredWakePane}" (session "${targetRaw ?? 'unknown'}" -> swarm "${targetNorm}", expected "${currentSwarm}")\n`)
+      wakePane = undefined
+      return
+    }
+    wakePane = configuredWakePane
+  }
+
+  const initialDetect = await detectSwarmAndPane()
+  ownPane = initialDetect.pane
+  lastRawSwarm = initialDetect.rawSwarm
+  const initialSwarmGuess = swarmGuessForRaw(lastRawSwarm)
+  currentSwarm = initialSwarmGuess
+  await refreshWakePane()
   if (wakeMode === 'tmux') process.stderr.write(`discord plugin: tmux wake ${wakePane ? `-> pane ${wakePane}` : 'disabled (no pane found)'}\n`)
+  const sessionName = explicitAliasFor(initialSwarmGuess).name || assignedAliasFor(initialSwarmGuess).name || sessionBase()
   const wakeText = process.env.DISCORD_WAKE_TEXT || 'New agent-bus/Discord message(s): call the discord check_inbox tool and handle them.'
   let wakeTimer: ReturnType<typeof setTimeout> | null = null
   let wakeInFlight = false
@@ -335,7 +820,7 @@ export async function startPlugin(): Promise<void> {
   // One nudge until check_inbox acks it. A second directed message stays queued (hold)
   // and is either included in that drain or nudges exactly once after the ack.
   function considerWake(): void {
-    if (retired) return
+    if (retired || killed) return
     if (latchDecision(wakeInFlight, inbox.length) !== 'send') return
     if (wakeMode !== 'tmux' || !wakePane || wakeTimer) return
     wakeInFlight = true
@@ -403,13 +888,39 @@ export async function startPlugin(): Promise<void> {
   }
   let renamePending = false
   let registrationError: string | undefined
+  let lastRejectReason: string | undefined
+  let rejectRetry = false
   let reconnectAttempt = 0
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined
   let shuttingDown = false
   let retired = false
+  let killed = false
+  const KILLED_MESSAGE = 'session killed by operator'
   let routerSupportsReclaim = false
   let reclaimAllowed = true
   const pendingRequests = new Map<string, PendingRequest>()
+
+  function markKilled(reason?: string): void {
+    if (killed) return
+    killed = true
+    process.stderr.write(`discord plugin: session killed by operator${reason ? ` (${reason})` : ''}; suppressing reconnects\n`)
+    ackWake()
+    clearReRegisterTimer()
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = undefined }
+    if (aliasTimer) { clearInterval(aliasTimer); aliasTimer = null }
+    for (const [id, pending] of pendingRequests) {
+      clearTimeout(pending.timer)
+      pendingRequests.delete(id)
+      pending.reject(new Error(KILLED_MESSAGE))
+    }
+    if (currentWs) {
+      const old = currentWs
+      currentWs = null
+      old.onclose = null
+      old.onerror = null
+      try { old.close() } catch {}
+    }
+  }
 
   function onMessage(content: string, meta: ChannelMeta): void {
     process.stderr.write(`discord plugin: received message from router: "${content.slice(0, 50)}"\n`)
@@ -437,8 +948,12 @@ export async function startPlugin(): Promise<void> {
   /** Send a WS message and await a tool result response. */
   function sendToolRequest(msg: Record<string, unknown>): Promise<string> {
     return new Promise((resolve, reject) => {
+      if (killed) {
+        reject(new Error(KILLED_MESSAGE))
+        return
+      }
       if (!currentWs || currentWs.readyState !== WebSocket.OPEN) {
-        reject(new Error('Not connected to router'))
+        reject(new Error(lastRejectReason ?? 'Not connected to router'))
         return
       }
       const requestId = nextRequestId()
@@ -451,30 +966,273 @@ export async function startPlugin(): Promise<void> {
     })
   }
 
+  let reRegisterTimer: ReturnType<typeof setTimeout> | null = null
+  let lastRequestedSwarmGuess = initialSwarmGuess
+  let lastRequestUsedGuessAlias = false
+  let pendingSavedAliasSync = false
+
+  function clearReRegisterTimer(): void {
+    if (reRegisterTimer) { clearTimeout(reRegisterTimer); reRegisterTimer = null }
+  }
+
+  function handleRegisterFailure(errMessage: string, requestedNameForMsg: string): void {
+    if (errMessage === 'takeover_refused') {
+      registrationError = 'The router refused to take over the pinned bus alias. Check DISCORD_AGENT and DISCORD_SESSION_NAME.'
+      process.stderr.write(`discord plugin: ${registrationError}\n`)
+      return
+    }
+    if (errMessage === 'register rejected: invalid_bus_alias') {
+      registrationError = 'The router rejected the bus alias. Check DISCORD_SESSION_NAME and DISCORD_HOST_LABEL, then restart the client.'
+      process.stderr.write(`discord plugin: ${registrationError}\n`)
+      return
+    }
+    if (errMessage.startsWith('register rejected:')) {
+      if (errMessage.includes('unknown_swarm')) {
+        lastRejectReason = `Registration rejected (unknown_swarm): session "${lastRawSwarm ?? '(none)'}" is not a configured swarm or in defaultSessions. Add it to swarms-config.json or move to a configured session. Retrying every 60s.`
+        rejectRetry = true
+      } else if (errMessage.includes('protected_alias')) {
+        lastRejectReason = `Registration rejected (protected_alias): alias "${requestedNameForMsg}" is protected (wrong swarm or already held/leased; protected aliases must be pinned with DISCORD_SESSION_NAME). Retrying every 60s.`
+        rejectRetry = true
+      } else {
+        // Router-secret and other rejections keep exponential backoff (m5).
+        lastRejectReason = errMessage
+        rejectRetry = false
+      }
+      process.stderr.write(`discord plugin: ${lastRejectReason}\n`)
+      if (!shuttingDown) scheduleReconnect()
+      return
+    }
+    rejectRetry = false
+    process.stderr.write(`discord plugin: connection failed: ${errMessage}\n`)
+    if (!shuttingDown) scheduleReconnect()
+  }
+
+  function applyRegistrationResult(info: {
+    registeredName: string
+    swarm: string
+    defaultSessions: readonly string[]
+    routerSupportsSwarms: boolean
+    swarmConfigured: boolean
+    warning?: string
+  }, allowSavedAliasSync = true): void {
+    clearReRegisterTimer()
+    currentSwarm = info.swarm
+    currentDefaultSessions = info.defaultSessions
+    const activeExplicit = explicitAliasFor(currentSwarm)
+    const activeAssigned = assignedAliasFor(currentSwarm)
+    activeExplicit.restore()
+    activeAssigned.restore()
+    if (info.routerSupportsSwarms) {
+      routerSwarmConfigured = info.swarmConfigured
+      lastRouterRaw = lastRawSwarm
+      lastRouterSwarm = info.swarm
+      const nextHint = info.swarmConfigured && info.swarm !== 'default' && !configuredName && !activeExplicit.name
+        ? info.registeredName
+        : undefined
+      lastApprovedGeneratedName = nextHint
+      savePersistedSwarmState(stateDir, instanceId, {
+        raw: lastRawSwarm,
+        swarm: info.swarm,
+        defaultSessions: info.defaultSessions,
+        configured: info.swarmConfigured,
+        ...(nextHint && { lastApprovedGeneratedName: nextHint }),
+      })
+    } else {
+      // Pre-swarm router rollback (#32-2): preserve swarm-state on disk so rollback hint survives restarts.
+      routerSwarmConfigured = false
+    }
+    currentName = info.registeredName
+    lastRejectReason = undefined
+    rejectRetry = false
+    retired = false
+    reclaimAllowed = true
+    if (info.warning) {
+      process.stderr.write(`discord plugin: registration notice: ${info.warning}\n`)
+    }
+    // B1 & N2: If a swarm-aware router's authoritative swarm differs from our guess:
+    //  - If the target swarm's store holds a different saved name (B1), or
+    //  - If this request sent a stale alias/hint from the wrong guess (N2, e.g. config removed after cfd),
+    // never save an assigned alias from this mismatched response; reconnect under the target swarm's
+    // saved alias or plain sessionBase().
+    // (Skip for pre-swarm routers where !routerSupportsSwarms so the rollback hint keeps its :cfd/ name, #32-2.)
+    if (info.routerSupportsSwarms && info.swarm !== lastRequestedSwarmGuess) {
+      const savedForSwarm = activeExplicit.name || activeAssigned.name
+      const desiredName = savedForSwarm || (lastRequestUsedGuessAlias ? sessionBase() : undefined)
+      if (allowSavedAliasSync && !pendingSavedAliasSync && desiredName && desiredName !== info.registeredName) {
+        pendingSavedAliasSync = true
+        void refreshWakePane()
+        if (currentWs) {
+          const old = currentWs
+          currentWs = null
+          old.onclose = null
+          try { old.close() } catch {}
+        }
+        if (!shuttingDown && !killed) scheduleReconnect(true)
+        return
+      }
+      if (lastRequestUsedGuessAlias) {
+        pendingSavedAliasSync = false
+        void refreshWakePane()
+        return
+      }
+    }
+    pendingSavedAliasSync = false
+    if (activeExplicit.name && configuredName && activeExplicit.name !== configuredName) {
+      process.stderr.write(`discord plugin: using saved bus alias "${info.registeredName}" (overrides DISCORD_SESSION_NAME)\n`)
+    }
+    const keptRollbackAlias = !info.routerSupportsSwarms && (
+      (lastRequestedSwarmGuess !== 'default' && lastRequestUsedGuessAlias) ||
+      (!!lastApprovedGeneratedName && info.registeredName === lastApprovedGeneratedName)
+    )
+    // Never overwrite explicitAlias with a -N collision (§10.2), never save a pinned name as assigned (M1),
+    // and never pollute default assigned-aliases with a non-default explicit/assigned/rollback alias on pre-swarm rollback (#32-2).
+    if (activeExplicit.name || configuredName) {
+      forget(activeAssigned)
+    } else if (keptRollbackAlias) {
+      // Leave default assigned-aliases untouched while using a non-default alias on a rolled-back pre-swarm router.
+    } else if (info.registeredName !== expectedGeneratedName(sessionBase(), currentSwarm)) {
+      if (activeAssigned.name !== info.registeredName) {
+        try { activeAssigned.save(info.registeredName) } catch { process.stderr.write('discord plugin: could not save the name the router assigned\n') }
+      }
+    } else {
+      forget(activeAssigned)
+    }
+    void refreshWakePane()
+  }
+
+  async function reRegisterInPlace(newSwarm: string): Promise<void> {
+    if (shuttingDown || killed) return
+    const detected = await detectSwarmAndPane()
+    // #32-1: Never pair newSwarm's alias with a stale lastRawSwarm; abort and reconnect on detection failure.
+    if (!detected.ok) {
+      process.stderr.write(`discord plugin: swarm detection failed during in-place re-register (-> ${newSwarm}); closing and reconnecting\n`)
+      clearReRegisterTimer()
+      if (currentWs) {
+        const old = currentWs
+        currentWs = null
+        old.onclose = null
+        try { old.close() } catch {}
+      }
+      if (!shuttingDown && !killed) scheduleReconnect()
+      return
+    }
+    ownPane = detected.pane
+    lastRawSwarm = detected.rawSwarm
+    currentSwarm = newSwarm
+    lastRequestedSwarmGuess = newSwarm
+    const activeExplicit = explicitAliasFor(newSwarm)
+    const activeAssigned = assignedAliasFor(newSwarm)
+    activeExplicit.restore()
+    activeAssigned.restore()
+    const base = sessionBase()
+    const rollbackHint = !configuredName && !activeExplicit.name && !activeAssigned.name ? rollbackHintForRaw(lastRawSwarm) : undefined
+    lastRequestUsedGuessAlias = Boolean(activeExplicit.name || activeAssigned.name || rollbackHint)
+    const wantName = activeExplicit.name ?? activeAssigned.name ?? rollbackHint ?? base
+    const isGenerated = !configuredName && !activeExplicit.name && !activeAssigned.name
+    currentName = wantName
+    if (!currentWs || currentWs.readyState !== WebSocket.OPEN) return
+    const secret = process.env.DISCORD_ROUTER_SECRET || undefined
+    const mode = process.env.DISCORD_MODE === 'pull' ? 'pull' : 'push'
+    const costClass = process.env.DISCORD_COST_CLASS
+    const cost = costClass === 'cheap' || costClass === 'standard' || costClass === 'premium' ? costClass : undefined
+    const conversationId = process.env.DISCORD_CONVERSATION_ID || claude?.sessionId
+    const assigned = !activeExplicit.name && !!activeAssigned.name
+    const takeover = activeExplicit.name ? false : assigned ? false : configuredName ? true : undefined
+    clearReRegisterTimer()
+    reRegisterTimer = setTimeout(() => {
+      reRegisterTimer = null
+      process.stderr.write('discord plugin: in-place re-register timed out; reconnecting\n')
+      if (currentWs) {
+        const old = currentWs
+        currentWs = null
+        old.onclose = null
+        try { old.close() } catch {}
+      }
+      if (!shuttingDown && !killed) scheduleReconnect()
+    }, 5_000)
+    currentWs.send(buildRegisterFrame({
+      name: wantName,
+      projectPath: cwd,
+      instanceId,
+      agent,
+      mode,
+      host: hostLabel,
+      takeover,
+      secret,
+      costClass: cost,
+      conversationId,
+      swarm: lastRawSwarm,
+      generated: isGenerated,
+      role,
+    }))
+  }
+
   async function connect(): Promise<void> {
+    if (shuttingDown || killed) return
     // Re-read router URL / secret each (re)connect so moving the router or rotating the
     // secret needs no agent restart.
     reloadClientEnv()
-    explicitAlias.restore()
+    // Recompute pane and raw session inside connect() before every register (§10.1, M2).
+    const detected = await detectSwarmAndPane()
+    if (detected.ok) {
+      ownPane = detected.pane
+      lastRawSwarm = detected.rawSwarm
+    }
+    const swarmGuess = swarmGuessForRaw(lastRawSwarm)
+    lastRequestedSwarmGuess = swarmGuess
+    pendingSavedAliasSync = false
+    const activeExplicit = explicitAliasFor(swarmGuess)
+    const activeAssigned = assignedAliasFor(swarmGuess)
+    activeExplicit.restore()
+    activeAssigned.restore()
+    const base = sessionBase()
+    const isGenerated = !configuredName && !activeExplicit.name && !activeAssigned.name
+    const rollbackHint = isGenerated ? rollbackHintForRaw(lastRawSwarm) : undefined
+    lastRequestUsedGuessAlias = Boolean(activeExplicit.name || activeAssigned.name || rollbackHint)
     // A name the router assigned is asked for as it is and not taken over: the router holds
     // it for this instance, and taking it over would be a claim on somebody else's name.
-    const assigned = !explicitAlias.name && !!assignedAlias.name
+    const assigned = !activeExplicit.name && !!activeAssigned.name
+    const requestedName = activeExplicit.name ?? activeAssigned.name ?? rollbackHint ?? base
     // Don't auto-spawn the router — it's a Discord bot that must be started manually.
     // The plugin just connects to it.
     try {
       const conversationId = process.env.DISCORD_CONVERSATION_ID || claude?.sessionId
-      const { ws, registeredName, canReclaim } = await connectToRouter({
+      const reg = await connectToRouter({
         wsPort,
-        name: explicitAlias.name ?? assignedAlias.name ?? currentName,
+        name: requestedName,
         projectPath: cwd,
         instanceId,
         host: hostLabel,
         agent,
-        ...((retired || explicitAlias.name) ? { takeover: false, reclaimOnly: retired } : assigned ? { takeover: false } : configuredName && { takeover: true }),
+        swarm: lastRawSwarm,
+        generated: isGenerated,
+        role,
+        ...((retired || activeExplicit.name) ? { takeover: false, reclaimOnly: retired } : assigned ? { takeover: false } : configuredName && { takeover: true }),
         onRenamed: name => { currentName = name },
         onMessage,
         pendingRequests,
         onPermissionVerdict,
+        onKilled: reason => markKilled(reason),
+        onSwarmChanged: (newSwarm: string) => {
+          process.stderr.write(`discord plugin: router reported swarm_changed -> ${newSwarm}; re-registering in place\n`)
+          void reRegisterInPlace(newSwarm)
+        },
+        onReRegistered: info => {
+          applyRegistrationResult(info, false)
+          process.stderr.write(`discord plugin: re-registered as "${info.registeredName}" (swarm=${info.swarm})\n`)
+        },
+        onReRegisterError: (errMsg: string) => {
+          // Failed in-place re-register must close the socket and schedule a reconnect (M4).
+          clearReRegisterTimer()
+          pendingSavedAliasSync = false
+          if (currentWs) {
+            const old = currentWs
+            currentWs = null
+            old.onclose = null
+            try { old.close() } catch {}
+          }
+          handleRegisterFailure(errMsg, currentName)
+        },
         onReplaced: (n: string, reclaim: boolean) => {
           reclaimAllowed = reclaim
           process.stderr.write(`discord plugin: name "${n}" taken over${reclaim ? '; waiting for it to become free' : '; conversation superseded'}\n`)
@@ -484,77 +1242,63 @@ export async function startPlugin(): Promise<void> {
         },
         ...(conversationId && { conversationId }),
       })
-      currentWs = ws
-      routerSupportsReclaim = canReclaim
-      currentName = registeredName
-      retired = false
-      reclaimAllowed = true
-      if (explicitAlias.name && configuredName && explicitAlias.name !== configuredName) {
-        process.stderr.write(`discord plugin: using saved bus alias "${registeredName}" (overrides DISCORD_SESSION_NAME)\n`)
+      if (killed) {
+        try { reg.ws.close() } catch {}
+        return
       }
-      if (explicitAlias.name && explicitAlias.name !== registeredName) {
-        try { explicitAlias.save(registeredName) } catch { process.stderr.write('discord plugin: could not save the registered bus alias\n') }
-      }
-      if (explicitAlias.name) {
-        // the explicit alias always wins: there is no assigned name left to remember
-        forget(assignedAlias)
-      } else if (registeredName !== sessionBase()) {
-        // the router gave another name, a `-N` one because this instance's own was taken:
-        // ask for that again next time, so it is this instance's from then on
-        if (assignedAlias.name !== registeredName) {
-          try { assignedAlias.save(registeredName) } catch { process.stderr.write('discord plugin: could not save the name the router assigned\n') }
-        }
-      } else {
-        // registered under the name this instance asks for by itself
-        forget(assignedAlias)
-      }
+      currentWs = reg.ws
+      routerSupportsReclaim = reg.canReclaim
+      routerSupportsSwarms = reg.routerSupportsSwarms
+      applyRegistrationResult(reg, true)
+      // N1: If applyRegistrationResult closed reg.ws to reconnect under another swarm's alias/base,
+      // stop here so we do not attach onclose/onerror or send registerSkills on the closing socket.
+      if (currentWs !== reg.ws) return
       reconnectAttempt = 0
-      process.stderr.write(`discord plugin: connected as "${registeredName}"\n`)
+      process.stderr.write(`discord plugin: connected as "${reg.registeredName}" (swarm=${reg.swarm})\n`)
       if (alias !== undefined || agent === 'claude') startAliasWatch()
 
       // Fire-and-forget: discover and register skills as slash commands asynchronously
       discoverSkills(cwd).then(skills => {
-        if (skills.length > 0 && ws.readyState === WebSocket.OPEN) {
+        if (skills.length > 0 && reg.ws.readyState === WebSocket.OPEN) {
           const msg: WsRegisterSkills = { type: 'registerSkills', skills }
-          ws.send(JSON.stringify(msg))
+          reg.ws.send(JSON.stringify(msg))
           process.stderr.write(`discord plugin: registered ${skills.length} skill(s)\n`)
         }
       }).catch((err: unknown) => {
         process.stderr.write(`discord plugin: skill discovery failed: ${err instanceof Error ? err.message : String(err)}\n`)
       })
 
-      ws.onclose = () => {
+      reg.ws.onclose = () => {
+        if (currentWs !== reg.ws) return
+        clearReRegisterTimer()
         currentWs = null
-        if (!shuttingDown) scheduleReconnect()
+        if (!shuttingDown && !killed) scheduleReconnect()
       }
 
-      ws.onerror = () => {
+      reg.ws.onerror = () => {
+        if (currentWs !== reg.ws) return
+        clearReRegisterTimer()
         currentWs = null
       }
     } catch (err: unknown) {
-      if (err instanceof Error && err.message === 'takeover_refused') {
-        registrationError = 'The router refused to take over the pinned bus alias. Check DISCORD_AGENT and DISCORD_SESSION_NAME.'
-        process.stderr.write(`discord plugin: ${registrationError}\n`)
-        return
-      }
-      if (err instanceof Error && err.message === 'register rejected: invalid_bus_alias') {
-        registrationError = 'The router rejected the bus alias. Check DISCORD_SESSION_NAME and DISCORD_HOST_LABEL, then restart the client.'
-        process.stderr.write(`discord plugin: ${registrationError}\n`)
-        return
-      }
-      process.stderr.write(`discord plugin: connection failed: ${err instanceof Error ? err.message : String(err)}\n`)
-      if (!shuttingDown) scheduleReconnect()
+      if (killed) return
+      handleRegisterFailure(err instanceof Error ? err.message : String(err), requestedName)
     }
   }
 
   let aliasTimer: ReturnType<typeof setInterval> | null = null
+  let lastClaudeAlias: string | undefined = alias
   function startAliasWatch(): void {
-    if (aliasTimer || explicitAlias.name || configuredName || !claude) return
+    if (aliasTimer || explicitAliasFor(currentSwarm).name || configuredName || !claude) return
     aliasTimer = setInterval(() => {
-      explicitAlias.restore()
-      if (explicitAlias.name) { clearInterval(aliasTimer!); aliasTimer = null; return }
+      const activeExplicit = explicitAliasFor(currentSwarm)
+      activeExplicit.restore()
+      if (activeExplicit.name) { clearInterval(aliasTimer!); aliasTimer = null; return }
       const a = claudeAlias()
-      const want = generatedName(a ?? namingCtx.dirName)
+      // Fire only when claudeAlias() actually changes (prevents 15s rename spam on -2 seats, §10.5).
+      if (a === lastClaudeAlias) return
+      lastClaudeAlias = a
+      const want = expectedGeneratedName(generatedName(a ?? namingCtx.dirName), currentSwarm)
       if (!renamePending && want !== currentName && currentWs && currentWs.readyState === WebSocket.OPEN) {
         process.stderr.write(`discord plugin: /name changed -> ${want}\n`)
         currentWs.send(JSON.stringify({ type: 'rename', name: want }))
@@ -564,13 +1308,15 @@ export async function startPlugin(): Promise<void> {
     aliasTimer.unref?.()
   }
 
-  function scheduleReconnect(): void {
-    if (reconnectTimer || shuttingDown || (retired && (!routerSupportsReclaim || !reclaimAllowed))) return
-    const delay = retired ? 60_000 : computeBackoff(reconnectAttempt++)
+  function scheduleReconnect(immediate = false): void {
+    if (shuttingDown || killed || (retired && (!routerSupportsReclaim || !reclaimAllowed))) return
+    if (immediate && reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = undefined }
+    if (reconnectTimer) return
+    const delay = immediate ? 0 : (retired || rejectRetry) ? 60_000 : computeBackoff(reconnectAttempt++)
     process.stderr.write(`discord plugin: reconnecting in ${delay}ms\n`)
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined
-      if (!shuttingDown) void connect()
+      if (!shuttingDown && !killed) void connect()
     }, delay)
   }
 
@@ -613,6 +1359,7 @@ export async function startPlugin(): Promise<void> {
             text: { type: 'string', description: 'Message text' },
             to: { type: 'string', description: 'Exact session name (see bus_sessions). "human" answers the human only. "all" wakes every other session. Omit to mirror in the channel without waking anyone. A prefix is rejected.' },
             files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of local files to attach (max 4, 10 MB each). Uploaded inline; the human sees them in Discord.' },
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
           },
           required: ['text'],
         },
@@ -627,6 +1374,7 @@ export async function startPlugin(): Promise<void> {
             text: { type: 'string' },
             to: { type: 'string', description: 'Optional session name/prefix, or "human"' },
             files: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of local files to attach (max 4, 10 MB each)' },
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
           },
           required: ['channel', 'text'],
         },
@@ -634,7 +1382,12 @@ export async function startPlugin(): Promise<void> {
       {
         name: 'channel_list',
         description: 'List text channels in the agent-bus Discord server with topic, subscribers, and whether you are subscribed.',
-        inputSchema: { type: 'object' as const, properties: {} },
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
+          },
+        },
       },
       {
         name: 'channel_create',
@@ -644,6 +1397,7 @@ export async function startPlugin(): Promise<void> {
           properties: {
             name: { type: 'string', description: 'lowercase-hyphen name' },
             topic: { type: 'string', description: 'What the channel is for' },
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
           },
           required: ['name'],
         },
@@ -699,6 +1453,7 @@ export async function startPlugin(): Promise<void> {
           properties: {
             channel: { type: 'string', description: 'Channel to archive (id or name)' },
             replacement: { type: 'string', description: 'Channel where the conversation continues' },
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
           },
           required: ['channel'],
         },
@@ -706,17 +1461,36 @@ export async function startPlugin(): Promise<void> {
       {
         name: 'channel_subscribe',
         description: 'Receive messages posted in a channel (by agents or the human). Persists across restarts.',
-        inputSchema: { type: 'object' as const, properties: { channel: { type: 'string' } }, required: ['channel'] },
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            channel: { type: 'string' },
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
+          },
+          required: ['channel'],
+        },
       },
       {
         name: 'channel_unsubscribe',
         description: 'Stop receiving messages from a channel.',
-        inputSchema: { type: 'object' as const, properties: { channel: { type: 'string' } }, required: ['channel'] },
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            channel: { type: 'string' },
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
+          },
+          required: ['channel'],
+        },
       },
       {
         name: 'bus_sessions',
         description: 'List the agent sessions connected to the Discord router (your own is marked).',
-        inputSchema: { type: 'object' as const, properties: {} },
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
+          },
+        },
       },
       {
         name: 'check_inbox',
@@ -786,6 +1560,7 @@ export async function startPlugin(): Promise<void> {
           properties: {
             channel: { type: 'string' },
             limit: { type: 'number', description: 'Max messages (default 20, max 100)' },
+            swarm: { type: 'string', description: 'Target swarm (cross-swarm sessions only)' },
           },
           required: ['channel'],
         },
@@ -820,8 +1595,14 @@ export async function startPlugin(): Promise<void> {
 
   mcp.setRequestHandler(CallToolRequestSchema, async req => {
     const args = (req.params.arguments ?? {}) as Record<string, unknown>
+    if (killed) {
+      return { content: [{ type: 'text', text: KILLED_MESSAGE }], isError: true }
+    }
     if (registrationError) {
       return { content: [{ type: 'text', text: registrationError }], isError: true }
+    }
+    if (lastRejectReason && (!currentWs || currentWs.readyState !== WebSocket.OPEN)) {
+      return { content: [{ type: 'text', text: lastRejectReason }], isError: true }
     }
     if (retired) {
       return { content: [{ type: 'text', text: !reclaimAllowed
@@ -831,15 +1612,15 @@ export async function startPlugin(): Promise<void> {
         : `A newer session took over the bus name "${currentName}". This router does not support automatic reclaim.` }], isError: true }
     }
     try {
+      const swarmArg = typeof args.swarm === 'string' && args.swarm.trim() ? args.swarm.trim() : undefined
       switch (req.params.name) {
         case 'reply': {
           const text = args.text as string
           const replyTo = args.reply_to as string | undefined
           const files = args.files as string[] | undefined
           const chatId = args.chat_id as string | undefined
-          if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
           const inline = inlineFiles(files)
-          sendWs(JSON.stringify({ type: 'reply', text, ...(chatId && { chatId }), ...(replyTo && { replyTo }), ...(inline.length && { files: inline }) }))
+          await sendToolRequest({ type: 'reply', text, ...(chatId && { chatId }), ...(replyTo && { replyTo }), ...(inline.length && { files: inline }) })
           return { content: [{ type: 'text', text: 'Message sent' }] }
         }
         case 'dispatch': {
@@ -856,34 +1637,32 @@ export async function startPlugin(): Promise<void> {
           try {
             const name = await sendToolRequest({ type: 'rename', name: args.name })
             if (aliasTimer) { clearInterval(aliasTimer); aliasTimer = null }
-            forget(assignedAlias)   // an explicit name replaces whatever the router had assigned
-            try { explicitAlias.save(name) } catch {
+            forget(assignedAliasFor(currentSwarm))   // an explicit name replaces whatever the router had assigned
+            try { explicitAliasFor(currentSwarm).save(name) } catch {
               throw new Error(`Renamed to "${name}", but could not save it for a restart`)
             }
             return { content: [{ type: 'text', text: name }] }
           } finally { renamePending = false }
         }
         case 'bus_post': {
-          if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
           const to = args.to as string | undefined
           const inline = inlineFiles(args.files)
-          sendWs(JSON.stringify({ type: 'busPost', text: args.text as string, ...(to && { to }), ...(inline.length && { files: inline }) }))
+          await sendToolRequest({ type: 'busPost', text: args.text as string, ...(to && { to }), ...(swarmArg && { swarm: swarmArg }), ...(inline.length && { files: inline }) })
           return { content: [{ type: 'text', text: `Posted to ${to ?? 'all agents'} as ${currentName}${inline.length ? ` with ${inline.length} file(s)` : ''}` }] }
         }
         case 'channel_post': {
-          if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error('Not connected to router')
           const to = args.to as string | undefined
           const inline = inlineFiles(args.files)
-          sendWs(JSON.stringify({ type: 'channelPost', channel: args.channel as string, text: args.text as string, ...(to && { to }), ...(inline.length && { files: inline }) }))
+          await sendToolRequest({ type: 'channelPost', channel: args.channel as string, text: args.text as string, ...(to && { to }), ...(swarmArg && { swarm: swarmArg }), ...(inline.length && { files: inline }) })
           return { content: [{ type: 'text', text: `Posted in ${String(args.channel)}${to ? ` to ${to}` : ''} as ${currentName}${inline.length ? ` with ${inline.length} file(s)` : ''}` }] }
         }
         case 'channel_list': {
-          const list = JSON.parse(await sendToolRequest({ type: 'channelList' })) as Array<{ id: string; name: string; topic?: string; default: boolean; subscribed: boolean; subscribers: string[] }>
+          const list = JSON.parse(await sendToolRequest({ type: 'channelList', ...(swarmArg && { swarm: swarmArg }) })) as Array<{ id: string; name: string; topic?: string; default: boolean; subscribed: boolean; subscribers: string[] }>
           const lines = list.map(c => `- #${c.name} (${c.id})${c.default ? ' [default bus]' : ''}${c.subscribed ? ' [subscribed]' : ''}${c.topic ? ` — ${c.topic}` : ''}\n    subscribers: ${c.subscribers.join(', ') || '(none)'}`)
           return { content: [{ type: 'text', text: lines.join('\n') || 'No text channels.' }] }
         }
         case 'channel_create': {
-          const r = await sendToolRequest({ type: 'channelCreate', name: args.name as string, ...(args.topic ? { topic: args.topic as string } : {}) })
+          const r = await sendToolRequest({ type: 'channelCreate', name: args.name as string, ...(args.topic ? { topic: args.topic as string } : {}), ...(swarmArg && { swarm: swarmArg }) })
           return { content: [{ type: 'text', text: r }] }
         }
         case 'claim':
@@ -912,18 +1691,18 @@ export async function startPlugin(): Promise<void> {
           return { content: [{ type: 'text', text: r }] }
         }
         case 'channel_archive': {
-          const r = await sendToolRequest({ type: 'channelArchive', channel: args.channel as string, ...(args.replacement ? { replacement: args.replacement as string } : {}) })
+          const r = await sendToolRequest({ type: 'channelArchive', channel: args.channel as string, ...(args.replacement ? { replacement: args.replacement as string } : {}), ...(swarmArg && { swarm: swarmArg }) })
           return { content: [{ type: 'text', text: r }] }
         }
         case 'channel_subscribe':
         case 'channel_unsubscribe': {
-          const r = await sendToolRequest({ type: req.params.name === 'channel_subscribe' ? 'channelSubscribe' : 'channelUnsubscribe', channel: args.channel as string })
+          const r = await sendToolRequest({ type: req.params.name === 'channel_subscribe' ? 'channelSubscribe' : 'channelUnsubscribe', channel: args.channel as string, ...(swarmArg && { swarm: swarmArg }) })
           return { content: [{ type: 'text', text: r }] }
         }
         case 'bus_sessions': {
-          const result = await sendToolRequest({ type: 'listSessions' })
-          const list = JSON.parse(result) as Array<{ name: string; projectPath: string; connectedAt: string }>
-          const lines = list.map(s => `- ${s.name}${s.name === currentName ? '  (you)' : ''}  [${s.projectPath}]`)
+          const result = await sendToolRequest({ type: 'listSessions', ...(swarmArg && { swarm: swarmArg }) })
+          const list = JSON.parse(result) as Array<{ name: string; projectPath: string; connectedAt: string; swarm?: string }>
+          const lines = list.map(s => `- ${s.name}${s.name === currentName ? '  (you)' : ''}  [${s.projectPath}]${s.swarm ? `  (swarm: ${s.swarm})` : ''}`)
           return { content: [{ type: 'text', text: `Connected sessions:\n${lines.join('\n')}` }] }
         }
         case 'check_inbox': {
@@ -954,7 +1733,12 @@ export async function startPlugin(): Promise<void> {
           return { content: [{ type: 'text', text: passive ? `${text}\n\n${passive}` : text }] }
         }
         case 'react': {
-          sendWs(JSON.stringify({ type: 'react', chatId: args.chat_id, messageId: args.message_id, emoji: args.emoji }))
+          if (routerSupportsSwarms) {
+            await sendToolRequest({ type: 'react', chatId: args.chat_id, messageId: args.message_id, emoji: args.emoji })
+          } else {
+            if (!currentWs || currentWs.readyState !== WebSocket.OPEN) throw new Error(lastRejectReason ?? 'Not connected to router')
+            sendWs(JSON.stringify({ type: 'react', chatId: args.chat_id, messageId: args.message_id, emoji: args.emoji }))
+          }
           return { content: [{ type: 'text', text: 'Reaction sent' }] }
         }
         case 'edit_message': {
@@ -978,7 +1762,7 @@ export async function startPlugin(): Promise<void> {
           return { content: [{ type: 'text', text: `Downloaded ${lines.length} file(s):\n${lines.join('\n')}` }] }
         }
         case 'fetch_messages': {
-          const result = await sendToolRequest({ type: 'fetchMessages', channel: args.channel, limit: args.limit })
+          const result = await sendToolRequest({ type: 'fetchMessages', channel: args.channel, limit: args.limit, ...(swarmArg && { swarm: swarmArg }) })
           return { content: [{ type: 'text', text: result }] }
         }
         case 'ask_user': {
@@ -1045,15 +1829,46 @@ export async function startPlugin(): Promise<void> {
   setInterval(() => {
     let alive = true
     try { process.kill(parentPid, 0) } catch { alive = false }
-    if (!alive || process.ppid === 1) exitSoon(`agent process ${parentPid} gone`)
+    if (!alive || process.ppid === 1) { exitSoon(`agent process ${parentPid} gone`); return }
+    // 10 s swarm re-check: if raw tmux session/group changed while configured, close socket and re-register (§5, §10.1, M2, N3).
+    if (!shuttingDown && !killed && !inChatGPT) {
+      void detectSwarmAndPane().then(async (res) => {
+        if (!res.ok) return // Transient lookup failure: preserve previous ownPane & lastRawSwarm (M2).
+        const paneChanged = res.pane?.paneId !== ownPane?.paneId
+        ownPane = res.pane
+        if (res.rawSwarm !== lastRawSwarm) {
+          const prevRaw = lastRawSwarm
+          lastRawSwarm = res.rawSwarm
+          await refreshWakePane()
+          // With no swarms-config.json, tmux session/window changes must NOT reconnect the seat (N3).
+          if (!routerSwarmConfigured) return
+          process.stderr.write(`discord plugin: raw swarm changed "${prevRaw ?? ''}" -> "${res.rawSwarm ?? ''}"; re-registering\n`)
+          const guess = swarmGuessForRaw(res.rawSwarm)
+          currentName = explicitAliasFor(guess).name || assignedAliasFor(guess).name || sessionBase()
+          rejectRetry = false
+          clearReRegisterTimer()
+          if (currentWs && currentWs.readyState === WebSocket.OPEN) {
+            const old = currentWs
+            currentWs = null
+            old.onclose = null
+            try { old.close() } catch {}
+          }
+          scheduleReconnect(true)
+        } else if (paneChanged) {
+          await refreshWakePane()
+        }
+      }).catch(() => {})
+    }
   }, 10_000).unref()
 
   // Initial connection
   await connect()
 }
 
-// Entry point — always start (no isMainModule check, bundle calls this directly)
-startPlugin().catch((err: unknown) => {
-  process.stderr.write(`discord plugin: startup failed: ${err instanceof Error ? err.message : String(err)}\n`)
-  process.exit(1)
-})
+// Entry point — run when executed directly (allows unit tests to import helpers cleanly)
+if (import.meta.main) {
+  startPlugin().catch((err: unknown) => {
+    process.stderr.write(`discord plugin: startup failed: ${err instanceof Error ? err.message : String(err)}\n`)
+    process.exit(1)
+  })
+}
