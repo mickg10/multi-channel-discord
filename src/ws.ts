@@ -52,6 +52,7 @@ import { createHash, randomUUID, timingSafeEqual } from 'node:crypto'
 import { join, basename } from 'node:path'
 
 export interface WsData {
+  closeHandled?: boolean
   lastPongAt?: number
   closeReason?: string
   sessionName: string | null
@@ -69,6 +70,7 @@ export interface WsData {
 }
 
 export interface WsDeps {
+  readonly now?: () => number
   readonly sessions: SessionManager
   readonly history: ProjectHistory
   readonly client: Client
@@ -345,11 +347,12 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
     const target = deps.inboxes?.target(name)
     return target ? [[name, identityKey(target)]] : []
   }))
-  const connections = new Map<WsData, { ws: WsLike; seen: number; ping: number }>()
+  const clock = deps.now ?? Date.now
+  const connections = new Map<WsData, { ws: WsLike; seen: number; ping: number; app: boolean }>()
   return {
-    sweep(now = Date.now()): void {
+    sweep(now = clock()): void {
       for (const [data, c] of connections) {
-        if (now - c.seen > SILENCE_MS) {
+        if (c.app && now - c.seen > SILENCE_MS) {
           data.closeReason = 'keepalive_timeout'
           this.close(c.ws)
           c.ws.close?.()
@@ -364,7 +367,8 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
       }
     },
     open(ws: WsLike): void {
-      connections.set(ws.data, { ws, seen: Date.now(), ping: Date.now() })
+      ws.data.closeHandled = false
+      connections.set(ws.data, { ws, seen: clock(), ping: clock(), app: false })
       ws.send(JSON.stringify({ type: 'ping' }))
     },
 
@@ -381,9 +385,12 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
 
       if (!parsed || typeof parsed !== 'object') { sendError(ws, 'Invalid frame'); return }
       const connection = connections.get(ws.data)
-      if (connection) connection.seen = Date.now()
+      if (connection) {
+        connection.seen = clock()
+        if (parsed.type === 'ping' || parsed.type === 'pong') connection.app = true
+      }
       if (parsed.type === 'ping') { ws.send(JSON.stringify({ type: 'pong' })); return }
-      if (parsed.type === 'pong') { ws.data.lastPongAt = Date.now(); return }
+      if (parsed.type === 'pong') { ws.data.lastPongAt = clock(); return }
       try {
         dispatchMessage(ws, parsed, deps)
       } catch (err) {
@@ -397,6 +404,8 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
     },
 
     close(ws: WsLike): void {
+      if (ws.data.closeHandled) return
+      ws.data.closeHandled = true
       connections.delete(ws.data)
       if (ws.data.gateway && ws.data.nodeName && deps.inboxes) {
         const hosts = gateways.get(deps.inboxes)

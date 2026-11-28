@@ -2,15 +2,31 @@ export const PING_MS = 30_000
 export const SILENCE_MS = 75_000
 
 /** App-level heartbeats detect a deaf application even when TCP stays established. */
-export function clientKeepalive(socket: Pick<WebSocket, 'send' | 'close' | 'addEventListener' | 'removeEventListener'>,
-  schedule: typeof setInterval = setInterval, cancel: typeof clearInterval = clearInterval): () => void {
+export function clientKeepalive(socket: Pick<WebSocket, 'send' | 'close' | 'addEventListener' | 'removeEventListener'> & { terminate?: () => void; dispatchEvent?: (event: Event) => boolean },
+  schedule: typeof setInterval = setInterval, cancel: typeof clearInterval = clearInterval,
+  defer: typeof setTimeout = setTimeout, cancelDeferred: typeof clearTimeout = clearTimeout): () => void {
   let missed = 0
   let stopped = false
   const ping = () => {
     if (stopped) return
-    if (missed >= 2) { stop(); socket.close(); return }
+    if (missed >= 2) { fail(); return }
     missed++
-    try { socket.send(JSON.stringify({ type: 'ping' })) } catch { stop(); socket.close() }
+    try { socket.send(JSON.stringify({ type: 'ping' })) } catch { fail() }
+  }
+  function fail() {
+    stop()
+    // close() may wait forever for a peer's closing handshake on a half-open socket.
+    const done = () => { cancelDeferred(force); socket.removeEventListener('close', done) }
+    const force = defer(() => {
+      socket.removeEventListener('close', done)
+      try { socket.terminate?.() } finally {
+        // Ensure client reconnect handlers run even if terminate emits no close event.
+        socket.dispatchEvent?.(new Event('close'))
+      }
+    }, 5000)
+    force.unref?.()
+    socket.addEventListener('close', done)
+    try { socket.close() } catch { /* Forced disconnect runs in five seconds. */ }
   }
   const message = (event: Event) => {
     try {
