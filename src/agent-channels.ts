@@ -24,6 +24,7 @@ interface ChannelState extends AgentChannelRegistration {
   archived: boolean
   appliedName: string
   appliedTopic?: string
+  appliedSwarm?: string
 }
 
 interface Candidate {
@@ -94,7 +95,13 @@ export class AgentChannels {
     const id = this.channelFor(info.name)
     if (id) {
       const state = this.states.get(id)!
-      this.states.set(id, { ...state, kind: info.kind ?? state.kind, host: info.host ?? state.host, lastSeen: now })
+      this.states.set(id, {
+        ...state,
+        kind: info.kind ?? state.kind,
+        host: info.host ?? state.host,
+        ...(info.swarm !== undefined && { swarm: info.swarm }),
+        lastSeen: now,
+      })
       this.save(this.stateFile, this.states)
       return
     }
@@ -134,6 +141,14 @@ export class AgentChannels {
     this.save(this.stateFile, this.states)
   }
 
+  private countForSwarm(swarm: string): number {
+    let n = 0
+    for (const state of this.states.values()) {
+      if ((state.swarm ?? 'default') === swarm) n++
+    }
+    return n
+  }
+
   async maintain(ops: AgentChannelOps, isOnline: (name: string) => boolean, now = Date.now()): Promise<void> {
     if (this.busy) return
     this.busy = true
@@ -152,13 +167,14 @@ export class AgentChannels {
         else if (sweep && !state.archived && now - state.lastSeen >= AGENT_CHANNEL_IDLE_MS) this.pendingArchives.add(id)
         // A failed Discord update remains due on the next maintenance tick.
         const archived = !online && (state.archived || this.pendingArchives.has(id))
+        const swarm = state.swarm ?? 'default'
         const info = { ...state, name: owner }
         const topic = agentChannelTopic(info)
-        if (state.appliedName === owner && state.appliedTopic === topic && state.archived === archived) continue
+        if (state.appliedName === owner && state.appliedTopic === topic && state.archived === archived && (state.appliedSwarm ?? 'default') === swarm) continue
         try {
           await ops.update(id, info, archived)
           const current = this.states.get(id)!
-          this.states.set(id, { ...current, archived, appliedName: owner, appliedTopic: topic })
+          this.states.set(id, { ...current, archived, appliedName: owner, appliedTopic: topic, appliedSwarm: swarm })
           this.save(this.stateFile, this.states)
           this.pendingArchives.delete(id)
         } catch {
@@ -167,7 +183,8 @@ export class AgentChannels {
       }
       for (const [name, candidate] of this.candidates) {
         if (!isOnline(name) || this.channelFor(name)) { this.candidates.delete(name); continue }
-        if (now - candidate.since < AGENT_CHANNEL_DELAY_MS || this.bindings.size >= MAX_AGENT_CHANNELS) continue
+        const candSwarm = candidate.info.swarm ?? 'default'
+        if (now - candidate.since < AGENT_CHANNEL_DELAY_MS || this.countForSwarm(candSwarm) >= MAX_AGENT_CHANNELS) continue
         const info = candidate.info
         try {
           const id = await ops.ensure(info)
@@ -177,7 +194,15 @@ export class AgentChannels {
           const bindings = new Map(this.bindings).set(id, owner)
           this.save(this.ownersFile, bindings)
           this.bindings.set(id, owner)
-          this.states.set(id, { ...candidate.info, name: owner, lastSeen: now, archived: false, appliedName: info.name, appliedTopic: agentChannelTopic(info) })
+          this.states.set(id, {
+            ...candidate.info,
+            name: owner,
+            lastSeen: now,
+            archived: false,
+            appliedName: info.name,
+            appliedTopic: agentChannelTopic(info),
+            appliedSwarm: info.swarm ?? 'default',
+          })
           this.save(this.stateFile, this.states)
           this.candidates.delete(name)
           this.candidates.delete(currentName)
