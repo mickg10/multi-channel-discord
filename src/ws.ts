@@ -23,6 +23,7 @@ import type { AgentChannelRegistration, AgentChannels } from './agent-channels.j
 import { BUS_ALIAS_MAX, isBusAlias } from './bus-alias.js'
 import { DEFAULT_SWARM, type SwarmConfig, type SwarmConfigDiff } from './swarm-config.js'
 import { holderKey, type SwarmJournal } from './swarm-journal.js'
+import type { SwarmChannels } from './swarm-channels.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
@@ -136,10 +137,14 @@ export interface WsDeps {
   readonly swarmConfig?: SwarmConfig
   /** Name -> swarm journal (`agent-swarms.json`). */
   readonly swarmJournal?: SwarmJournal
+  /** Category-derived channel swarm classifier, provisioner, and sweep. */
+  readonly swarmChannels?: SwarmChannels
   /** Resolve a swarm's `#general` channel id (for returning undelivered mail on move & deferred rules). */
   readonly swarmGeneralChannel?: (swarm: string) => string | undefined
   /** Register-time subscription prune callback (wired to SwarmChannels.pruneSessionSubscriptions; §10.4). */
   readonly onRegisterPruneSubs?: (name: string, swarm: string) => void
+  /** Max time (ms) to hold a configured non-default permission prompt while `<swarm>:human` is provisioning. Default 30_000. */
+  readonly permissionHoldMs?: number
 }
 
 /** A file sent inline by a client (the router is remote: it must never open client-named paths). */
@@ -226,6 +231,102 @@ export function knownSwarm(deps: Readonly<WsDeps>, name: string): string | undef
   const journaled = deps.swarmJournal?.get(name)?.swarm
   if (journaled !== undefined) return journaled
   return knownOffline(deps, name) ? DEFAULT_SWARM : undefined
+}
+
+export function callerSwarm(deps: Readonly<WsDeps>, name: string): string {
+  const live = deps.sessions.getSwarm(name)
+  if (live !== undefined) return live
+  if (deps.inboxes?.target(name) || deps.nodes?.get(name)) return DEFAULT_SWARM
+  return knownSwarm(deps, name) ?? DEFAULT_SWARM
+}
+
+export function isCrossSwarm(deps: Readonly<WsDeps>, name: string): boolean {
+  return Boolean(deps.swarmConfig?.isConfigured() && deps.swarmConfig.isCrossSwarm(name))
+}
+
+/** Live sessions + offline addressable names whose `knownSwarm` equals `swarm` (§4, §10.6). */
+export function swarmMembers(deps: Readonly<WsDeps>, swarm: string): string[] {
+  const names = allNames(deps)
+  if (!deps.swarmConfig?.isConfigured()) return names
+  return names.filter(name => (knownSwarm(deps, name) ?? DEFAULT_SWARM) === swarm)
+}
+
+function swarmGeneralId(deps: Readonly<WsDeps>, swarm: string): string | undefined {
+  if (swarm === DEFAULT_SWARM) return deps.busChannelId
+  return deps.swarmChannels?.generalChannelId(swarm) ?? deps.swarmGeneralChannel?.(swarm)
+}
+
+function swarmHumanId(deps: Readonly<WsDeps>, swarm: string): string | undefined {
+  if (swarm === DEFAULT_SWARM) return deps.humanChannelId
+  return deps.swarmChannels?.humanChannelId(swarm)
+}
+
+/** Resolve an optional `swarm` parameter against the caller's permissions (§4, §10.6). */
+export function resolveRequestedSwarm(
+  deps: Readonly<WsDeps>,
+  actor: string,
+  requested?: string,
+): { ok: true; swarm: string } | { ok: false; error: string } {
+  const mySwarm = callerSwarm(deps, actor)
+  if (requested === undefined || requested === '') return { ok: true, swarm: mySwarm }
+  const cfg = deps.swarmConfig
+  if (!cfg?.isConfigured()) {
+    return requested === DEFAULT_SWARM ? { ok: true, swarm: DEFAULT_SWARM } : { ok: false, error: 'unknown_swarm' }
+  }
+  const target = requested.trim()
+  if (target !== mySwarm && !isCrossSwarm(deps, actor)) {
+    return { ok: false, error: 'cross_swarm' }
+  }
+  if (target === DEFAULT_SWARM) return { ok: true, swarm: DEFAULT_SWARM }
+  if (cfg.isRetired(target)) return { ok: false, error: 'retired_swarm' }
+  if (!cfg.hasSwarm(target)) return { ok: false, error: 'unknown_swarm' }
+  return { ok: true, swarm: target }
+}
+
+/** Verify `actor` may operate on `channelId` (§4, §10.4). Handles cache-miss fetch, DMs, threads, retired, unknown. */
+export async function assertChannelInSwarm(
+  deps: Readonly<WsDeps>,
+  actor: string,
+  channelId: string,
+): Promise<{ ok: true; swarm: string; dm?: boolean } | { ok: false; error: string }> {
+  if (!deps.swarmConfig?.isConfigured() || !deps.swarmChannels) {
+    return { ok: true, swarm: DEFAULT_SWARM }
+  }
+  const cls = await deps.swarmChannels.resolveChannelSwarm(channelId)
+  if (cls.kind === 'unknown') {
+    return { ok: false, error: deps.swarmChannels.isInitialFetchDone() ? 'cross_swarm' : 'swarm_not_ready' }
+  }
+  if (cls.kind === 'retired') {
+    return { ok: false, error: 'retired_swarm' }
+  }
+  const mySwarm = callerSwarm(deps, actor)
+  const cross = isCrossSwarm(deps, actor)
+  if (cls.kind === 'dm') {
+    return mySwarm === DEFAULT_SWARM || cross
+      ? { ok: true, swarm: DEFAULT_SWARM, dm: true }
+      : { ok: false, error: 'cross_swarm' }
+  }
+  if (cross || cls.swarm === mySwarm) {
+    return { ok: true, swarm: cls.swarm }
+  }
+  return { ok: false, error: 'cross_swarm' }
+}
+
+/** Resolve an exact recipient in `swarm` (+ crossSwarm aliases). Error messages list same-swarm names only (§4). */
+function resolveExactInSwarm(
+  to: string,
+  sameSwarmNames: readonly string[],
+  addressableNames: readonly string[],
+  swarm: string,
+  configured: boolean,
+): { ok: true; name: string } | { ok: false; error: string } {
+  if (!configured) return resolveExact(to, addressableNames)
+  if (addressableNames.includes(to)) return { ok: true, name: to }
+  const prefix = sameSwarmNames.filter(n => n.startsWith(to))
+  if (prefix.length > 0) {
+    return { ok: false, error: `"${to}" is not an exact session name. Matches: ${prefix.join(', ')}. Use the full name.` }
+  }
+  return { ok: false, error: `No session named "${to}" in swarm ${swarm}. Connected: ${sameSwarmNames.join(', ') || '(none)'}` }
 }
 
 function isSwarmCollision(deps: Readonly<WsDeps>, candidate: string, targetSwarm: string, holder: string | undefined): boolean {
@@ -331,10 +432,28 @@ export function applySwarmConfigReload(deps: Readonly<WsDeps>, diff: SwarmConfig
     pullSessions.delete(slot.name)
     offlineDirectChannel(deps, slot.name)
     cleanupJournalEntry(deps, slot.name)
+    purgePermissionPromptsForSession(slot.name)
     closed.push(slot.name)
   }
   if (closed.length > 0) deps.onSessionChange?.()
   return closed
+}
+
+/** Operator `/kill` termination with full cleanup (impl-plan-v2 #31-1).
+ *  When configured: notifies `{ type: 'killed', reconnect: false }` before closing sockets.
+ *  Without config: preserves today's deregisterSession path (no `killed` frame, no socket close) plus state cleanup. */
+export function killSession(deps: Readonly<WsDeps>, name: string, reason = 'killed_by_operator'): void {
+  if (deps.swarmConfig?.isConfigured()) {
+    deps.sessions.notifySession(name, JSON.stringify({ type: 'killed', reconnect: false, reason }))
+    deps.sessions.closeSessionSockets(name)
+  } else {
+    try { deps.sessions.deregisterSession(name) } catch {}
+  }
+  pullSessions.delete(name)
+  offlineDirectChannel(deps, name)
+  cleanupJournalEntry(deps, name)
+  purgePermissionPromptsForSession(name)
+  deps.onSessionChange?.()
 }
 
 function observeDirectChannel(deps: Readonly<WsDeps>, info: AgentChannelRegistration, collision = false): void {
@@ -584,14 +703,8 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
         deps.onSessionChange?.()
         return
       }
-      // Clean up any pending permission requests associated with this WS
-      for (const [reqId, reqWs] of permissionSessions) {
-        if (reqWs === ws) {
-          permissionSessions.delete(reqId)
-          const t = permissionTimeouts.get(reqId)
-          if (t) { clearTimeout(t); permissionTimeouts.delete(reqId) }
-        }
-      }
+      // Clean up any pending or held permission requests associated with this WS
+      purgePermissionPromptsForWs(ws)
 
       if (ws.data.sessionName) {
         const closingName = ws.data.sessionName
@@ -948,9 +1061,26 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       if (!hasString(parsed, 'requestId')) { sendError(ws, 'claim op requires requestId'); return }
       const me = ws.data.sessionName
       if (!me || !deps.claims) { sendToolResult(ws, parsed.requestId, false, me ? 'claims disabled' : 'not registered'); return }
-      if (parsed.type === 'listClaims') { sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.claims.list())); return }
+      const mySwarm = callerSwarm(deps, me)
+      if (parsed.type === 'listClaims') {
+        sendToolResult(ws, parsed.requestId, true, JSON.stringify(deps.claims.list(deps.swarmConfig?.isConfigured() ? mySwarm : undefined)))
+        return
+      }
       if (!parsed.task) { sendToolResult(ws, parsed.requestId, false, 'task required'); return }
-      const r = parsed.type === 'claim' ? deps.claims.claim(parsed.task, me, parsed.note) : deps.claims.release(parsed.task, me, parsed.to)
+      if (parsed.type === 'releaseClaim' && parsed.to && deps.swarmConfig?.isConfigured()) {
+        const targetSwarm = knownSwarm(deps, parsed.to)
+        if (targetSwarm === undefined) {
+          sendToolResult(ws, parsed.requestId, false, `No session named "${parsed.to}" in swarm ${mySwarm}`)
+          return
+        }
+        if (targetSwarm !== mySwarm) {
+          sendToolResult(ws, parsed.requestId, false, `cross_swarm: cannot hand off claim in swarm ${mySwarm} to "${parsed.to}" in swarm ${targetSwarm}`)
+          return
+        }
+      }
+      const r = parsed.type === 'claim'
+        ? deps.claims.claim(parsed.task, me, parsed.note, mySwarm)
+        : deps.claims.release(parsed.task, me, parsed.to, mySwarm)
       sendToolResult(ws, parsed.requestId, true, JSON.stringify(r))
       break
     }
@@ -969,9 +1099,17 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
     }
     case 'agentStatus': {
       // For nodes: is an interactive (push) session holding this name? Then the node must not run
-      // a headless turn on the same conversation.
+      // a headless turn on the same conversation. Scoped to the owning node (§4).
       const p = parsed as { requestId?: string; agent?: string }
       if (!p.requestId || !p.agent) { sendError(ws, 'agentStatus requires requestId and agent'); return }
+      if (deps.swarmConfig?.isConfigured() && ws.data.nodeName) {
+        const ownerNode = deps.nodes?.get(p.agent)?.node
+        const ks = knownSwarm(deps, p.agent)
+        if ((ownerNode && ownerNode !== ws.data.nodeName) || (ks !== undefined && ks !== DEFAULT_SWARM)) {
+          sendToolResult(ws, p.requestId, false, 'cross_swarm')
+          return
+        }
+      }
       sendToolResult(ws, p.requestId, true, JSON.stringify(agentStatus(deps, p.agent)))
       break
     }
@@ -980,8 +1118,17 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       if (!hasString(parsed, 'requestId')) { sendError(ws, 'inbox op requires requestId'); return }
       const who = parsed.type === 'inboxCount' ? parsed.agent : ws.data.sessionName
       if (!who) { sendToolResult(ws, parsed.requestId, false, 'not registered'); return }
-      if (parsed.type === 'inboxCount') sendToolResult(ws, parsed.requestId, true, String(deps.inboxes?.count(who) ?? 0))
-      else {
+      if (parsed.type === 'inboxCount') {
+        if (deps.swarmConfig?.isConfigured() && ws.data.nodeName) {
+          const ownerNode = deps.nodes?.get(who)?.node
+          const ks = knownSwarm(deps, who)
+          if ((ownerNode && ownerNode !== ws.data.nodeName) || (ks !== undefined && ks !== DEFAULT_SWARM)) {
+            sendToolResult(ws, parsed.requestId, false, 'cross_swarm')
+            return
+          }
+        }
+        sendToolResult(ws, parsed.requestId, true, String(deps.inboxes?.count(who) ?? 0))
+      } else {
         // Legacy check_inbox keeps its bare array or {messages, unread} format and
         // accepts mail on a successful push or pull result. Gateway aliases use
         // structured leases and an echoed receipt instead.
@@ -999,17 +1146,17 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
     case 'dispatch':
       handleDispatch(ws, parsed, deps)
       break
-    case 'busPost':
+    case 'busPost': {
+      const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
       if (!hasString(parsed, 'text')) {
-        sendError(ws, 'busPost requires text')
+        sendOperationError(ws, requestId, 'busPost requires text')
         return
       }
-      {
-        const { files, errors } = decodeFiles((parsed as { files?: unknown }).files)
-        for (const e of errors) sendError(ws, e)
-        handleBusPost(ws, parsed.text, parsed.to, deps, files, parsed)
-      }
+      const { files, errors } = decodeFiles((parsed as { files?: unknown }).files)
+      for (const e of errors) sendError(ws, e)
+      handleBusPost(ws, parsed.text, parsed.to, deps, files, parsed, sender)
       break
+    }
     case 'channelPost': {
       const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
       if (!hasString(parsed, 'channel') || !hasString(parsed, 'text')) {
@@ -1039,34 +1186,46 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         return
       }
       {
-        const row = (name: string) => ({
+        const caller = ws.data.sessionName
+        let targetSwarm: string | undefined
+        if (deps.swarmConfig?.isConfigured()) {
+          if (!caller) { sendToolResult(ws, parsed.requestId, false, 'not registered'); return }
+          const req = resolveRequestedSwarm(deps, caller, parsed.swarm)
+          if (!req.ok) { sendToolResult(ws, parsed.requestId, false, req.error); return }
+          targetSwarm = req.swarm
+        }
+        const row = (name: string, swarm: string) => ({
+          ...(deps.swarmConfig?.isConfigured() && { swarm }),
           costClass: deps.costs?.get(name) ?? 'standard',
           pending: deps.inboxes?.count(name) ?? 0,
           unread: deps.unread?.count(name) ?? 0,
           ...(deps.activity?.lastPost(name) && { lastPost: deps.activity.lastPost(name) }),
         })
-        const live = deps.sessions.getSessions().map(s => ({
-          name: s.name, projectPath: s.projectPath, connectedAt: new Date(s.connectedAt).toISOString(),
-          state: deps.nodes?.get(s.name) ? 'running' : 'live',
-          ...(deps.nodes?.get(s.name) && { node: deps.nodes.get(s.name)!.node }),
-          ...row(s.name),
-        }))
+        const live = deps.sessions.getSessions()
+          .filter(s => targetSwarm === undefined || (s.swarm ?? DEFAULT_SWARM) === targetSwarm)
+          .map(s => ({
+            name: s.name, projectPath: s.projectPath, connectedAt: new Date(s.connectedAt).toISOString(),
+            state: deps.nodes?.get(s.name) ? 'running' : 'live',
+            ...(deps.nodes?.get(s.name) && { node: deps.nodes.get(s.name)!.node }),
+            ...row(s.name, s.swarm ?? DEFAULT_SWARM),
+          }))
         const native = []
         const inboxes = deps.inboxes
-        if (inboxes) for (const name of inboxes.names()) {
+        if (inboxes && (targetSwarm === undefined || targetSwarm === DEFAULT_SWARM)) for (const name of inboxes.names()) {
           const target = inboxes.target(name)
           if (!target) continue
           native.push({
             name, projectPath: '', connectedAt: '', node: target.host,
             state: nativeConnection(inboxes, target) ? 'live' : 'idle',
-            ...row(name),
+            ...row(name, DEFAULT_SWARM),
           })
         }
         const liveNames = new Set([...live, ...native].map(s => s.name))
-        const asleep = (deps.nodes?.list() ?? []).filter(a => !liveNames.has(a.name)).map(a => ({
-          name: a.name, projectPath: a.cwd ?? '', connectedAt: '', state: 'idle', node: a.node,
-          ...row(a.name),
-        }))
+        const asleep = (targetSwarm === undefined || targetSwarm === DEFAULT_SWARM ? deps.nodes?.list() ?? [] : [])
+          .filter(a => !liveNames.has(a.name)).map(a => ({
+            name: a.name, projectPath: a.cwd ?? '', connectedAt: '', state: 'idle', node: a.node,
+            ...row(a.name, DEFAULT_SWARM),
+          }))
         sendToolResult(ws, parsed.requestId, true, JSON.stringify([...live, ...native, ...asleep]))
       }
       break
@@ -1254,20 +1413,25 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       const { files, errors } = decodeFiles(parsed.files)
       if (errors.length && requestId) { sendOperationError(ws, requestId, errors.join(', ')); return }
       for (const error of errors) sendError(ws, error)
-      if (deps.busChannelId && parsed.chatId === deps.busChannelId) {
-        handleBusPost(ws, parsed.text, undefined, deps, files, requestId ? { requestId } : undefined, sender)
+      const core = parsed.chatId ? deps.swarmChannels?.isSwarmCoreChannel(parsed.chatId) : null
+      if ((deps.busChannelId && parsed.chatId === deps.busChannelId) || core?.role === 'general') {
+        handleBusPost(ws, parsed.text, undefined, deps, files, { ...(requestId && { requestId }), ...(core && { swarm: core.swarm }) }, sender)
         break
       }
       void handleReply(ws, parsed.text, parsed.replyTo, files, deps, parsed.chatId, requestId, sender)
       break
     }
-    case 'react':
+    case 'react': {
+      const requestId = typeof parsed.requestId === 'string' ? parsed.requestId : undefined
       if (!hasString(parsed, 'chatId') || !hasString(parsed, 'messageId') || !hasString(parsed, 'emoji')) {
-        sendError(ws, 'react requires chatId, messageId, and emoji')
+        sendOperationError(ws, requestId, 'react requires chatId, messageId, and emoji')
         return
       }
-      if (canAccessDirectChannel(ws, deps, parsed.chatId, undefined, sender)) handleReact(parsed.chatId, parsed.messageId, parsed.emoji, deps)
+      if (canAccessDirectChannel(ws, deps, parsed.chatId, requestId, sender)) {
+        handleReact(ws, parsed.chatId, parsed.messageId, parsed.emoji, deps, requestId)
+      }
       break
+    }
     case 'editMessage':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'chatId') || !hasString(parsed, 'messageId') || !hasString(parsed, 'text')) {
         sendError(ws, 'editMessage requires requestId, chatId, messageId, and text')
@@ -1291,9 +1455,7 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         sendError(ws, 'fetchMessages requires requestId and channel')
         return
       }
-      if (canAccessDirectChannel(ws, deps, parsed.channel, parsed.requestId, sender)) {
-        handleFetchMessages(ws, parsed.requestId, parsed.channel, parsed.limit, deps)
-      }
+      handleFetchMessages(ws, parsed.requestId, parsed.channel, parsed.limit, deps, parsed.swarm, sender)
       break
     case 'askUser':
       if (!hasString(parsed, 'requestId') || !hasString(parsed, 'chatId') || !hasString(parsed, 'question')) {
@@ -1315,6 +1477,10 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
       if (!Array.isArray(parsed.skills)) {
         sendError(ws, 'registerSkills requires skills array')
         return
+      }
+      // Non-default registerSkills is ignored (§10.6).
+      if (deps.swarmConfig?.isConfigured() && ws.data.sessionName && callerSwarm(deps, ws.data.sessionName) !== DEFAULT_SWARM) {
+        break
       }
       deps.onSkillsRegistered?.(parsed.skills)
       break
@@ -1356,7 +1522,9 @@ function handleRegister(
   deps.subs?.reclaim(actualName, instanceId, identity.host)
   deps.onRegisterPruneSubs?.(actualName, identity.swarm)
   ws.data.sendCallback = sendCb
-  deps.history.record(actualName, projectPath)
+  if (!deps.swarmConfig?.isConfigured() || identity.swarm === DEFAULT_SWARM) {
+    deps.history.record(actualName, projectPath)
+  }
 
   const warning = role === 'master' && !deps.swarmConfig?.isCandidate(actualName, identity.swarm)
     ? 'not_master_candidate' : undefined
@@ -1366,6 +1534,7 @@ function handleRegister(
     reclaimOnly: true,
     swarm: identity.swarm,
     defaultSessions: deps.swarmConfig?.getDefaultSessions() ?? ['agents'],
+    ...(deps.swarmConfig?.isConfigured() && { swarmConfigured: true }),
     ...(warning && { warning }),
   }
   ws.send(JSON.stringify(response))
@@ -1373,6 +1542,7 @@ function handleRegister(
 }
 
 function handleDeregister(ws: WsLike, deps: Readonly<WsDeps>): void {
+  purgePermissionPromptsForWs(ws)
   if (ws.data.sessionName) {
     const name = ws.data.sessionName
     try {
@@ -1415,6 +1585,7 @@ function handleRename(ws: WsLike, newName: string, deps: Readonly<WsDeps>, reque
   deps.swarmJournal?.set(actualName, swarm, holder)
   if (actualName !== oldName) cleanupJournalEntry(deps, oldName)
   ws.data.sessionName = actualName
+  renamePermissionPrompts(oldName, actualName)
   if (actualName !== oldName) {
     ws.data.renamed = true
     observeDirectChannel(deps, { name: actualName, kind: deps.sessions.registeredIdentity(actualName)?.agent ?? (oldName.includes('@') ? oldName.split('@')[0] : undefined), host: ws.data.legacyHost, swarm }, actualName !== newName)
@@ -1430,16 +1601,31 @@ async function handleReply(ws: WsLike, text: string, replyTo: string | undefined
     sendOperationError(ws, requestId, 'Cannot reply: not registered')
     return
   }
-  const chatId = explicitChatId || deps.chatId()
+  const mySwarm = callerSwarm(deps, sessionName)
+  let chatId = explicitChatId
+  if (!chatId) {
+    if (deps.swarmConfig?.isConfigured() && mySwarm !== DEFAULT_SWARM) {
+      if (!deps.swarmChannels?.isSwarmReady(mySwarm)) {
+        sendOperationError(ws, requestId, 'swarm_not_ready')
+        return
+      }
+      chatId = swarmHumanId(deps, mySwarm)
+    } else {
+      chatId = deps.chatId() ?? undefined
+    }
+  }
   if (!chatId) {
     if (requestId) sendOperationError(ws, requestId, 'No active Discord chat')
     return
   }
 
+  const swarmCheck = await assertChannelInSwarm(deps, sessionName, chatId)
+  if (!swarmCheck.ok) { sendOperationError(ws, requestId, swarmCheck.error); return }
+
   const restriction = agentPostError(deps, chatId, sessionName)
   if (restriction) { sendOperationError(ws, requestId, restriction); return }
   if (!canAccessDirectChannel(ws, deps, chatId, requestId, sender)) return
-  const activeChat = !directChannelOwner(deps, chatId) && chatId === deps.chatId()
+  const activeChat = !directChannelOwner(deps, chatId) && chatId === deps.chatId() && mySwarm === DEFAULT_SWARM
   const sends: Promise<boolean>[] = []
   if (activeChat && deps.sessions.getActive() !== sessionName) {
     const count = deps.sessions.bufferReply(sessionName, text)
@@ -1459,16 +1645,28 @@ async function handleReply(ws: WsLike, text: string, replyTo: string | undefined
   sendToolResult(ws, requestId, sent, sent ? '{}' : 'discord_unavailable')
 }
 
-function handleReact(chatId: string, messageId: string, emoji: string, deps: Readonly<WsDeps>): void {
-  // Fire-and-forget: react asynchronously without blocking the WS message handler
+function handleReact(ws: WsLike, chatId: string, messageId: string, emoji: string, deps: Readonly<WsDeps>, requestId?: string): void {
+  // Fire-and-forget (or request/response when requestId is given)
   void (async () => {
     try {
+      const actor = ws.data.sessionName
+      if (deps.swarmConfig?.isConfigured()) {
+        if (!actor) { sendOperationError(ws, requestId, 'not registered'); return }
+        const swarmCheck = await assertChannelInSwarm(deps, actor, chatId)
+        if (!swarmCheck.ok) { sendOperationError(ws, requestId, swarmCheck.error); return }
+      }
       const ch = await fetchTextChannelOrNull(deps.client, chatId)
-      if (!ch) return
+      if (!ch) {
+        if (requestId) sendToolResult(ws, requestId, false, 'Channel not found or not text-based')
+        return
+      }
       const msg = await ch.messages.fetch(messageId)
       await msg.react(emoji)
+      if (requestId) sendToolResult(ws, requestId, true, '{}')
     } catch (err: unknown) {
-      process.stderr.write(`discord: react failed: ${err instanceof Error ? err.message : String(err)}\n`)
+      const msg = err instanceof Error ? err.message : String(err)
+      process.stderr.write(`discord: react failed: ${msg}\n`)
+      if (requestId) sendToolResult(ws, requestId, false, `React failed: ${msg}`)
     }
   })()
 }
@@ -1507,6 +1705,12 @@ function handleEditMessage(ws: WsLike, requestId: string, chatId: string, messag
   // Fire-and-forget: edit message asynchronously and report result via WS tool result
   void (async () => {
     try {
+      if (deps.swarmConfig?.isConfigured()) {
+        const actor = ws.data.sessionName
+        if (!actor) { sendToolResult(ws, requestId, false, 'not registered'); return }
+        const swarmCheck = await assertChannelInSwarm(deps, actor, chatId)
+        if (!swarmCheck.ok) { sendToolResult(ws, requestId, false, swarmCheck.error); return }
+      }
       const ch = await fetchTextChannelOrNull(deps.client, chatId)
       if (!ch) {
         sendToolResult(ws, requestId, false, 'Channel not found or not text-based')
@@ -1529,6 +1733,12 @@ function handleDownloadAttachment(ws: WsLike, requestId: string, chatId: string,
   // Fire-and-forget: download attachments asynchronously and report result via WS tool result
   void (async () => {
     try {
+      if (deps.swarmConfig?.isConfigured()) {
+        const actor = ws.data.sessionName
+        if (!actor) { sendToolResult(ws, requestId, false, 'not registered'); return }
+        const swarmCheck = await assertChannelInSwarm(deps, actor, chatId)
+        if (!swarmCheck.ok) { sendToolResult(ws, requestId, false, swarmCheck.error); return }
+      }
       const ch = await fetchTextChannelOrNull(deps.client, chatId)
       if (!ch) {
         sendToolResult(ws, requestId, false, 'Channel not found or not text-based')
@@ -1562,10 +1772,32 @@ function handleDownloadAttachment(ws: WsLike, requestId: string, chatId: string,
   })()
 }
 
-function handleFetchMessages(ws: WsLike, requestId: string, channelId: string, limit: number | undefined, deps: Readonly<WsDeps>): void {
+function handleFetchMessages(ws: WsLike, requestId: string, channelRef: string, limit: number | undefined, deps: Readonly<WsDeps>, requestedSwarm?: string, sender?: Target): void {
   // Fire-and-forget: fetch messages asynchronously and report result via WS tool result
   void (async () => {
     try {
+      const actor = ws.data.sessionName
+      let targetSwarm = DEFAULT_SWARM
+      if (deps.swarmConfig?.isConfigured()) {
+        if (!actor) { sendToolResult(ws, requestId, false, 'not registered'); return }
+        const req = resolveRequestedSwarm(deps, actor, requestedSwarm)
+        if (!req.ok) { sendToolResult(ws, requestId, false, req.error); return }
+        targetSwarm = req.swarm
+      }
+      let channelId = channelRef
+      if (deps.channelOps) {
+        const resolved = await deps.channelOps.resolve(channelRef, targetSwarm).catch(() => null)
+        if (resolved) channelId = resolved.id
+      }
+      if (deps.swarmConfig?.isConfigured() && actor) {
+        const swarmCheck = await assertChannelInSwarm(deps, actor, channelId)
+        if (!swarmCheck.ok) { sendToolResult(ws, requestId, false, swarmCheck.error); return }
+        if (requestedSwarm && swarmCheck.swarm !== targetSwarm && !swarmCheck.dm) {
+          sendToolResult(ws, requestId, false, 'cross_swarm')
+          return
+        }
+      }
+      if (!canAccessDirectChannel(ws, deps, channelId, requestId, sender)) return
       const ch = await fetchTextChannelOrNull(deps.client, channelId)
       if (!ch) {
         sendToolResult(ws, requestId, false, 'Channel not found or not text-based')
@@ -1597,6 +1829,12 @@ function handleAskUser(
   // Fire-and-forget: ask user asynchronously via Discord components and report result via WS tool result
   void (async () => {
     try {
+      if (deps.swarmConfig?.isConfigured()) {
+        const actor = ws.data.sessionName
+        if (!actor) { sendToolResult(ws, requestId, false, 'not registered'); return }
+        const swarmCheck = await assertChannelInSwarm(deps, actor, chatId)
+        if (!swarmCheck.ok) { sendToolResult(ws, requestId, false, swarmCheck.error); return }
+      }
       const ch = await fetchTextChannelOrNull(deps.client, chatId)
       if (!ch || !('send' in ch)) {
         sendToolResult(ws, requestId, false, 'Channel not found or not sendable')
@@ -1717,40 +1955,114 @@ async function askWithSelectMenu(
   }
 }
 
-/** Map of permission request ID → WS connection that sent it, so we can route verdicts back. */
-const permissionSessions = new Map<string, WsLike>()
+interface PendingPermission {
+  readonly ws: WsLike
+  readonly requestId: string
+  sessionName: string
+  readonly timeout: ReturnType<typeof setTimeout>
+}
 
-/** Map of permission request ID → cleanup timer, auto-removes stale entries after 5 minutes. */
-const permissionTimeouts = new Map<string, ReturnType<typeof setTimeout>>()
+interface HeldPermission {
+  readonly ws: WsLike
+  readonly requestId: string
+  sessionName: string
+  readonly swarm: string
+  readonly toolName: string
+  readonly description: string
+  readonly inputPreview: string
+  readonly deps: Readonly<WsDeps>
+  readonly timer: ReturnType<typeof setTimeout>
+}
 
-function handlePermissionRequest(
+/** Map of router-minted promptId → pending prompt metadata so verdicts route cleanly without collisions (impl-plan-v2 #31-2). */
+const pendingPermissions = new Map<string, PendingPermission>()
+
+/** Prompts held in memory while a configured `<swarm>:human` channel is still being provisioned (bounded by min(30s, socket close)). */
+const heldPermissions = new Set<HeldPermission>()
+
+function purgePermissionPromptsForWs(ws: WsLike): void {
+  for (const [promptId, entry] of pendingPermissions) {
+    if (entry.ws === ws || entry.ws.data === ws.data) {
+      clearTimeout(entry.timeout)
+      pendingPermissions.delete(promptId)
+    }
+  }
+  for (const held of [...heldPermissions]) {
+    if (held.ws === ws || held.ws.data === ws.data) {
+      clearTimeout(held.timer)
+      heldPermissions.delete(held)
+    }
+  }
+}
+
+function purgePermissionPromptsForSession(name: string): void {
+  for (const [promptId, entry] of pendingPermissions) {
+    if (entry.sessionName === name) {
+      clearTimeout(entry.timeout)
+      pendingPermissions.delete(promptId)
+    }
+  }
+  for (const held of [...heldPermissions]) {
+    if (held.sessionName === name) {
+      clearTimeout(held.timer)
+      heldPermissions.delete(held)
+    }
+  }
+}
+
+function renamePermissionPrompts(oldName: string, newName: string): void {
+  if (oldName === newName) return
+  for (const entry of pendingPermissions.values()) {
+    if (entry.sessionName === oldName) entry.sessionName = newName
+  }
+  for (const held of heldPermissions) {
+    if (held.sessionName === oldName) held.sessionName = newName
+  }
+}
+
+function sendPermissionDeny(ws: WsLike, requestId: string, reason: string): void {
+  const verdict: WsPermissionVerdict = { type: 'permissionVerdict', requestId, behavior: 'deny', reason }
+  try { ws.send(JSON.stringify(verdict)) } catch {}
+}
+
+function dispatchPermissionPrompt(
   ws: WsLike,
   requestId: string,
+  sessionName: string,
   toolName: string,
   description: string,
   inputPreview: string,
+  chatId: string,
+  isNonDefaultConfigured: boolean,
   deps: Readonly<WsDeps>,
 ): void {
-  const chatId = deps.chatId()
-  if (!chatId) return
-
-  const sessionName = ws.data.sessionName ?? 'unknown'
-
-  // Store the WS so we can route the verdict back
-  permissionSessions.set(requestId, ws)
-
-  // Auto-cleanup after 5 minutes if no verdict is received
+  const promptId = randomUUID().replace(/-/g, '').slice(0, 16)
   const timeout = setTimeout(() => {
-    permissionSessions.delete(requestId)
-    permissionTimeouts.delete(requestId)
+    pendingPermissions.delete(promptId)
   }, 300_000)
-  permissionTimeouts.set(requestId, timeout)
+  pendingPermissions.set(promptId, { ws, requestId, sessionName, timeout })
 
   // Fire-and-forget: send permission prompt to Discord asynchronously
   void (async () => {
     try {
+      if (deps.swarmConfig?.isConfigured() && ws.data.sessionName) {
+        const swarmCheck = await assertChannelInSwarm(deps, ws.data.sessionName, chatId)
+        if (!swarmCheck.ok) {
+          const entry = pendingPermissions.get(promptId)
+          if (entry) { clearTimeout(entry.timeout); pendingPermissions.delete(promptId) }
+          if (isNonDefaultConfigured) sendPermissionDeny(ws, requestId, swarmCheck.error)
+          return
+        }
+      }
+      if (!pendingPermissions.has(promptId)) return
       const ch = await fetchTextChannelOrNull(deps.client, chatId)
-      if (!ch || !('send' in ch)) return
+      if (!pendingPermissions.has(promptId)) return
+      if (!ch || !('send' in ch)) {
+        const entry = pendingPermissions.get(promptId)
+        if (entry) { clearTimeout(entry.timeout); pendingPermissions.delete(promptId) }
+        if (isNonDefaultConfigured) sendPermissionDeny(ws, requestId, 'channel_unavailable')
+        return
+      }
 
       // Truncate input preview for Discord
       const preview = inputPreview.length > 800 ? inputPreview.slice(0, 800) + '...' : inputPreview
@@ -1758,11 +2070,11 @@ function handlePermissionRequest(
       const row = new ActionRowBuilder<ButtonBuilder>()
       row.addComponents(
         new ButtonBuilder()
-          .setCustomId(`perm_yes_${requestId}`)
+          .setCustomId(`perm_yes_${promptId}`)
           .setLabel(`yes ${requestId}`)
           .setStyle(ButtonStyle.Success),
         new ButtonBuilder()
-          .setCustomId(`perm_no_${requestId}`)
+          .setCustomId(`perm_no_${promptId}`)
           .setLabel(`no ${requestId}`)
           .setStyle(ButtonStyle.Danger),
       )
@@ -1778,30 +2090,110 @@ function handlePermissionRequest(
       noteSent(sent.id)
     } catch (err: unknown) {
       process.stderr.write(`discord: permission request send failed: ${err instanceof Error ? err.message : String(err)}\n`)
-      permissionSessions.delete(requestId)
-      const t = permissionTimeouts.get(requestId)
-      if (t) { clearTimeout(t); permissionTimeouts.delete(requestId) }
+      const entry = pendingPermissions.get(promptId)
+      if (entry) { clearTimeout(entry.timeout); pendingPermissions.delete(promptId) }
+      if (isNonDefaultConfigured) sendPermissionDeny(ws, requestId, 'send_failed')
     }
   })()
 }
 
-/** Handle a button click for a permission request. Called from the router's interactionCreate handler. */
-export function handlePermissionButton(customId: string): void {
+/** Flush any permission prompts held in memory while `<swarm>:human` was provisioning (impl-plan-v2 #31-2). */
+export function flushHeldPermissionsForSwarm(swarm: string): void {
+  for (const held of [...heldPermissions]) {
+    if (held.swarm !== swarm) continue
+    if (!held.deps.swarmChannels?.isSwarmReady(swarm)) continue
+    const chatId = swarmHumanId(held.deps, swarm)
+    if (!chatId) continue
+    clearTimeout(held.timer)
+    heldPermissions.delete(held)
+    const cur = held.ws.data.sessionName
+    if (!cur) continue
+    if (callerSwarm(held.deps, cur) !== swarm) {
+      sendPermissionDeny(held.ws, held.requestId, 'cross_swarm')
+      continue
+    }
+    dispatchPermissionPrompt(
+      held.ws,
+      held.requestId,
+      cur,
+      held.toolName,
+      held.description,
+      held.inputPreview,
+      chatId,
+      true,
+      held.deps,
+    )
+  }
+}
+
+function handlePermissionRequest(
+  ws: WsLike,
+  requestId: string,
+  toolName: string,
+  description: string,
+  inputPreview: string,
+  deps: Readonly<WsDeps>,
+): void {
+  const sessionName = ws.data.sessionName ?? 'unknown'
+  const mySwarm = ws.data.sessionName ? callerSwarm(deps, ws.data.sessionName) : DEFAULT_SWARM
+  const isNonDefaultConfigured = Boolean(deps.swarmConfig?.isConfigured() && mySwarm !== DEFAULT_SWARM)
+
+  let chatId: string | null | undefined
+  if (isNonDefaultConfigured) {
+    const ready = Boolean(deps.swarmChannels?.isSwarmReady(mySwarm))
+    chatId = ready ? swarmHumanId(deps, mySwarm) : undefined
+    if (!chatId) {
+      // Hold in memory for up to min(30s, socket close) while <swarm>:human is provisioning, then deny('swarm_not_ready').
+      const holdMs = deps.permissionHoldMs ?? 30_000
+      const held: HeldPermission = {
+        ws,
+        requestId,
+        sessionName,
+        swarm: mySwarm,
+        toolName,
+        description,
+        inputPreview,
+        deps,
+        timer: setTimeout(() => {
+          if (!heldPermissions.delete(held)) return
+          sendPermissionDeny(ws, requestId, 'swarm_not_ready')
+        }, holdMs),
+      }
+      heldPermissions.add(held)
+      return
+    }
+  } else {
+    chatId = deps.chatId()
+    // Without config (or in default swarm), keep today's silent return when no chat is active (B2).
+    if (!chatId) return
+  }
+
+  dispatchPermissionPrompt(ws, requestId, sessionName, toolName, description, inputPreview, chatId, isNonDefaultConfigured, deps)
+}
+
+/** Handle a button click for a permission request. Honoured only when `userId` is in `allowFrom` (if given, §10.5). */
+export function handlePermissionButton(customId: string, userId?: string, allowFrom?: readonly string[]): boolean {
+  if (allowFrom !== undefined && (!userId || !allowFrom.includes(userId))) return false
   const yesMatch = customId.match(/^perm_yes_(.+)$/)
   const noMatch = customId.match(/^perm_no_(.+)$/)
 
-  const requestId = yesMatch?.[1] ?? noMatch?.[1]
-  if (!requestId) return
+  const promptId = yesMatch?.[1] ?? noMatch?.[1]
+  if (!promptId) return false
 
   const behavior: 'allow' | 'deny' = yesMatch ? 'allow' : 'deny'
-  const ws = permissionSessions.get(requestId)
-  if (!ws) return
+  const entry = pendingPermissions.get(promptId)
+  if (!entry) return false
 
-  const verdict: WsPermissionVerdict = { type: 'permissionVerdict', requestId, behavior }
-  ws.send(JSON.stringify(verdict))
-  permissionSessions.delete(requestId)
-  const t = permissionTimeouts.get(requestId)
-  if (t) { clearTimeout(t); permissionTimeouts.delete(requestId) }
+  // Delete pending record BEFORE ws.send so a throwing or closed socket never leaks or double-delivers (#31-2).
+  pendingPermissions.delete(promptId)
+  clearTimeout(entry.timeout)
+  const verdict: WsPermissionVerdict = { type: 'permissionVerdict', requestId: entry.requestId, behavior }
+  try {
+    entry.ws.send(JSON.stringify(verdict))
+  } catch {
+    return false
+  }
+  return true
 }
 
 function sendToolResult(ws: WsLike, requestId: string, success: boolean, data: string): void {
@@ -1836,7 +2228,8 @@ const HUMAN_CHANNEL_POST_ERROR = 'Only posts to=human can use #human-questions. 
 
 function agentPostError(deps: Readonly<WsDeps>, channel: string, from: string, to?: string): string | undefined {
   const recipient = to?.toLowerCase()
-  if (channel === deps.humanChannelId && recipient !== 'human') return HUMAN_CHANNEL_POST_ERROR
+  const core = deps.swarmChannels?.isSwarmCoreChannel(channel)
+  if ((channel === deps.humanChannelId || core?.role === 'human') && recipient !== 'human') return HUMAN_CHANNEL_POST_ERROR
   const owner = directChannelOwner(deps, channel)
   if (owner && (owner !== from || (recipient && !HUMAN_TARGETS.has(recipient)))) {
     return 'This direct channel is reserved for its owner and the human. Use the topic channel or #general.'
@@ -1860,16 +2253,44 @@ function canAccessDirectChannel(ws: WsLike, deps: Readonly<WsDeps>, channel: str
  * `to` must be an exact session name. Omitting it mirrors the message and wakes nobody.
  * `to=all` or `to=@all:synthesis` is an explicit fan-out.
  */
-export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[], publish?: { requestId?: string; publish_id?: string }, sender?: Target): void {
-  if (!ws.data.sessionName) {
-    sendError(ws, 'Cannot post to bus: not registered')
+export function handleBusPost(ws: WsLike, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[], publish?: { requestId?: string; publish_id?: string; swarm?: string }, sender?: Target): void {
+  const from = ws.data.sessionName
+  if (!from) {
+    sendOperationError(ws, publish?.requestId, 'Cannot post to bus: not registered')
     return
   }
-  if (!deps.busChannelId) {
-    sendOperationError(ws, publish?.requestId, 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL')
+  if (!deps.swarmConfig?.isConfigured()) {
+    if (!deps.busChannelId) {
+      sendOperationError(ws, publish?.requestId, 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL')
+      return
+    }
+    postToChannel(ws, deps.busChannelId, undefined, text, to, deps, files, publish, sender, DEFAULT_SWARM)
     return
   }
-  postToChannel(ws, deps.busChannelId, undefined, text, to, deps, files, publish, sender)
+  let targetSwarm = callerSwarm(deps, from)
+  if (publish?.swarm !== undefined && publish.swarm !== '') {
+    const req = resolveRequestedSwarm(deps, from, publish.swarm)
+    if (!req.ok) { sendOperationError(ws, publish?.requestId, req.error); return }
+    targetSwarm = req.swarm
+  } else if (isCrossSwarm(deps, from) && typeof to === 'string') {
+    const low = to.toLowerCase()
+    const special = HUMAN_TARGETS.has(low) || low === 'subscribers' || /^(?:@)?all(?::(synthesis|independent))?$/.test(low)
+    if (!special) {
+      // Cross-swarm bus_post(to=X) with no swarm uses X's swarm (§10.6).
+      const targetKnown = knownSwarm(deps, to)
+      if (targetKnown) targetSwarm = targetKnown
+    }
+  }
+  if (targetSwarm !== DEFAULT_SWARM && deps.swarmChannels && !deps.swarmChannels.isSwarmReady(targetSwarm)) {
+    sendOperationError(ws, publish?.requestId, 'swarm_not_ready')
+    return
+  }
+  const generalId = swarmGeneralId(deps, targetSwarm)
+  if (!generalId) {
+    sendOperationError(ws, publish?.requestId, targetSwarm === DEFAULT_SWARM ? 'Agent bus disabled: router has no DISCORD_BUS_CHANNEL' : 'swarm_not_ready')
+    return
+  }
+  postToChannel(ws, generalId, undefined, text, to, deps, files, publish, sender, targetSwarm)
 }
 
 export function channelSubscribers(deps: Readonly<WsDeps>, channelId: string): string[] {
@@ -1879,37 +2300,71 @@ export function channelSubscribers(deps: Readonly<WsDeps>, channelId: string): s
   if (!subs) return []
   const inboxes = deps.inboxes
   const names = subs.subscribers(channelId).filter(name => !inboxes?.target(name))
-  if (!inboxes) return names
-  const keys = new Set(subs.nativeSubscribers(channelId))
-  if (!keys.size) return names
-  const aliases = new Map<string, { name: string; live: boolean }>()
-  for (const name of inboxes.names()) {
-    const target = inboxes.target(name)
-    if (!target) continue
-    const key = identityKey(target)
-    if (!keys.has(key)) continue
-    const previous = aliases.get(key)
-    if (previous?.live) continue
-    const live = !!nativeConnection(inboxes, target)
-    if (!previous || live) aliases.set(key, { name, live })
+  let combined: string[]
+  if (!inboxes) {
+    combined = names
+  } else {
+    const keys = new Set(subs.nativeSubscribers(channelId))
+    if (!keys.size) {
+      combined = names
+    } else {
+      const aliases = new Map<string, { name: string; live: boolean }>()
+      for (const name of inboxes.names()) {
+        const target = inboxes.target(name)
+        if (!target) continue
+        const key = identityKey(target)
+        if (!keys.has(key)) continue
+        const previous = aliases.get(key)
+        if (previous?.live) continue
+        const live = !!nativeConnection(inboxes, target)
+        if (!previous || live) aliases.set(key, { name, live })
+      }
+      combined = [...names, ...[...aliases.values()].map(alias => alias.name)]
+    }
   }
-  return [...names, ...[...aliases.values()].map(alias => alias.name)]
+  if (!deps.swarmConfig?.isConfigured() || !deps.swarmChannels) return combined
+  const cls = deps.swarmChannels.classifyChannel(channelId)
+  if (cls.kind !== 'swarm') return []
+  const members = new Set(swarmMembers(deps, cls.swarm))
+  // Intersect fan-out with swarmMembers(channelSwarm) + crossSwarm (§4).
+  return combined.filter(n => members.has(n) || isCrossSwarm(deps, n))
 }
 
-/** Sessions that receive untargeted traffic in a channel: everyone for the default bus, else subscribers. */
+/** Sessions that receive untargeted traffic in a channel: swarmMembers for general/human, else scoped subscribers (§4, §10.6). */
 function audience(channelId: string, deps: Readonly<WsDeps>): string[] {
+  if (!deps.swarmConfig?.isConfigured()) {
+    const live = allNames(deps)
+    if (channelId === deps.busChannelId || channelId === deps.humanChannelId) return live
+    const subs = new Set(channelSubscribers(deps, channelId))
+    return live.filter(n => subs.has(n))
+  }
+  const core = deps.swarmChannels?.isSwarmCoreChannel(channelId)
+  if (core) return swarmMembers(deps, core.swarm)
+  if (channelId === deps.busChannelId || channelId === deps.humanChannelId) return swarmMembers(deps, DEFAULT_SWARM)
   const live = allNames(deps)
-  if (channelId === deps.busChannelId || channelId === deps.humanChannelId) return live
   const subs = new Set(channelSubscribers(deps, channelId))
   return live.filter(n => subs.has(n))
 }
 
 async function handleChannelPost(ws: WsLike, msg: WsChannelPost, deps: Readonly<WsDeps>, files: DiscordFile[], sender?: Target): Promise<void> {
   const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined
-  if (!ws.data.sessionName) { sendOperationError(ws, requestId, 'Cannot post: not registered'); return }
-  const ch = deps.channelOps ? await deps.channelOps.resolve(msg.channel).catch(() => null) : null
+  const caller = ws.data.sessionName
+  if (!caller) { sendOperationError(ws, requestId, 'Cannot post: not registered'); return }
+  let targetSwarm = DEFAULT_SWARM
+  if (deps.swarmConfig?.isConfigured()) {
+    const req = resolveRequestedSwarm(deps, caller, msg.swarm)
+    if (!req.ok) { sendOperationError(ws, requestId, req.error); return }
+    targetSwarm = req.swarm
+  }
+  const ch = deps.channelOps ? await deps.channelOps.resolve(msg.channel, targetSwarm).catch(() => null) : null
   if (!ch) { sendOperationError(ws, requestId, `Unknown channel "${msg.channel}" (use channel_list)`); return }
-  postToChannel(ws, ch.id, ch.name, msg.text, msg.to, deps, files, requestId ? { requestId, publish_id: msg.publish_id } : undefined, sender)
+  const swarmCheck = await assertChannelInSwarm(deps, caller, ch.id)
+  if (!swarmCheck.ok) { sendOperationError(ws, requestId, swarmCheck.error); return }
+  if (msg.swarm && swarmCheck.swarm !== targetSwarm) {
+    sendOperationError(ws, requestId, 'cross_swarm')
+    return
+  }
+  postToChannel(ws, ch.id, ch.name, msg.text, msg.to, deps, files, requestId ? { requestId, publish_id: msg.publish_id } : undefined, sender, swarmCheck.swarm)
 }
 
 interface MirrorDelivery {
@@ -1966,7 +2421,7 @@ function tryPublishMirror(deps: Readonly<WsDeps>, plan: PublishMirror, text: str
   return attempt
 }
 
-function postToChannel(ws: WsLike, channelId: string, channelName: string | undefined, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[], publish?: { requestId?: string; publish_id?: string }, sender?: Target): void {
+function postToChannel(ws: WsLike, channelId: string, channelName: string | undefined, text: string, to: string | undefined, deps: Readonly<WsDeps>, files?: DiscordFile[], publish?: { requestId?: string; publish_id?: string; swarm?: string }, sender?: Target, channelSwarm = DEFAULT_SWARM): void {
   const from = ws.data.sessionName!
   const requestId = typeof publish?.requestId === 'string' ? publish.requestId : undefined
   const reply = (ok: boolean, data: string) => {
@@ -2017,10 +2472,15 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   times.push(now)
   busPostTimes.set(from, times)
 
-  const names = allNames(deps).filter(n => n !== from)
+  const configured = Boolean(deps.swarmConfig?.isConfigured())
+  const sameSwarmNames = (configured ? swarmMembers(deps, channelSwarm) : allNames(deps)).filter(n => n !== from)
+  const crossNames = configured ? allNames(deps).filter(n => n !== from && isCrossSwarm(deps, n)) : []
+  const addressable = configured ? [...new Set([...sameSwarmNames, ...crossNames])] : sameSwarmNames
   const heard = audience(channelId, deps).filter(n => n !== from)
-  const defaultLabel = channelId === deps.busChannelId || channelId === deps.humanChannelId ? 'all' : 'subscribers'
-  const routed = routeAgentTarget(to, names, heard, defaultLabel, deps)
+  const chGeneralId = swarmGeneralId(deps, channelSwarm)
+  const chHumanId = swarmHumanId(deps, channelSwarm)
+  const defaultLabel = channelId === chGeneralId || channelId === chHumanId ? 'all' : 'subscribers'
+  const routed = routeAgentTarget(to, sameSwarmNames, addressable, heard, defaultLabel, channelSwarm, configured, deps)
   if (!routed.ok) {
     reply(false, routed.error)
     return
@@ -2031,9 +2491,9 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
   if (routed.passive) deps.unread?.bump(heard)
   deps.activity?.markPost(from)
 
-  const humanChannel = toLabel === 'human' && deps.humanChannelId !== channelId &&
-    !directChannelOwner(deps, channelId) ? deps.humanChannelId : undefined
-  const redirect = humanChannel && (!channelName || channelId === deps.busChannelId)
+  const humanChannel = toLabel === 'human' && chHumanId && chHumanId !== channelId &&
+    !directChannelOwner(deps, channelId) ? chHumanId : undefined
+  const redirect = humanChannel && (!channelName || channelId === chGeneralId)
   const source = channelName ? `#${channelName}` : '#general'
   const where = redirect ? humanChannel : channelId
   const origin = redirect ? ` (from ${source})` : ''
@@ -2096,7 +2556,16 @@ function postToChannel(ws: WsLike, channelId: string, channelName: string | unde
 type AgentRoute = { ok: true; targets: string[]; label: string; passive: boolean; allMode?: 'independent' | 'synthesis' } | { ok: false; error: string }
 
 /** `to` omitted or `subscribers` = mirror only. `all` = explicit fan-out. Anything else must be exact. */
-function routeAgentTarget(to: string | undefined, names: readonly string[], heard: readonly string[], defaultLabel: string, deps: Readonly<WsDeps>): AgentRoute {
+function routeAgentTarget(
+  to: string | undefined,
+  sameSwarmNames: readonly string[],
+  addressableNames: readonly string[],
+  heard: readonly string[],
+  defaultLabel: string,
+  swarm: string,
+  configured: boolean,
+  deps: Readonly<WsDeps>,
+): AgentRoute {
   if (!to) return { ok: true, targets: [], label: defaultLabel, passive: true }
   const low = to.toLowerCase()
   if (HUMAN_TARGETS.has(low)) return { ok: true, targets: [], label: 'human', passive: false }
@@ -2106,7 +2575,7 @@ function routeAgentTarget(to: string | undefined, names: readonly string[], hear
     const mode = all[1] === 'synthesis' ? 'synthesis' : 'independent'
     return { ok: true, targets: orderByCost(heard, n => deps.costs?.get(n) ?? 'standard'), label: 'all', passive: false, allMode: mode }
   }
-  const resolved = resolveExact(to, names)
+  const resolved = resolveExactInSwarm(to, sameSwarmNames, addressableNames, swarm, configured)
   if (!resolved.ok) return { ok: false, error: resolved.error }
   return { ok: true, targets: [resolved.name], label: resolved.name, passive: false }
 }
@@ -2149,7 +2618,13 @@ function scheduleTransport(deps: Readonly<WsDeps>, name: string, entry: InboxEnt
   }, delay)
 }
 
-function oneHumanTarget(deps: Readonly<WsDeps> | undefined, meta: ChannelMeta, names: readonly string[]): string | undefined {
+function oneHumanTarget(deps: Readonly<WsDeps> | undefined, meta: ChannelMeta, names: readonly string[], swarm = DEFAULT_SWARM): string | undefined {
+  // PR1 has no interim coordinator in non-default swarms; default keeps dispatcher + channelOwners
+  // only when no default master candidates are configured (impl-plan-v2 #31-3).
+  if (swarm !== DEFAULT_SWARM) return undefined
+  if (deps?.swarmConfig?.isConfigured() && deps.swarmConfig.candidatesFor(DEFAULT_SWARM).length > 0) {
+    return undefined
+  }
   const dispatcher = deps?.dispatcher
   if (dispatcher && names.includes(dispatcher)) return dispatcher
   const owner = meta.chat_id ? deps?.channelOwners?.get(meta.chat_id) : undefined
@@ -2163,7 +2638,7 @@ function interactiveNames(deps: Readonly<WsDeps> | undefined, sessions: SessionM
   return pool.filter(n => live.has(n) && !pullSessions.has(n))
 }
 
-/** Dispatcher re-delivers a stored human post. Anyone else is refused. */
+/** Dispatcher re-delivers a stored human post. Scoped to the dispatcher's swarm (§4). */
 function handleDispatch(ws: WsLike, parsed: { requestId?: string; messageId?: string; to?: readonly unknown[] }, deps: Readonly<WsDeps>): void {
   const requestId = parsed.requestId
   const messageId = parsed.messageId
@@ -2178,13 +2653,23 @@ function handleDispatch(ws: WsLike, parsed: { requestId?: string; messageId?: st
     sendToolResult(ws, requestId, false, 'only the dispatcher can re-deliver a human message')
     return
   }
-  const saved = deps.humanMail?.get(messageId)
-  if (!saved) { sendToolResult(ws, requestId, false, `no human message ${messageId}`); return }
-  const names = allNames(deps)
+  const mySwarm = callerSwarm(deps, me)
+  const configured = Boolean(deps.swarmConfig?.isConfigured())
+  const saved = deps.humanMail?.get(messageId, configured ? mySwarm : undefined)
+  if (!saved) {
+    // Distinguish cross-swarm messageId when configured (§8).
+    if (configured && deps.humanMail?.get(messageId)) {
+      sendToolResult(ws, requestId, false, 'cross_swarm')
+      return
+    }
+    sendToolResult(ws, requestId, false, `no human message ${messageId}`)
+    return
+  }
+  const names = configured ? swarmMembers(deps, mySwarm) : allNames(deps)
   const targets: string[] = []
   for (const raw of to) {
     if (typeof raw !== 'string' || !raw) { sendToolResult(ws, requestId, false, 'to must be exact session names'); return }
-    const resolved = resolveExact(raw, names)
+    const resolved = resolveExactInSwarm(raw, names, names, mySwarm, configured)
     if (!resolved.ok) { sendToolResult(ws, requestId, false, resolved.error); return }
     if (!targets.includes(resolved.name)) targets.push(resolved.name)
   }
@@ -2210,18 +2695,37 @@ function handleDispatch(ws: WsLike, parsed: { requestId?: string; messageId?: st
  * tells later sessions to read earlier replies; it does not attach them.
  * A Discord reply that also names a session follows the name, not the dispatcher.
  */
-export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager, audienceNames?: readonly string[], deps?: Readonly<WsDeps>): string[] {
-  const names = deps ? allNames(deps) : sessions.getSessions().map(s => s.name)
-  const send = (n: string, t: string, m: ChannelMeta) => {
-    if (deps) deliver(deps, n, t, m)
-    else sessions.routeToSession(n, t, m)
-  }
-  const pool = audienceNames ? names.filter(n => audienceNames.includes(n)) : names
+export function routeHumanBusMessage(content: string, meta: ChannelMeta, sessions: SessionManager, audienceNames?: readonly string[], deps?: Readonly<WsDeps>, swarm?: string): string[] {
+  const configured = Boolean(deps?.swarmConfig?.isConfigured())
   const direct = deps && meta.chat_id ? directChannelOwner(deps, meta.chat_id) : undefined
   if (direct && deps) {
     return deliver(deps, direct, content, { ...meta, to: direct, routed: 'direct-channel' }) ? [direct] : []
   }
-  deps?.humanMail?.remember(content, meta)
+  if (configured && deps?.swarmChannels && !deps.swarmChannels.isInitialFetchDone() &&
+      meta.chat_id && meta.chat_id !== deps.busChannelId && meta.chat_id !== deps.humanChannelId) {
+    // Topic channel before initial fetch: reply swarm_not_ready instead of silent empty fan-out (m4).
+    deps.onRoutingError?.('swarm_not_ready')
+    return []
+  }
+  let effectiveSwarm = swarm ?? DEFAULT_SWARM
+  if (configured && swarm === undefined && meta.chat_id && deps?.swarmChannels) {
+    const cls = deps.swarmChannels.classifyChannel(meta.chat_id)
+    if (cls.kind === 'swarm') effectiveSwarm = cls.swarm
+  }
+  const members = configured && deps
+    ? swarmMembers(deps, effectiveSwarm)
+    : (deps ? allNames(deps) : sessions.getSessions().map(s => s.name))
+  const addressable = configured && deps
+    ? [...new Set([...members, ...allNames(deps).filter(n => isCrossSwarm(deps, n))])]
+    : members
+  const send = (n: string, t: string, m: ChannelMeta) => {
+    if (deps) deliver(deps, n, t, m)
+    else sessions.routeToSession(n, t, m)
+  }
+  // For general/human (audienceNames omitted), pool = swarmMembers(effectiveSwarm) (no crossSwarm).
+  // For topic channels (audienceNames provided from channelSubscribers), pool includes subscribed crossSwarm.
+  const pool = audienceNames ? addressable.filter(n => audienceNames.includes(n)) : members
+  deps?.humanMail?.remember(content, meta, effectiveSwarm)
   const replyMeta: ChannelMeta = meta.unbound_reply
     ? { in_reply_to: meta.unbound_reply, question_id: meta.question_id ?? meta.unbound_reply }
     : {}
@@ -2241,18 +2745,18 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
   const m = content.match(/^\s*(@)?([\w.@:/-]+?)(:)?\s+([\s\S]*)$/)
   if (m && (m[1] || m[3])) {
     const token = m[2]
-    const resolved = resolveExact(token, names)
+    const resolved = resolveExactInSwarm(token, members, addressable, effectiveSwarm, configured)
     if (resolved.ok) {
       send(resolved.name, m[4], { ...meta, ...replyMeta, to: resolved.name })
       return [resolved.name]
     }
-    const prefix = names.some(n => n.startsWith(token))
+    const prefix = members.some(n => n.startsWith(token))
     if (m[1] || prefix) {
       deps?.onRoutingError?.(resolved.error)
       return []
     }
   }
-  const one = oneHumanTarget(deps, meta, names)
+  const one = oneHumanTarget(deps, meta, members, effectiveSwarm)
   if (one) {
     send(one, content, { ...meta, ...replyMeta, to: one, routed: 'dispatcher' })
     deps?.unread?.bump(pool.filter(n => n !== one))
@@ -2265,13 +2769,13 @@ export function routeHumanBusMessage(content: string, meta: ChannelMeta, session
     deps?.onRouteNote?.(`routed to ${interactive.join(', ')} (no dispatcher; live interactive only)`)
     return interactive
   }
-  deps?.onRouteNote?.(names.length
+  deps?.onRouteNote?.(members.length
     ? 'not routed: no live interactive session is connected. Headless agents were not woken.'
     : 'not routed: no agent sessions are connected.')
   return []
 }
 
-async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string }, deps: Readonly<WsDeps>, sender?: Target): Promise<void> {
+async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: string; channel?: string; name?: string; topic?: string; replacement?: string; session?: string; swarm?: string }, deps: Readonly<WsDeps>, sender?: Target): Promise<void> {
   // A legacy alias change cannot confer or carry administrative privileges.
   const caller = ws.data.sessionName
   const admin = caller && !ws.data.renamed && deps.admins?.has(caller)
@@ -2279,31 +2783,65 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
     sendToolResult(ws, msg.requestId, false, 'only admin sessions may act for another session')
     return
   }
+  if (admin && msg.session && caller && msg.session !== caller && deps.swarmConfig?.isConfigured()) {
+    // Acting across swarms needs a cross-swarm admin (§4).
+    const actorSwarm = knownSwarm(deps, msg.session) ?? DEFAULT_SWARM
+    if (actorSwarm !== callerSwarm(deps, caller) && !isCrossSwarm(deps, caller)) {
+      sendToolResult(ws, msg.requestId, false, 'cross_swarm')
+      return
+    }
+  }
   const me = (admin && msg.session) || caller
   const ops = deps.channelOps
   const subs = deps.subs
-  if (!me) { sendToolResult(ws, msg.requestId, false, 'not registered'); return }
+  if (!me || !caller) { sendToolResult(ws, msg.requestId, false, 'not registered'); return }
   if (!ops || !subs) { sendToolResult(ws, msg.requestId, false, 'channels disabled: router has no DISCORD_BUS_CHANNEL'); return }
   const target = sender?.alias === me ? sender : deps.inboxes?.target(me)
   const identity = target && identityKey(target)
+  const configured = Boolean(deps.swarmConfig?.isConfigured())
+  const reqSwarm = configured
+    ? resolveRequestedSwarm(deps, me, msg.swarm)
+    : { ok: true as const, swarm: DEFAULT_SWARM }
+  if (!reqSwarm.ok) { sendToolResult(ws, msg.requestId, false, reqSwarm.error); return }
+  const targetSwarm = reqSwarm.swarm
+
   try {
     if (msg.type === 'channelList') {
-      const list = await ops.list()
+      if (configured && targetSwarm !== DEFAULT_SWARM && deps.swarmChannels && !deps.swarmChannels.isSwarmReady(targetSwarm)) {
+        sendToolResult(ws, msg.requestId, false, 'swarm_not_ready')
+        return
+      }
+      const list = await ops.list(targetSwarm)
+      const genId = swarmGeneralId(deps, targetSwarm)
+      const humId = swarmHumanId(deps, targetSwarm)
       const out = list.map(c => ({
         id: c.id, name: c.name, topic: c.topic ?? undefined,
-        default: c.id === deps.busChannelId,
-        human: c.id === deps.humanChannelId,
-        subscribed: c.id === deps.busChannelId || c.id === deps.humanChannelId ||
+        default: c.id === genId,
+        human: c.id === humId,
+        subscribed: c.id === genId || c.id === humId ||
           (directChannelOwner(deps, c.id) ? directChannelOwner(deps, c.id) === me : subs.has(me, c.id, identity)),
-        subscribers: c.id === deps.busChannelId || c.id === deps.humanChannelId ? ['(everyone)'] : channelSubscribers(deps, c.id),
+        subscribers: c.id === genId || c.id === humId ? ['(everyone)'] : channelSubscribers(deps, c.id),
       }))
       sendToolResult(ws, msg.requestId, true, JSON.stringify(out))
       return
     }
     if (msg.type === 'channelCreate') {
       if (!msg.name) { sendToolResult(ws, msg.requestId, false, 'channel_create requires name'); return }
-      const existing = await ops.resolve(msg.name)
-      const ch = existing ?? await ops.create(msg.name, msg.topic)
+      const cleanName = msg.name.replace(/^#/, '').trim().toLowerCase()
+      if (configured && targetSwarm !== DEFAULT_SWARM && (cleanName === 'general' || cleanName === 'human')) {
+        sendToolResult(ws, msg.requestId, false, 'reserved_swarm_channel')
+        return
+      }
+      if (configured && targetSwarm !== DEFAULT_SWARM && deps.swarmChannels && !deps.swarmChannels.isSwarmReady(targetSwarm)) {
+        sendToolResult(ws, msg.requestId, false, 'swarm_not_ready')
+        return
+      }
+      const existing = await ops.resolve(msg.name, targetSwarm)
+      if (existing) {
+        const check = await assertChannelInSwarm(deps, me, existing.id)
+        if (!check.ok) { sendToolResult(ws, msg.requestId, false, check.error); return }
+      }
+      const ch = existing ?? await ops.create(msg.name, msg.topic, targetSwarm)
       if (directChannelOwner(deps, ch.id)) {
         sendToolResult(ws, msg.requestId, false, 'direct_channel_managed')
         return
@@ -2312,27 +2850,51 @@ async function handleChannelOp(ws: WsLike, msg: { type: string; requestId: strin
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, created: !existing, subscribed: true }))
       return
     }
-    const ch = msg.channel ? await ops.resolve(msg.channel) : null
+    const ch = msg.channel ? await ops.resolve(msg.channel, targetSwarm) : null
     if (!ch) { sendToolResult(ws, msg.requestId, false, `Unknown channel "${msg.channel ?? ''}" (use channel_list)`); return }
+    const chCheck = await assertChannelInSwarm(deps, me, ch.id)
+    if (!chCheck.ok) { sendToolResult(ws, msg.requestId, false, chCheck.error); return }
+    if (caller !== me) {
+      const callerCheck = await assertChannelInSwarm(deps, caller, ch.id)
+      if (!callerCheck.ok) { sendToolResult(ws, msg.requestId, false, callerCheck.error); return }
+    }
+    if (msg.swarm && chCheck.swarm !== targetSwarm) {
+      sendToolResult(ws, msg.requestId, false, 'cross_swarm')
+      return
+    }
     if (directChannelOwner(deps, ch.id)) {
       sendToolResult(ws, msg.requestId, false, 'direct_channel_managed')
       return
     }
-    if (ch.id === deps.busChannelId) {
+    const chCore = deps.swarmChannels?.isSwarmCoreChannel(ch.id)
+    const isCoreGeneral = ch.id === deps.busChannelId || chCore?.role === 'general'
+    const isCoreHuman = ch.id === deps.humanChannelId || chCore?.role === 'human'
+    // Without config, keep today's BUS_CHANNEL note+success short-circuit before channelArchive (m1).
+    if (!configured && ch.id === deps.busChannelId) {
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, note: 'default bus channel: every session always receives it' }))
       return
     }
     if (msg.type === 'channelArchive') {
-      if (ch.id === deps.humanChannelId) { sendToolResult(ws, msg.requestId, false, 'cannot archive the human channel'); return }
-      const repl = msg.replacement ? await ops.resolve(msg.replacement) : null
+      if (isCoreGeneral) { sendToolResult(ws, msg.requestId, false, 'cannot archive the general bus channel'); return }
+      if (isCoreHuman) { sendToolResult(ws, msg.requestId, false, 'cannot archive the human channel'); return }
+      const repl = msg.replacement ? await ops.resolve(msg.replacement, chCheck.swarm) : null
       if (msg.replacement && !repl) { sendToolResult(ws, msg.requestId, false, `Unknown replacement channel "${msg.replacement}"`); return }
+      if (repl) {
+        const replCheck = await assertChannelInSwarm(deps, me, repl.id)
+        if (!replCheck.ok) { sendToolResult(ws, msg.requestId, false, replCheck.error); return }
+        if (replCheck.swarm !== chCheck.swarm) { sendToolResult(ws, msg.requestId, false, 'cross_swarm'); return }
+      }
       if (repl?.id === ch.id) { sendToolResult(ws, msg.requestId, false, 'replacement is the same channel'); return }
       const note = `ARCHIVED by ${me}${repl ? ` — continue in #${repl.name} (${repl.id})` : ''}`
-      if (ops.archive) await ops.archive(ch.id, note)
+      if (ops.archive) await ops.archive(ch.id, note, chCheck.swarm)
       const moved = channelSubscribers(deps, ch.id)
       subs.moveChannel(ch.id, repl?.id)
       sendToDiscord(deps.client, ch.id, `**${note}**`)
       sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, archived: true, movedSubscribers: moved, ...(repl && { replacement: repl }) }))
+      return
+    }
+    if (isCoreGeneral) {
+      sendToolResult(ws, msg.requestId, true, JSON.stringify({ ...ch, note: 'default bus channel: every session always receives it' }))
       return
     }
     const changed = msg.type === 'channelSubscribe' ? subs.add(me, ch.id, identity) : subs.remove(me, ch.id, identity)

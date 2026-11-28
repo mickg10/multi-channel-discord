@@ -63,26 +63,36 @@ export class CostClasses {
 }
 
 /**
- * Recent human posts, keyed by Discord message id. The dispatcher re-delivers
- * one of these verbatim. Not durable: a restart forgets them.
+ * Recent human posts, partitioned per swarm and keyed by Discord message id (§4).
+ * The dispatcher re-delivers one of these verbatim. Not durable: a restart forgets them.
  */
 export class HumanMail {
-  private readonly items = new Map<string, { content: string; meta: Record<string, string | undefined> }>()
-  private readonly ids: string[] = []
+  private readonly partitions = new Map<string, {
+    items: Map<string, { content: string; meta: Record<string, string | undefined>; swarm: string }>
+    ids: string[]
+  }>()
 
-  remember(content: string, meta: { message_id?: string; from_human?: string }): void {
+  remember(content: string, meta: { message_id?: string; from_human?: string }, swarm = 'default'): void {
     const id = meta.message_id
-    if (!id || meta.from_human !== 'true' || this.items.has(id)) return
-    this.items.set(id, { content, meta: { ...meta } })
-    this.ids.push(id)
-    while (this.ids.length > 200) {
-      const old = this.ids.shift()
-      if (old) this.items.delete(old)
+    if (!id || meta.from_human !== 'true') return
+    let part = this.partitions.get(swarm)
+    if (!part) { part = { items: new Map(), ids: [] }; this.partitions.set(swarm, part) }
+    if (part.items.has(id)) return
+    part.items.set(id, { content, meta: { ...meta }, swarm })
+    part.ids.push(id)
+    while (part.ids.length > 200) {
+      const old = part.ids.shift()
+      if (old) part.items.delete(old)
     }
   }
 
-  get(id: string): { content: string; meta: Record<string, string | undefined> } | undefined {
-    return this.items.get(id)
+  get(id: string, swarm?: string): { content: string; meta: Record<string, string | undefined>; swarm: string } | undefined {
+    if (swarm !== undefined) return this.partitions.get(swarm)?.items.get(id)
+    for (const part of this.partitions.values()) {
+      const hit = part.items.get(id)
+      if (hit) return hit
+    }
+    return undefined
   }
 }
 

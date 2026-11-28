@@ -69,6 +69,7 @@ export interface WsReply {
 /** Plugin → Router: react to a Discord message */
 export interface WsReact {
   readonly type: 'react'
+  readonly requestId?: string
   readonly chatId: string
   readonly messageId: string
   readonly emoji: string
@@ -97,6 +98,7 @@ export interface WsFetchMessages {
   readonly requestId: string
   readonly channel: string
   readonly limit?: number
+  readonly swarm?: string
 }
 
 /** Plugin → Router: send an interactive question with select menu or buttons */
@@ -137,6 +139,8 @@ export interface WsBusPost {
   readonly text: string
   /** Exact session, "human", or "all". Omitted mirrors the post and wakes nobody. */
   readonly to?: string
+  /** Target swarm (cross-swarm callers only; defaults to caller's swarm or recipient's swarm). */
+  readonly swarm?: string
 }
 
 /** Dispatcher only: re-deliver a stored human message to these exact sessions. */
@@ -151,6 +155,7 @@ export interface WsDispatch {
 export interface WsListSessions {
   readonly type: 'listSessions'
   readonly requestId: string
+  readonly swarm?: string
 }
 
 /** Post to a specific Discord channel (id or name); delivered to its subscribers. */
@@ -162,6 +167,7 @@ export interface WsChannelPost {
   readonly channel: string
   readonly text: string
   readonly to?: string
+  readonly swarm?: string
 }
 
 /** Channel management, answered with a toolResult. */
@@ -175,6 +181,7 @@ export interface WsChannelOp {
   readonly replacement?: string
   /** Admin only: act on behalf of this session (subscribe/unsubscribe). */
   readonly session?: string
+  readonly swarm?: string
 }
 
 /** A per-machine node daemon announcing the headless agents it runs. */
@@ -267,6 +274,7 @@ export interface WsRegistered {
   readonly reclaimOnly?: true
   readonly swarm?: string
   readonly defaultSessions?: readonly string[]
+  readonly swarmConfigured?: boolean
   readonly warning?: string
 }
 
@@ -297,6 +305,7 @@ export interface WsPermissionVerdict {
   readonly type: 'permissionVerdict'
   readonly requestId: string
   readonly behavior: 'allow' | 'deny'
+  readonly reason?: string
 }
 
 /** Union of all messages the router can send to a plugin */
@@ -314,9 +323,17 @@ export interface WsSwarmChanged {
   readonly swarm: string
 }
 
+/** Router → plugin: operator killed this session; close WS, do not reconnect, keep process alive. */
+export interface WsKilled {
+  readonly type: 'killed'
+  readonly reconnect: false
+  readonly reason?: string
+}
+
 export type RouterToPluginMessage =
   | WsReplaced
   | WsSwarmChanged
+  | WsKilled
   | WsMessage
   | WsRegistered
   | WsRenamed
@@ -419,10 +436,10 @@ type ForwardedGatewayCall =
   | (Omit<WsChannelPost, 'type'> & { op: 'channelPost' })
   | (Omit<WsReply, 'type'> & { op: 'reply' })
   | (Omit<WsFetchMessages, 'type'> & { op: 'fetchMessages' })
-  | { op: 'busSessions' }
+  | { op: 'busSessions'; swarm?: string }
   | (Omit<WsClaimOp, 'type'> & { op: WsClaimOp['type'] })
   | (Omit<WsMcpOp, 'type'> & { op: WsMcpOp['type'] })
-  | { op: 'channelList' | 'channelSubscribe'; channel?: string; session?: string }
+  | { op: 'channelList' | 'channelSubscribe'; channel?: string; session?: string; swarm?: string }
 
 export type GatewayToolCall = ForwardedGatewayCall & {
   type: 'gatewayOp'

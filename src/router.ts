@@ -11,7 +11,7 @@ import { loadEnvFile, gate, checkApprovals, loadAccess, getStateDir } from './ac
 import { createDiscordClient, safeAttName, TypingManager } from './discord.js'
 import { SessionManager, ProjectHistory } from './sessions.js'
 import { NameLeases } from './name-leases.js'
-import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, directChannelOwner, onlineBusAgent, inboxError, deliver as deliverFn, applySwarmConfigReload, knownSwarm, sendRulesForSwarm } from './ws.js'
+import { createWsHandlers, handlePermissionButton, routeHumanBusMessage, channelSubscribers, directChannelOwner, onlineBusAgent, inboxError, deliver as deliverFn, applySwarmConfigReload, knownSwarm, sendRulesForSwarm, flushHeldPermissionsForSwarm, killSession } from './ws.js'
 import { SwarmConfig } from './swarm-config.js'
 import { SwarmJournal } from './swarm-journal.js'
 import { SwarmChannels, type ChannelClientLike, type GuildLike } from './swarm-channels.js'
@@ -235,7 +235,10 @@ const swarmChannels = new SwarmChannels({
     }
     return undefined
   },
-  onSwarmReady: (swarm) => sendRulesForSwarm(wsDepsRef, swarm),
+  onSwarmReady: (swarm) => {
+    sendRulesForSwarm(wsDepsRef, swarm)
+    flushHeldPermissionsForSwarm(swarm)
+  },
 })
 
 const getGuildLike = async () => (await busGuild()) as unknown as GuildLike
@@ -285,6 +288,7 @@ const wsHandlers = createWsHandlers(wsDepsRef = {
   conversations,
   swarmConfig,
   swarmJournal,
+  swarmChannels,
   swarmGeneralChannel: swarm => swarmChannels.generalChannelId(swarm),
   onRegisterPruneSubs: (name, swarm) => { swarmChannels.pruneSessionSubscriptions(name, swarm) },
   onSkillsRegistered: (skills: readonly SkillEntry[]) => {
@@ -353,6 +357,9 @@ const slashDeps: SlashCommandDeps = {
   sessions,
   history,
   startedAt,
+  channelSwarm: id => swarmChannels.channelSwarm(id),
+  isSwarmConfigured: () => swarmConfig.isConfigured(),
+  killSession: name => killSession(wsDepsRef, name),
 }
 
 // ============================================================
@@ -383,7 +390,15 @@ async function handleBusInbound(msg: Message): Promise<void> {
   let channelName: string | undefined
   try { channelName = 'name' in msg.channel ? (msg.channel as { name: string }).name : undefined } catch {}
   const fullMeta: ChannelMeta = { ...meta, ...(channelName && { channel: channelName }) }
+  if (swarmConfig.isConfigured() && !swarmChannels.isInitialFetchDone() &&
+      msg.channelId !== BUS_CHANNEL && msg.channelId !== HUMAN_CHANNEL && !directChannelOwner(wsDepsRef, msg.channelId)) {
+    // Topic channel before initial fetch completes: reply swarm_not_ready instead of empty fan-out (m4).
+    await msg.reply('swarm_not_ready: channel layout is still initializing — please try again shortly.').catch(() => {})
+    return
+  }
   // A Discord reply to an agent's post goes to that agent only ("**[name → ...]**" prefix).
+  const chCls = swarmConfig.isConfigured() ? swarmChannels.classifyChannel(msg.channelId) : null
+  const chSwarm = chCls && chCls.kind === 'swarm' ? chCls.swarm : 'default'
   let delivered: string[] = []
   let boundMiss: string | undefined
   if (msg.reference?.messageId && !directChannelOwner(wsDepsRef, msg.channelId)) {
@@ -392,6 +407,13 @@ async function handleBusInbound(msg: Message): Promise<void> {
       const m = ref.author.id === client.user?.id ? ref.content.match(/^\*\*\[([^\]\s]+) →/) : null
       if (m) {
         const asker = m[1]
+        if (swarmConfig.isConfigured()) {
+          const askerSwarm = knownSwarm(wsDepsRef, asker) ?? 'default'
+          if (askerSwarm !== chSwarm && !swarmConfig.isCrossSwarm(asker)) {
+            await msg.reply(`not delivered to ${asker}: session is not in swarm ${chSwarm}.`).catch(() => {})
+            return
+          }
+        }
         const target = inboxes.approvalTarget(ref.id)
         const held = deliverFn(wsDepsRef, asker, content, { ...fullMeta, to: asker, in_reply_to: ref.id, question_id: ref.id }, target)
         if (held) delivered = [asker]
@@ -410,9 +432,10 @@ async function handleBusInbound(msg: Message): Promise<void> {
     const bound = msg.reference?.messageId
       ? { ...fullMeta, unbound_reply: msg.reference.messageId, in_reply_to: msg.reference.messageId }
       : fullMeta
-    const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL
+    const core = swarmChannels.isSwarmCoreChannel(msg.channelId)
+    const everyone = msg.channelId === BUS_CHANNEL || msg.channelId === HUMAN_CHANNEL || core?.role === 'general' || core?.role === 'human'
     try {
-      delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : channelSubscribers(wsDepsRef, msg.channelId), wsDepsRef)
+      delivered = routeHumanBusMessage(content, bound, sessions, everyone ? undefined : channelSubscribers(wsDepsRef, msg.channelId), wsDepsRef, chSwarm)
     } catch (err) {
       await msg.reply(inboxError(err)).catch(() => {})
       return
@@ -532,15 +555,26 @@ client.on('interactionCreate', interaction => {
     )
     return
   }
-  // Handle permission button clicks
+  // Handle permission button clicks (when swarm config is active, honoured only for users in allowFrom, §10.5, m2)
   if (interaction.isButton()) {
     const customId = interaction.customId
     if (customId.startsWith('perm_yes_') || customId.startsWith('perm_no_')) {
+      const configured = swarmConfig.isConfigured()
+      let allowFrom: readonly string[] | undefined
+      if (configured) {
+        allowFrom = loadAccess().allowFrom
+        if (!allowFrom.includes(interaction.user.id)) {
+          interaction.reply({ content: 'Not authorised to respond to permission requests.', ephemeral: true })
+            .catch((e: unknown) => process.stderr.write(`discord: permission button deny reply failed: ${e instanceof Error ? e.message : String(e)}\n`))
+          return
+        }
+      }
+      // Update message: Allowed/Denied when delivered, Expired when unknown/timed out/disconnected (impl-plan-v2 #31-2).
+      const delivered = handlePermissionButton(customId, interaction.user.id, allowFrom)
       const isAllow = customId.startsWith('perm_yes_')
-      const requestId = customId.replace(/^perm_(yes|no)_/, '')
-      handlePermissionButton(customId)
+      const statusLabel = delivered ? (isAllow ? 'Allowed' : 'Denied') : 'Expired'
       interaction.update({
-        content: interaction.message.content + `\n\n> **${isAllow ? 'Allowed' : 'Denied'}**`,
+        content: interaction.message.content + `\n\n> **${statusLabel}**`,
         components: [],
       }).catch((e: unknown) => process.stderr.write(`discord: permission button update failed: ${e instanceof Error ? e.message : String(e)}\n`))
     }
