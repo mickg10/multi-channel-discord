@@ -14,7 +14,7 @@ import {
 import { z } from 'zod'
 import { readNamingContext, findClaudeSession, readClaudeSession, sessionAlias } from './naming.js'
 import { ensureRouter } from './ensure-router.js'
-import { computeBackoff } from './reconnect.js'
+import { computeBackoff, connectionClosed } from './reconnect.js'
 import { discoverSkills } from './skills.js'
 import { getStateDir, loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
@@ -499,13 +499,14 @@ export async function startPlugin(): Promise<void> {
         process.stderr.write(`discord plugin: skill discovery failed: ${err instanceof Error ? err.message : String(err)}\n`)
       })
 
-      ws.onclose = () => {
-        currentWs = null
-        if (!shuttingDown) scheduleReconnect()
-      }
-
+      const disconnected = connectionClosed(() => currentWs === ws,
+        () => { currentWs = null },
+        () => { if (!shuttingDown) scheduleReconnect() })
+      ws.onclose = disconnected
       ws.onerror = () => {
-        currentWs = null
+        if (currentWs !== ws) return
+        disconnected()
+        try { ws.close() } catch {}
       }
     } catch (err: unknown) {
       if (err instanceof Error && err.message === 'takeover_refused') {
