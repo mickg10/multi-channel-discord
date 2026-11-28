@@ -13,7 +13,7 @@ import {
 import { z } from 'zod'
 import { readNamingContext, findClaudeSession, readClaudeSession, sessionAlias } from './naming.js'
 import { ensureRouter } from './ensure-router.js'
-import { computeBackoff } from './reconnect.js'
+import { computeBackoff, PING_INTERVAL_MS, pingMissed } from './reconnect.js'
 import { discoverSkills } from './skills.js'
 import { getStateDir, loadEnvFile } from './access.js'
 import { hostname } from 'node:os'
@@ -121,6 +121,8 @@ export interface ConnectToRouterOptions {
   readonly onPermissionVerdict?: (requestId: string, behavior: 'allow' | 'deny') => void
   /** The router gave our name to a newer connection. */
   readonly onReplaced?: (name: string, reclaim: boolean) => void
+  /** Router answered a keepalive ping. */
+  readonly onPong?: () => void
   /** Stable conversation id. A later session that reuses the display name does not inherit held approvals. */
   readonly conversationId?: string
 }
@@ -178,6 +180,8 @@ export async function connectToRouter(opts: ConnectToRouterOptions): Promise<Con
           else if (msg.success) pending.resolve(msg.data)
           else pending.reject(new Error(msg.data))
         }
+      } else if (msg.type === 'pong') {
+        opts.onPong?.()
       } else if (msg.type === 'replaced') {
         onReplaced?.(msg.name, msg.reclaim !== false)
         if (!registered) {
@@ -462,6 +466,7 @@ export async function startPlugin(): Promise<void> {
         onMessage,
         pendingRequests,
         onPermissionVerdict,
+        onPong: () => { pongAt = Date.now() },
         onReplaced: (n: string, reclaim: boolean) => {
           reclaimAllowed = reclaim
           process.stderr.write(`discord plugin: name "${n}" taken over${reclaim ? '; waiting for it to become free' : '; conversation superseded'}\n`)
@@ -472,6 +477,7 @@ export async function startPlugin(): Promise<void> {
         ...(conversationId && { conversationId }),
       })
       currentWs = ws
+      startKeepalive(ws)
       routerSupportsReclaim = canReclaim
       currentName = registeredName
       retired = false
@@ -498,6 +504,7 @@ export async function startPlugin(): Promise<void> {
       })
 
       ws.onclose = () => {
+        stopKeepalive()
         currentWs = null
         if (!shuttingDown) scheduleReconnect()
       }
@@ -519,6 +526,29 @@ export async function startPlugin(): Promise<void> {
       process.stderr.write(`discord plugin: connection failed: ${err instanceof Error ? err.message : String(err)}\n`)
       if (!shuttingDown) scheduleReconnect()
     }
+  }
+
+  let pingTimer: ReturnType<typeof setInterval> | undefined
+  let pingSentAt: number | undefined
+  let pongAt: number | undefined
+  function stopKeepalive(): void {
+    if (pingTimer) clearInterval(pingTimer)
+    pingTimer = undefined
+    pingSentAt = undefined
+    pongAt = undefined
+  }
+  function startKeepalive(socket: WebSocket): void {
+    stopKeepalive()
+    pingTimer = setInterval(() => {
+      if (pingMissed(pingSentAt, pongAt)) {
+        process.stderr.write('discord plugin: keepalive missed; reconnecting\n')
+        try { socket.close() } catch { /* already closed */ }
+        return
+      }
+      pingSentAt = Date.now()
+      try { socket.send(JSON.stringify({ type: 'ping' })) } catch { /* close will reconnect */ }
+    }, PING_INTERVAL_MS)
+    pingTimer.unref?.()
   }
 
   let aliasTimer: ReturnType<typeof setInterval> | null = null

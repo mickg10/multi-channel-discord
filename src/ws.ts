@@ -20,6 +20,7 @@ import type { SessionManager, ProjectHistory } from './sessions.js'
 import type { Subscriptions } from './subscriptions.js'
 import type { NodeRegistry, Claims } from './nodes.js'
 import { isBusAlias } from './bus-alias.js'
+import { PING_INTERVAL_MS } from './reconnect.js'
 import { identityKey, type Inboxes, type InboxEntry, type PublishMirror } from './inboxes.js'
 import type { GatewayToRouterMessage, GatewayToolCall, Kind, PublishResult, Target, WakeResult, WsChannelPost } from './types.js'
 import type { McpRouterDeps, McpServerDecl } from './mcp.js'
@@ -63,7 +64,12 @@ export interface WsData {
   gateway?: { user: string; agents: Map<string, Target> }
   /** Register-time instance id of the client connection (grant binding). */
   instanceId?: string
+  /** Last keepalive ping. Unset until the client opts in by pinging. */
+  lastPing?: number
 }
+
+/** A client that has pinged and then stays silent this long is dropped. Three plugin intervals. */
+export const KEEPALIVE_DEAD_MS = PING_INTERVAL_MS * 3
 
 export interface WsDeps {
   readonly sessions: SessionManager
@@ -83,6 +89,8 @@ export interface WsDeps {
   readonly secret?: string
   /** Max bus posts per session per minute (loop guard). Default 12. */
   readonly busMaxPerMinute?: number
+  /** Silence after a ping before the router closes the socket. Default {@link KEEPALIVE_DEAD_MS}. */
+  readonly keepaliveDeadMs?: number
   /** Channel subscriptions (agent bus beyond the default channel). */
   readonly subs?: Subscriptions
   readonly channelOps?: ChannelOps
@@ -322,6 +330,8 @@ export interface WsHandlers {
   open(ws: WsLike): void
   message(ws: WsLike, msg: string | Buffer): void
   close(ws: WsLike): void
+  /** Close sockets that pinged and then went silent. Returns the session names dropped. */
+  sweepKeepalive(now?: number): string[]
 }
 
 /** Fetch a text-based channel from Discord, returning null if not found or not text-based. */
@@ -341,8 +351,22 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
     const target = deps.inboxes?.target(name)
     return target ? [[name, identityKey(target)]] : []
   }))
+  const clients = new Set<WsLike>()
+  const sweepKeepalive = (now = Date.now()): string[] => {
+    const deadMs = deps.keepaliveDeadMs ?? KEEPALIVE_DEAD_MS
+    const dropped: string[] = []
+    for (const client of clients) {
+      const seen = client.data.lastPing
+      if (seen === undefined || now - seen <= deadMs) continue
+      dropped.push(client.data.sessionName ?? '')
+      clients.delete(client)
+      try { client.close?.() } catch { /* already gone */ }
+    }
+    return dropped
+  }
   return {
-    open(_ws: WsLike): void {},
+    sweepKeepalive,
+    open(ws: WsLike): void { clients.add(ws) },
 
     message(ws: WsLike, raw: string | Buffer): void {
       const text = typeof raw === 'string' ? raw : raw.toString()
@@ -369,6 +393,7 @@ export function createWsHandlers(deps: Readonly<WsDeps>): WsHandlers {
     },
 
     close(ws: WsLike): void {
+      clients.delete(ws)
       if (ws.data.gateway && ws.data.nodeName && deps.inboxes) {
         const hosts = gateways.get(deps.inboxes)
         if (hosts?.get(ws.data.nodeName)?.data === ws.data) hosts.delete(ws.data.nodeName)
@@ -876,6 +901,13 @@ function dispatchLegacyMessage(ws: WsLike, parsed: PluginToRouterMessage, deps: 
         deps.costs?.set(ws.data.sessionName, (parsed as { costClass?: unknown }).costClass)
       }
       break
+    case 'ping': {
+      const now = Date.now()
+      ws.data.lastPing = now
+      if (ws.data.sessionName) deps.sessions.notePing(ws.data.sessionName, now)
+      ws.send(JSON.stringify({ type: 'pong' }))
+      break
+    }
     case 'deregister':
       handleDeregister(ws, deps)
       break

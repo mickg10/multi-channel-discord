@@ -17,6 +17,8 @@ interface SessionSlot {
   readonly agent?: string
   readonly conversationId?: string
   readonly connectedAt: number
+  /** Last protocol ping from the connection that owns this name. */
+  lastPing?: number
   messageCount: number
   readonly send: (msg: string) => void
   readonly extraSends: Array<(msg: string) => void>
@@ -100,6 +102,11 @@ export class SessionManager {
 
   isSameInstance(name: string, instanceId?: string): boolean {
     return !!instanceId && this.sessions.get(name)?.instanceId === instanceId
+  }
+
+  notePing(name: string, at: number): void {
+    const slot = this.sessions.get(name)
+    if (slot) slot.lastPing = at
   }
 
   ownsSender(name: string, send: (msg: string) => void): boolean {

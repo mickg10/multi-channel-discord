@@ -340,6 +340,9 @@ const wsServer = Bun.serve<WsData>({
 
 process.stderr.write(`discord channel: WS server listening on ${WS_HOST}:${WS_PORT} (auth=${ROUTER_SECRET ? 'secret' : 'none'}, bus=${BUS_CHANNEL ?? 'off'}, human=${HUMAN_CHANNEL ?? 'off'})\n`)
 
+const keepaliveSweep = setInterval(() => wsHandlers.sweepKeepalive(), 15_000)
+keepaliveSweep.unref?.()
+
 // ============================================================
 // PID management
 // ============================================================
@@ -559,6 +562,7 @@ async function shutdown(): Promise<void> {
   shuttingDown = true
   process.stderr.write('discord channel: shutting down\n')
   clearInterval(bufferInterval)
+  clearInterval(keepaliveSweep)
   // Clear all typing intervals
   typingManager.stopAll()
   try {

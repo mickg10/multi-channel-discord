@@ -41,6 +41,11 @@ export interface WsRegister {
   readonly conversationId?: string
 }
 
+/** Plugin → Router: keepalive. The router drops a client that misses it. */
+export interface WsPing {
+  readonly type: 'ping'
+}
+
 /** Plugin → Router: rename this session */
 export interface WsRename {
   readonly type: 'rename'
@@ -232,6 +237,7 @@ export type PluginToRouterMessage =
   | WsDispatch
   | WsListSessions
   | WsRegister
+  | WsPing
   | WsRename
   | WsReply
   | WsReact
@@ -269,6 +275,11 @@ export interface WsRenamed {
   readonly newName: string
 }
 
+/** Router → Plugin: answer to a keepalive ping. */
+export interface WsPong {
+  readonly type: 'pong'
+}
+
 /** Router → Plugin: error response */
 export interface WsError {
   readonly type: 'error'
@@ -304,6 +315,7 @@ export type RouterToPluginMessage =
   | WsMessage
   | WsRegistered
   | WsRenamed
+  | WsPong
   | WsError
   | WsToolResult
   | WsPermissionVerdict
