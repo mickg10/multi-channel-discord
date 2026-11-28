@@ -1,0 +1,77 @@
+# R2 resolutions (lead)
+
+## Carbon R2
+- **Accepted:**
+  - **#1:** `protectedRenameAlias` stays rename-only. At register, a `crossSwarm` alias is rejected unless its swarm is `default`, and a candidate alias is rejected unless it's in its candidate swarm. Candidates are excluded from `observeDirectChannel`, and both kinds launch with `DISCORD_SESSION_NAME`.
+  - **#2:** SessionManager and NameLeases key on `${host}:${instanceId}`. A same-swarm duplicate merges into `extraSends` as today; the socket is closed only when the swarm changed.
+  - **#3:** `agent-swarms.json` is the persistent name→swarm map, used as the fallback for offline names. `inboxes.legacy` is filtered by swarm. A cross-swarm takeover is refused (the newcomer gets a collision suffix), and so is a cross-swarm `registerAgent`. Claims are partitioned by `(swarm, task)`, and `release_claim(to=)` follows the `to=` rules.
+  - **#4:** `~/.codex-$S/config.toml` is rendered with `DISCORD_SESSION_NAME` stripped, `DISCORD_WAKE_PANE` set to `=$S:codex`, and the new tools pre-approved.
+    - `codex-photos` is kept, in `agents` on nas642.
+    - Window targets use `-t "=$S:=$w"`.
+    - The `CODEX_HOME` match uses `ps eww` on the Mac and `/proc/<pid>/environ` on Linux; the Mac's shared daemon is never killed.
+    - The opencode and grok commands and their MCP env are defined.
+  - **#5:** schema `{crossSwarm?, default?:{candidates}, swarms:{<id>:{candidates}}}`.
+    - `ENOENT` means absent.
+    - Malformed JSON at cold start enters configured-empty mode: every non-default swarm is rejected.
+    - The file is polled every 5 s.
+    - `requestedSwarm` is kept on `WsData`.
+  - **#6:**
+    - The DM exemption applies only to `default` and cross-swarm callers.
+    - A `permissionRequest` from a non-default swarm goes to `<swarm>:human`.
+    - `fetch` resolves refs.
+    - The WS frames gain `swarm?`, and a mismatch from a non-cross-swarm caller gets `cross_swarm` (no silent ignore).
+    - A cross-swarm `bus_post(swarm=s)`, or a reply in `s:general`, targets `s`.
+    - `msg.session` requires the session's swarm to match the channel's swarm.
+    - `/switch`, `/spawn` and skills are limited to `default` and DMs; `/list`, `/status`, `/kill` and `/broadcast` are scoped.
+  - **#7:**
+    - Master-routed and queued posts are journalled on arrival.
+    - The topic fallback goes to interactive subscribers only.
+    - Self-assign is exempt from the subscriber rule.
+    - `role:master` is rejected in pull mode.
+    - An incumbent removed on reload is fenced.
+    - A `bus_demote` tool is added, and Mick's `demote` is scoped by channel (`default` in BUS/HUMAN).
+    - The `default` swarm announces in BUS_CHANNEL.
+  - **#8:**
+    - On a swarm change, `currentName` is reset.
+    - `TMUX_PANE` is dropped; wake uses the own pane, and `DISCORD_WAKE_PANE` is only resolved in order to warn.
+    - A rejected register uses the `register rejected:` prefix and retries every 60 s.
+    - Session lookup uses `list-windows -a` by window id.
+    - Under ChatGPT, the swarm is forced to `default`.
+  - **#9:**
+    - Provisioning runs after `clientReady` with an unthrottled fetch and case-insensitive matching, through one locked overflow picker.
+    - `channelSwarm` also matches `<id> (archived)`.
+    - A sweep runs on `clientReady` and `channelUpdate`, keeping cross-swarm subscribers.
+    - `swarmMembers` (live and offline) is used for `to=`, `@`, `@all` and lists.
+    - `@<cross-swarm>` is allowed.
+    - An out-of-swarm reply-to-bot is rejected in place.
+    - Node `inboxCount` and `agentStatus` are scoped to the owning node.
+  - **#10:** the rollout gate.
+- **Cuts:**
+  - **Cut 1 accepted.** `SwarmStore` and the id→swarm map are dropped; `channelSwarm` works from the category name: `<id>`, `<id> N` or `<id> (archived)`.
+  - **Cut 3 accepted.** The swarm, master and term go into `bus_sessions`, and there is no `bus_swarm` tool.
+  - **Cut 2 rejected.** Whether swarm-master is cross-swarm is a config choice, not spec. Mick uses it as the overall coordinator, so it stays in the example config.
+
+## Fable R2
+- **All accepted.**
+  - **B1:** a cross-swarm takeover is a plain register and gets `-N`. This is the same as Carbon #3.
+  - **B2:** non-default names are `<agent>@<host>:<swarm>/<dir>`. The `name→swarm` journal (`agent-swarms.json`, the same as Carbon #3) is the only offline lookup. A register whose journalled swarm differs is a collision and gets `-N`. **Cut:** the swarm field on inbox rows, and "newest inbox row".
+  - **B3:** the render rewrites the name and pane and fails on a foreign session. There is one `CODEX_HOME` per Codex window. With no own pane, a foreign-swarm `DISCORD_WAKE_PANE` is ignored.
+  - **B4:** a `defaultSessions` list in the config (`agents`, `0`, …). The rollout step is to list each host's `tmux ls` first.
+  - **B5:** sockets merge on host, instanceId and swarm. This is the same as Carbon #2.
+  - **M1:** the non-default fallback chat is `<swarm>:human`. This is the same as Carbon #6.
+  - **M2:** a retired swarm's categories are rejected for every op. Because the SwarmStore is cut, the router remembers retired swarm ids in `swarms-config.json`'s `retired: []` instead. A category whose name matches a retired id belongs to no swarm.
+  - **M3:** the id→swarm map is cut. This is the same as Carbon cut 1.
+  - **M4:** adoption is refused for a category holding default-critical channels, and matching is case-insensitive.
+  - **M5:** a direct channel follows its agent's swarm on register.
+  - **M6:** a thread takes its parent's swarm.
+  - **M7:** subscriber fan-out is intersected with the swarm members, and out-of-swarm subscriptions are dropped at register.
+  - **M8:** an admin acting for a session in another swarm (`session=`) is checked against that session's swarm, and only cross-swarm admins may do it.
+  - **M9:** a `default` key holds candidates only, `DISCORD_DISPATCHER` is ignored when `default` has candidates, and an alias may be both cross-swarm and a candidate.
+  - **Minors:**
+    - the "can't be taken by register" claim is reworded;
+    - the namespaced schema;
+    - the lowest live priority wins;
+    - `auth.json`: copy it and log in per home if a refresh drifts (verify in the proof);
+    - the Mac daemon's env is checked in the proof;
+    - archived channels are excluded from inbound.
+  - **Cut:** the gateway and node `swarm?` field.

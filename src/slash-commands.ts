@@ -184,6 +184,30 @@ export interface SlashCommandDeps {
   readonly sessions: SessionManager
   readonly history: ProjectHistory
   readonly startedAt: number
+  /** Classify a Discord channel id into `'default' | '<swarm>' | 'dm' | 'retired' | 'unknown'`. */
+  readonly channelSwarm?: (channelId: string) => string
+  /** Whether multi-swarm config is active. */
+  readonly isSwarmConfigured?: () => boolean
+}
+
+function interactionSwarm(channelId: string | undefined, deps: Readonly<SlashCommandDeps>): { ok: true; swarm: string; isDefaultOrDm: boolean } | { ok: false; error: string } {
+  if (!deps.isSwarmConfigured?.() || !deps.channelSwarm || !channelId) {
+    return { ok: true, swarm: 'default', isDefaultOrDm: true }
+  }
+  const cls = deps.channelSwarm(channelId)
+  if (cls === 'retired' || cls === 'unknown') {
+    return { ok: false, error: cls === 'retired' ? 'This channel belongs to a retired swarm.' : 'Swarm channels are not ready yet.' }
+  }
+  if (cls === 'dm' || cls === 'default') {
+    return { ok: true, swarm: 'default', isDefaultOrDm: true }
+  }
+  return { ok: true, swarm: cls, isDefaultOrDm: false }
+}
+
+function scopedSessions(deps: Readonly<SlashCommandDeps>, swarm: string) {
+  const all = deps.sessions.getSessions()
+  if (!deps.isSwarmConfigured?.()) return all
+  return all.filter(s => (s.swarm ?? 'default') === swarm)
 }
 
 // ============================================================
@@ -193,9 +217,15 @@ export interface SlashCommandDeps {
 export function handleAutocomplete(interaction: AutocompleteInteraction, deps: Readonly<SlashCommandDeps>): void {
   const focused = interaction.options.getFocused(true)
   const commandName = interaction.commandName
+  const ctx = interactionSwarm(interaction.channelId, deps)
+  if (!ctx.ok) {
+    void interaction.respond([]).catch(() => {})
+    return
+  }
 
   if (commandName === 'switch' && focused.name === 'session') {
-    const names = deps.sessions.getSessions().map(s => s.name)
+    if (!ctx.isDefaultOrDm) { void interaction.respond([]).catch(() => {}); return }
+    const names = scopedSessions(deps, 'default').map(s => s.name)
     const filtered = names.filter(n => n.toLowerCase().startsWith(focused.value.toLowerCase()))
     void interaction.respond(
       filtered.slice(0, 25).map(n => ({ name: n, value: n })),
@@ -204,7 +234,7 @@ export function handleAutocomplete(interaction: AutocompleteInteraction, deps: R
   }
 
   if (commandName === 'kill' && focused.name === 'session') {
-    const names = ['all', ...deps.sessions.getSessions().map(s => s.name)]
+    const names = ['all', ...scopedSessions(deps, ctx.swarm).map(s => s.name)]
     const filtered = names.filter(n => n.toLowerCase().startsWith(focused.value.toLowerCase()))
     void interaction.respond(
       filtered.slice(0, 25).map(n => ({ name: n, value: n })),
@@ -213,6 +243,7 @@ export function handleAutocomplete(interaction: AutocompleteInteraction, deps: R
   }
 
   if (commandName === 'spawn' && focused.name === 'project') {
+    if (!ctx.isDefaultOrDm) { void interaction.respond([]).catch(() => {}); return }
     const projects = deps.history.getRecent(25)
     const filtered = projects.filter(p =>
       p.name.toLowerCase().startsWith(focused.value.toLowerCase()) ||
@@ -235,17 +266,36 @@ export async function handleSlashCommand(
   interaction: ChatInputCommandInteraction,
   deps: Readonly<SlashCommandDeps>,
 ): Promise<void> {
+  if (interaction.commandName === 'help') return handleHelp(interaction)
+  const ctx = interactionSwarm(interaction.channelId, deps)
+  if (!ctx.ok) {
+    await interaction.reply({ content: ctx.error, ephemeral: true })
+    return
+  }
   switch (interaction.commandName) {
-    case 'switch': return handleSwitch(interaction, deps)
-    case 'list': return handleList(interaction, deps)
-    case 'status': return handleStatus(interaction, deps)
-    case 'kill': return handleKill(interaction, deps)
-    case 'broadcast': return handleBroadcast(interaction, deps)
-    case 'spawn': return handleSpawn(interaction, deps)
-    case 'help': return handleHelp(interaction)
+    case 'switch':
+      if (!ctx.isDefaultOrDm) {
+        await interaction.reply({ content: '`/switch` is only available in default channels and DMs.', ephemeral: true })
+        return
+      }
+      return handleSwitch(interaction, deps)
+    case 'list': return handleList(interaction, deps, ctx.swarm)
+    case 'status': return handleStatus(interaction, deps, ctx.swarm)
+    case 'kill': return handleKill(interaction, deps, ctx.swarm)
+    case 'broadcast': return handleBroadcast(interaction, deps, ctx.swarm)
+    case 'spawn':
+      if (!ctx.isDefaultOrDm) {
+        await interaction.reply({ content: '`/spawn` is only available in default channels and DMs.', ephemeral: true })
+        return
+      }
+      return handleSpawn(interaction, deps)
     default:
       // Check if it's a skill command
       if (isSkillCommand(interaction.commandName)) {
+        if (!ctx.isDefaultOrDm) {
+          await interaction.reply({ content: 'Skill commands are only available in default channels and DMs.', ephemeral: true })
+          return
+        }
         return handleSkillInvocation(interaction, deps)
       }
       await interaction.reply({ content: `Unknown command: /${interaction.commandName}`, ephemeral: true })
@@ -257,7 +307,7 @@ async function handleSwitch(
   deps: Readonly<SlashCommandDeps>,
 ): Promise<void> {
   const sessionName = interaction.options.getString('session', true)
-  const sessions = deps.sessions.getSessions()
+  const sessions = scopedSessions(deps, 'default')
   const target = sessions.find(s => s.name === sessionName)
 
   if (!target) {
@@ -291,8 +341,9 @@ async function handleSwitch(
 async function handleList(
   interaction: ChatInputCommandInteraction,
   deps: Readonly<SlashCommandDeps>,
+  swarm: string,
 ): Promise<void> {
-  const sessions = deps.sessions.getSessions()
+  const sessions = scopedSessions(deps, swarm)
   if (sessions.length === 0) {
     await interaction.reply({ content: 'No sessions connected.', ephemeral: true })
     return
@@ -315,10 +366,11 @@ async function handleList(
 async function handleStatus(
   interaction: ChatInputCommandInteraction,
   deps: Readonly<SlashCommandDeps>,
+  swarm: string,
 ): Promise<void> {
-  const sessions = deps.sessions.getSessions()
+  const sessions = scopedSessions(deps, swarm)
   const uptime = formatUptime(Date.now() - deps.startedAt)
-  const unroutedCount = deps.sessions.getUnrouted().length
+  const unroutedCount = swarm === 'default' ? deps.sessions.getUnrouted().length : 0
   const totalBuffered = sessions.reduce((sum, s) => sum + deps.sessions.getBufferedCount(s.name), 0)
 
   const lines = [
@@ -333,18 +385,24 @@ async function handleStatus(
 async function handleKill(
   interaction: ChatInputCommandInteraction,
   deps: Readonly<SlashCommandDeps>,
+  swarm: string,
 ): Promise<void> {
   const sessionName = interaction.options.getString('session', true)
+  const sessions = scopedSessions(deps, swarm)
+  // Without config, keep today's deregisterSession semantics; with config, close sockets per §4 (M3).
+  const terminate = (name: string) => {
+    if (deps.isSwarmConfigured?.()) deps.sessions.closeSessionSockets(name)
+    else deps.sessions.deregisterSession(name)
+  }
 
   if (sessionName === 'all') {
-    const sessions = deps.sessions.getSessions()
     if (sessions.length === 0) {
       await interaction.reply({ content: 'No sessions to terminate.', ephemeral: true })
       return
     }
     const count = sessions.length
     for (const s of sessions) {
-      deps.sessions.deregisterSession(s.name)
+      terminate(s.name)
     }
     await interaction.reply({
       content: `${count} session${count === 1 ? '' : 's'} terminated.`,
@@ -353,7 +411,6 @@ async function handleKill(
     return
   }
 
-  const sessions = deps.sessions.getSessions()
   if (!sessions.find(s => s.name === sessionName)) {
     const names = sessions.map(s => s.name)
     const available = names.length > 0 ? `Available: ${names.join(', ')}` : 'No sessions connected.'
@@ -361,8 +418,8 @@ async function handleKill(
     return
   }
 
-  deps.sessions.deregisterSession(sessionName)
-  const remaining = deps.sessions.getSessions().map(s => s.name)
+  terminate(sessionName)
+  const remaining = scopedSessions(deps, swarm).map(s => s.name)
   const activeInfo = remaining.length > 0 ? `Active: ${remaining.join(', ')}` : 'No sessions remaining.'
   await interaction.reply({
     content: `Session "${sessionName}" terminated. ${activeInfo}`,
@@ -373,9 +430,10 @@ async function handleKill(
 async function handleBroadcast(
   interaction: ChatInputCommandInteraction,
   deps: Readonly<SlashCommandDeps>,
+  swarm: string,
 ): Promise<void> {
   const message = interaction.options.getString('message', true)
-  const sessions = deps.sessions.getSessions()
+  const sessions = scopedSessions(deps, swarm)
 
   if (sessions.length === 0) {
     await interaction.reply({ content: 'No sessions connected.', ephemeral: true })

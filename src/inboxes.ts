@@ -302,6 +302,9 @@ export class Inboxes {
 
   target(alias: string): Target | undefined { return this.aliases.get(alias) }
   names(): string[] { return [...new Set([...this.aliases.keys(), ...this.legacyConversations.keys()])] }
+  hasName(name: string): boolean {
+    return this.aliases.has(name) || this.legacyConversations.has(name) || (this.byKey.get(name)?.size ?? 0) > 0
+  }
   conversation(name: string): string | undefined { return this.legacyConversations.get(name) }
   remember(name: string, conv: string): void {
     if (this.conversation(name) !== conv) this.append({ op: 'remember', name, conv })

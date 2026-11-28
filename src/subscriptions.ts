@@ -87,13 +87,33 @@ export class Subscriptions {
     return [...this.channelOwners.values()].flatMap(owner => owner && 'name' in owner ? [owner.name] : [])
   }
 
-  reclaim(name: string, instanceId?: string): void {
-    if (this.owners.get(name) === instanceId) return
-    const old = instanceId && [...this.owners].find(([, owner]) => owner === instanceId)?.[0]
-    if (old) { this.move(this.map, old, name); this.owners.delete(old) }
-    if (instanceId) this.owners.set(name, instanceId)
+  reclaim(name: string, instanceId?: string, host?: string): void {
+    const ownerKey = instanceId ? (host ? `${host}:${instanceId}` : instanceId) : undefined
+    if (this.owners.get(name) === ownerKey) return
+    const old = ownerKey && (
+      [...this.owners].find(([, owner]) => owner === ownerKey)?.[0] ??
+      (host && instanceId ? [...this.owners].find(([, owner]) => owner === instanceId)?.[0] : undefined)
+    )
+    if (old) {
+      if (old !== name) this.move(this.map, old, name)
+      this.owners.delete(old)
+    }
+    if (ownerKey) this.owners.set(name, ownerKey)
     else this.owners.delete(name)
     this.save()
+  }
+
+  /** Drop all legacy channel subscriptions for `name` (e.g. when a name moves swarms). */
+  clear(name: string): boolean {
+    if (!this.map.delete(name)) return false
+    this.save()
+    return true
+  }
+
+  /** Whether `name` has any legacy channel subscriptions. */
+  hasAny(name: string): boolean {
+    const set = this.map.get(name)
+    return !!set && set.size > 0
   }
 
   rename(oldName: string, name: string): void {
