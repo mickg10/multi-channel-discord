@@ -14,9 +14,10 @@ export class BusAlias {
   private readonly path: string
   name?: string
 
-  constructor(stateDir: string, instanceId: string) {
+  /** `store` keeps this file apart from another save kept for the same instance. */
+  constructor(stateDir: string, instanceId: string, store = 'bus-aliases') {
     const key = createHash('sha256').update(instanceId).digest('hex')
-    this.path = join(stateDir, 'bus-aliases', key)
+    this.path = join(stateDir, store, key)
     this.restore()
   }
 
@@ -39,5 +40,11 @@ export class BusAlias {
       rmSync(tmp, { force: true })
       throw err
     }
+  }
+
+  /** Forget the saved name. */
+  clear(): void {
+    this.name = undefined
+    rmSync(this.path, { force: true })
   }
 }
